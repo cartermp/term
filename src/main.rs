@@ -314,12 +314,11 @@ impl App {
                         self.pty_write(b"\x05");
                     }
                     s => {
-                        if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
-                            if d >= 1 {
+                        if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
+                            && d >= 1 {
                                 self.switch_tab(d as usize - 1);
                                 self.sync_window_title();
                             }
-                        }
                     }
                 },
                 _ => {}
@@ -351,14 +350,13 @@ impl App {
         }
 
         // ── Printable text ────────────────────────────────────────────────────
-        if !ctrl && !alt {
-            if let Some(text) = &event.text {
+        if !ctrl && !alt
+            && let Some(text) = &event.text {
                 self.active_mut().ghost_text = None;
                 let bytes = text.as_str().as_bytes().to_vec();
                 self.active_mut().write(&bytes);
                 return;
             }
-        }
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
@@ -600,11 +598,10 @@ impl ApplicationHandler<AppEvent> for App {
                     .as_ref()
                     .map(|r| position.y < r.tab_bar_height as f64)
                     .unwrap_or(false);
-                if in_bar {
-                    if let Some(w) = &self.window {
+                if in_bar
+                    && let Some(w) = &self.window {
                         w.request_redraw();
                     }
-                }
             }
 
             WindowEvent::CursorLeft { .. } => {
@@ -620,8 +617,8 @@ impl ApplicationHandler<AppEvent> for App {
                 ..
             } => {
                 let (mx, my) = self.cursor_pos;
-                if let Some(r) = &self.renderer {
-                    if my >= 0.0 && my < r.tab_bar_height as f64 {
+                if let Some(r) = &self.renderer
+                    && my >= 0.0 && my < r.tab_bar_height as f64 {
                         let bw = self
                             .window
                             .as_ref()
@@ -645,7 +642,6 @@ impl ApplicationHandler<AppEvent> for App {
                             w.request_redraw();
                         }
                     }
-                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

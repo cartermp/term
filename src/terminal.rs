@@ -332,7 +332,7 @@ impl Perform for TerminalState {
                 let next = (self.cursor_col / 8 + 1) * 8;
                 self.cursor_col = next.min(self.cols.saturating_sub(1));
             }
-            0x0a | 0x0b | 0x0c => self.do_newline(),
+            0x0a..=0x0c => self.do_newline(),
             0x0d => self.cursor_col = 0,
             _ => {}
         }
@@ -509,11 +509,10 @@ impl Perform for TerminalState {
         }
         match params[0] {
             b"0" | b"2" => {
-                if params.len() >= 2 {
-                    if let Ok(s) = std::str::from_utf8(params[1]) {
+                if params.len() >= 2
+                    && let Ok(s) = std::str::from_utf8(params[1]) {
                         self.title = s.to_string();
                     }
-                }
             }
             b"7" => {
                 // OSC 7: shell reports current directory as file://hostname/path
@@ -524,7 +523,7 @@ impl Perform for TerminalState {
                     .join(";");
                 let path = content
                     .strip_prefix("file://")
-                    .and_then(|s| s.splitn(2, '/').nth(1))
+                    .and_then(|s| s.split_once('/').map(|x| x.1))
                     .map(|s| format!("/{s}"))
                     .unwrap_or(content);
                 if !path.is_empty() {

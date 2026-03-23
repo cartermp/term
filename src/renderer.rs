@@ -85,6 +85,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // buf+bw+bh are an inherent unit for pixel buffers
     fn blit(
         &mut self,
         buf: &mut [u32],
@@ -130,6 +131,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fill_rect(
         buf: &mut [u32],
         bw: usize,
@@ -175,6 +177,7 @@ impl Renderer {
     }
 
     /// Filled rounded rectangle with radius `r` pixels (circular corners).
+    #[allow(clippy::too_many_arguments)]
     fn fill_rounded(
         buf: &mut [u32],
         bw: usize,
@@ -360,6 +363,7 @@ impl Renderer {
     // ── Public render ─────────────────────────────────────────────────────────
 
     /// `hover` — hovered tab index, or `tabs.len()` for the + button.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         buf: &mut [u32],
@@ -418,8 +422,8 @@ impl Renderer {
         }
 
         // ── 2. Ghost text ─────────────────────────────────────────────────────
-        if !state.is_scrolled_back() {
-            if let Some(g) = ghost {
+        if !state.is_scrolled_back()
+            && let Some(g) = ghost {
                 let py = tby + state.cursor_row * ch;
                 for (i, c) in g.chars().enumerate() {
                     let col = state.cursor_col + i;
@@ -429,7 +433,6 @@ impl Renderer {
                     self.blit(buf, bw, bh, col * cw, py, c, GHOST_COLOR);
                 }
             }
-        }
 
         // ── 3. Cursor ─────────────────────────────────────────────────────────
         if !state.is_scrolled_back()

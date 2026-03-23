@@ -49,7 +49,7 @@ fn load_history() -> Vec<String> {
     for line in text.lines().rev() {
         // Strip extended history prefix:  `: 1234567890:0;actual command`
         let cmd = if line.starts_with(": ") {
-            match line.splitn(3, ';').nth(1) {
+            match line.split(';').nth(1) {
                 Some(s) => s,
                 None => line,
             }

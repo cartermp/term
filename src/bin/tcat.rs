@@ -183,8 +183,8 @@ fn highlight_file(path: &str, ps: &SyntaxSet, ts: &ThemeSet) -> io::Result<()> {
         let ranges = h.highlight_line(line, ps).unwrap_or_default();
         for (style, text) in &ranges {
             // Strip trailing newline from the last span so reset doesn't leave colour on blank line
-            let t = if text.ends_with('\n') {
-                &text[..text.len() - 1]
+            let t = if let Some(stripped) = text.strip_suffix('\n') {
+                stripped
             } else {
                 text
             };
