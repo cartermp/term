@@ -1,6 +1,6 @@
+use crate::config::*;
 use std::collections::VecDeque;
 use vte::{Params, Perform};
-use crate::config::*;
 
 const SCROLLBACK_MAX: usize = 10_000;
 
@@ -16,7 +16,14 @@ pub struct Attrs {
 
 impl Default for Attrs {
     fn default() -> Self {
-        Self { fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false, italic: false, underline: false, inverse: false }
+        Self {
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }
     }
 }
 
@@ -28,14 +35,17 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { c: ' ', attrs: Attrs::default() }
+        Self {
+            c: ' ',
+            attrs: Attrs::default(),
+        }
     }
 }
 
 pub struct TerminalState {
     pub grid: Vec<Vec<Cell>>,
     pub scrollback: VecDeque<Vec<Cell>>,
-    pub viewport_offset: usize,   // 0 = live view; N = scrolled N rows above live bottom
+    pub viewport_offset: usize, // 0 = live view; N = scrolled N rows above live bottom
     pub cols: usize,
     pub rows: usize,
     pub cursor_row: usize,
@@ -86,8 +96,7 @@ impl TerminalState {
             self.viewport_offset =
                 (self.viewport_offset + delta as usize).min(self.scrollback.len());
         } else {
-            self.viewport_offset =
-                self.viewport_offset.saturating_sub((-delta) as usize);
+            self.viewport_offset = self.viewport_offset.saturating_sub((-delta) as usize);
         }
     }
 
@@ -105,14 +114,16 @@ impl TerminalState {
         if row < vo {
             // Row is in the scrollback buffer
             let sb_idx = self.scrollback.len() - vo + row;
-            self.scrollback.get(sb_idx)
+            self.scrollback
+                .get(sb_idx)
                 .and_then(|r| r.get(col))
                 .copied()
                 .unwrap_or_default()
         } else {
             // Row is in the live grid
             let grid_row = row - vo;
-            self.grid.get(grid_row)
+            self.grid
+                .get(grid_row)
                 .and_then(|r| r.get(col))
                 .copied()
                 .unwrap_or_default()
@@ -144,8 +155,7 @@ impl TerminalState {
                 }
                 // Keep the viewport pinned to the same content when user is scrolled back
                 if self.viewport_offset > 0 {
-                    self.viewport_offset =
-                        (self.viewport_offset + 1).min(self.scrollback.len());
+                    self.viewport_offset = (self.viewport_offset + 1).min(self.scrollback.len());
                 }
             }
             let blank = vec![Cell::default(); self.cols];
@@ -170,7 +180,10 @@ impl TerminalState {
             self.do_newline();
         }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
-            self.grid[self.cursor_row][self.cursor_col] = Cell { c, attrs: self.attrs };
+            self.grid[self.cursor_row][self.cursor_col] = Cell {
+                c,
+                attrs: self.attrs,
+            };
             if self.cursor_col + 1 >= self.cols {
                 self.wrap_next = true;
             } else {
@@ -188,7 +201,14 @@ impl TerminalState {
     }
 
     fn blank_cell(&self) -> Cell {
-        Cell { c: ' ', attrs: Attrs { fg: DEFAULT_FG, bg: self.attrs.bg, ..Default::default() } }
+        Cell {
+            c: ' ',
+            attrs: Attrs {
+                fg: DEFAULT_FG,
+                bg: self.attrs.bg,
+                ..Default::default()
+            },
+        }
     }
 
     fn erase_line(&mut self, mode: u16) {
@@ -196,9 +216,21 @@ impl TerminalState {
         let row = self.cursor_row;
         let col = self.cursor_col;
         match mode {
-            0 => { for c in col..self.cols { self.grid[row][c] = blank; } }
-            1 => { for c in 0..=col.min(self.cols.saturating_sub(1)) { self.grid[row][c] = blank; } }
-            2 => { for c in 0..self.cols { self.grid[row][c] = blank; } }
+            0 => {
+                for c in col..self.cols {
+                    self.grid[row][c] = blank;
+                }
+            }
+            1 => {
+                for c in 0..=col.min(self.cols.saturating_sub(1)) {
+                    self.grid[row][c] = blank;
+                }
+            }
+            2 => {
+                for c in 0..self.cols {
+                    self.grid[row][c] = blank;
+                }
+            }
             _ => {}
         }
     }
@@ -208,18 +240,32 @@ impl TerminalState {
         match mode {
             0 => {
                 let (row, col) = (self.cursor_row, self.cursor_col);
-                for c in col..self.cols { self.grid[row][c] = blank; }
+                for c in col..self.cols {
+                    self.grid[row][c] = blank;
+                }
                 for r in (row + 1)..self.rows {
-                    for c in 0..self.cols { self.grid[r][c] = blank; }
+                    for c in 0..self.cols {
+                        self.grid[r][c] = blank;
+                    }
                 }
             }
             1 => {
                 let (row, col) = (self.cursor_row, self.cursor_col);
-                for r in 0..row { for c in 0..self.cols { self.grid[r][c] = blank; } }
-                for c in 0..=col.min(self.cols.saturating_sub(1)) { self.grid[row][c] = blank; }
+                for r in 0..row {
+                    for c in 0..self.cols {
+                        self.grid[r][c] = blank;
+                    }
+                }
+                for c in 0..=col.min(self.cols.saturating_sub(1)) {
+                    self.grid[row][c] = blank;
+                }
             }
             2 | 3 => {
-                for r in 0..self.rows { for c in 0..self.cols { self.grid[r][c] = blank; } }
+                for r in 0..self.rows {
+                    for c in 0..self.cols {
+                        self.grid[r][c] = blank;
+                    }
+                }
             }
             _ => {}
         }
@@ -229,11 +275,11 @@ impl TerminalState {
         let mut i = 0;
         while i < p.len() {
             match p[i] {
-                0  => self.attrs = Attrs::default(),
-                1  => self.attrs.bold = true,
-                3  => self.attrs.italic = true,
-                4  => self.attrs.underline = true,
-                7  => self.attrs.inverse = true,
+                0 => self.attrs = Attrs::default(),
+                1 => self.attrs.bold = true,
+                3 => self.attrs.italic = true,
+                4 => self.attrs.underline = true,
+                7 => self.attrs.inverse = true,
                 22 => self.attrs.bold = false,
                 23 => self.attrs.italic = false,
                 24 => self.attrs.underline = false,
@@ -244,7 +290,7 @@ impl TerminalState {
                         self.attrs.fg = ansi_256_color(p[i + 2] as u8);
                         i += 2;
                     } else if i + 4 < p.len() && p[i + 1] == 2 {
-                        self.attrs.fg = Color::new(p[i+2] as u8, p[i+3] as u8, p[i+4] as u8);
+                        self.attrs.fg = Color::new(p[i + 2] as u8, p[i + 3] as u8, p[i + 4] as u8);
                         i += 4;
                     }
                 }
@@ -255,12 +301,12 @@ impl TerminalState {
                         self.attrs.bg = ansi_256_color(p[i + 2] as u8);
                         i += 2;
                     } else if i + 4 < p.len() && p[i + 1] == 2 {
-                        self.attrs.bg = Color::new(p[i+2] as u8, p[i+3] as u8, p[i+4] as u8);
+                        self.attrs.bg = Color::new(p[i + 2] as u8, p[i + 3] as u8, p[i + 4] as u8);
                         i += 4;
                     }
                 }
                 49 => self.attrs.bg = DEFAULT_BG,
-                n @ 90..=97  => self.attrs.fg = ANSI_COLORS[(n - 90 + 8) as usize],
+                n @ 90..=97 => self.attrs.fg = ANSI_COLORS[(n - 90 + 8) as usize],
                 n @ 100..=107 => self.attrs.bg = ANSI_COLORS[(n - 100 + 8) as usize],
                 _ => {}
             }
@@ -277,7 +323,11 @@ impl Perform for TerminalState {
     fn execute(&mut self, byte: u8) {
         self.wrap_next = false;
         match byte {
-            0x08 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
+            0x08 => {
+                if self.cursor_col > 0 {
+                    self.cursor_col -= 1;
+                }
+            }
             0x09 => {
                 let next = (self.cursor_col / 8 + 1) * 8;
                 self.cursor_col = next.min(self.cols.saturating_sub(1));
@@ -337,7 +387,8 @@ impl Perform for TerminalState {
                 for _ in 0..n {
                     let remove = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
                     self.grid.remove(remove);
-                    self.grid.insert(self.cursor_row, vec![Cell::default(); self.cols]);
+                    self.grid
+                        .insert(self.cursor_row, vec![Cell::default(); self.cols]);
                 }
             }
             (0, 'M') => {
@@ -427,10 +478,19 @@ impl Perform for TerminalState {
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
-            b'7' => { self.saved_cursor = (self.cursor_row, self.cursor_col); self.saved_attrs = self.attrs; }
-            b'8' => { (self.cursor_row, self.cursor_col) = self.saved_cursor; self.attrs = self.saved_attrs; }
+            b'7' => {
+                self.saved_cursor = (self.cursor_row, self.cursor_col);
+                self.saved_attrs = self.attrs;
+            }
+            b'8' => {
+                (self.cursor_row, self.cursor_col) = self.saved_cursor;
+                self.attrs = self.saved_attrs;
+            }
             b'D' => self.do_newline(),
-            b'E' => { self.cursor_col = 0; self.do_newline(); }
+            b'E' => {
+                self.cursor_col = 0;
+                self.do_newline();
+            }
             b'M' => {
                 if self.cursor_row <= self.scroll_top {
                     self.scroll_down(1);
@@ -444,7 +504,9 @@ impl Perform for TerminalState {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if params.is_empty() { return; }
+        if params.is_empty() {
+            return;
+        }
         match params[0] {
             b"0" | b"2" => {
                 if params.len() >= 2 {
@@ -455,7 +517,8 @@ impl Perform for TerminalState {
             }
             b"7" => {
                 // OSC 7: shell reports current directory as file://hostname/path
-                let content = params[1..].iter()
+                let content = params[1..]
+                    .iter()
                     .filter_map(|p| std::str::from_utf8(p).ok())
                     .collect::<Vec<_>>()
                     .join(";");
@@ -464,13 +527,16 @@ impl Perform for TerminalState {
                     .and_then(|s| s.splitn(2, '/').nth(1))
                     .map(|s| format!("/{s}"))
                     .unwrap_or(content);
-                if !path.is_empty() { self.current_dir = path; }
+                if !path.is_empty() {
+                    self.current_dir = path;
+                }
             }
             b"9001" => {
                 // Shell integration: ZLE hook sends current buffer + cursor.
                 // Format: OSC 9001 ; <buffer_with_semicolons_rejoined> \x1c <cursor> ST
                 // (vte splits on ";", so we rejoin params[1..] with ";")
-                let content = params[1..].iter()
+                let content = params[1..]
+                    .iter()
                     .filter_map(|p| std::str::from_utf8(p).ok())
                     .collect::<Vec<_>>()
                     .join(";");
@@ -576,9 +642,12 @@ mod tests {
         // 4 lines → first line scrolls off
         t.process(b"line1\r\nline2\r\nline3\r\nline4");
         assert_eq!(t.state.scrollback.len(), 1);
-        let row: String = t.state.scrollback[0].iter()
-            .map(|c| c.c).collect::<String>()
-            .trim_end_matches(' ').to_string();
+        let row: String = t.state.scrollback[0]
+            .iter()
+            .map(|c| c.c)
+            .collect::<String>()
+            .trim_end_matches(' ')
+            .to_string();
         assert_eq!(row, "line1");
     }
 
@@ -677,7 +746,9 @@ mod tests {
     fn el2_erases_whole_line() {
         let mut t = t(10, 5);
         t.process(b"ABCDE\x1b[1;1H\x1b[2K");
-        for col in 0..5 { assert_eq!(ch(&t, 0, col), ' ', "col {col}"); }
+        for col in 0..5 {
+            assert_eq!(ch(&t, 0, col), ' ', "col {col}");
+        }
     }
 
     #[test]
@@ -685,7 +756,9 @@ mod tests {
         let mut t = t(10, 3);
         t.process(b"AAA\r\nBBB\r\nCCC\x1b[2J");
         for row in 0..3 {
-            for col in 0..3 { assert_eq!(ch(&t, row, col), ' ', "({row},{col})"); }
+            for col in 0..3 {
+                assert_eq!(ch(&t, row, col), ' ', "({row},{col})");
+            }
         }
     }
 
@@ -711,21 +784,30 @@ mod tests {
     fn sgr_fg_ansi_color() {
         let mut t = t(80, 24);
         t.process(b"\x1b[31mA"); // ANSI red = index 1
-        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ANSI_COLORS[1].to_u32());
+        assert_eq!(
+            t.state.grid[0][0].attrs.fg.to_u32(),
+            ANSI_COLORS[1].to_u32()
+        );
     }
 
     #[test]
     fn sgr_bg_ansi_color() {
         let mut t = t(80, 24);
         t.process(b"\x1b[41mA"); // ANSI red bg = index 1
-        assert_eq!(t.state.grid[0][0].attrs.bg.to_u32(), ANSI_COLORS[1].to_u32());
+        assert_eq!(
+            t.state.grid[0][0].attrs.bg.to_u32(),
+            ANSI_COLORS[1].to_u32()
+        );
     }
 
     #[test]
     fn sgr_256_fg_color() {
         let mut t = t(80, 24);
         t.process(b"\x1b[38;5;200mA");
-        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ansi_256_color(200).to_u32());
+        assert_eq!(
+            t.state.grid[0][0].attrs.fg.to_u32(),
+            ansi_256_color(200).to_u32()
+        );
     }
 
     #[test]
@@ -756,7 +838,10 @@ mod tests {
     fn sgr_bright_fg_uses_high_ansi() {
         let mut t = t(80, 24);
         t.process(b"\x1b[91mA"); // bright red = index 9
-        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ANSI_COLORS[9].to_u32());
+        assert_eq!(
+            t.state.grid[0][0].attrs.fg.to_u32(),
+            ANSI_COLORS[9].to_u32()
+        );
     }
 
     // ── Cursor movement ───────────────────────────────────────────────────────
@@ -781,13 +866,13 @@ mod tests {
     fn csi_abcd_relative_moves() {
         let mut t = t(80, 24);
         t.process(b"\x1b[10;10H"); // row 9, col 9
-        t.process(b"\x1b[2A");  // up 2 → row 7
+        t.process(b"\x1b[2A"); // up 2 → row 7
         assert_eq!(t.state.cursor_row, 7);
-        t.process(b"\x1b[3B");  // down 3 → row 10
+        t.process(b"\x1b[3B"); // down 3 → row 10
         assert_eq!(t.state.cursor_row, 10);
-        t.process(b"\x1b[4D");  // left 4 → col 5
+        t.process(b"\x1b[4D"); // left 4 → col 5
         assert_eq!(t.state.cursor_col, 5);
-        t.process(b"\x1b[2C");  // right 2 → col 7
+        t.process(b"\x1b[2C"); // right 2 → col 7
         assert_eq!(t.state.cursor_col, 7);
     }
 
@@ -927,8 +1012,16 @@ mod tests {
         let mut t = t(80, 24);
         t.process(b"\x1b[20;70H"); // cursor at (19, 69)
         t.resize(40, 10);
-        assert!(t.state.cursor_row < 10, "row {} out of bounds", t.state.cursor_row);
-        assert!(t.state.cursor_col < 40, "col {} out of bounds", t.state.cursor_col);
+        assert!(
+            t.state.cursor_row < 10,
+            "row {} out of bounds",
+            t.state.cursor_row
+        );
+        assert!(
+            t.state.cursor_col < 40,
+            "col {} out of bounds",
+            t.state.cursor_col
+        );
     }
 }
 
@@ -939,7 +1032,10 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self { parser: vte::Parser::new(), state: TerminalState::new(cols, rows) }
+        Self {
+            parser: vte::Parser::new(),
+            state: TerminalState::new(cols, rows),
+        }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {

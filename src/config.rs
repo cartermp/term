@@ -69,7 +69,6 @@ pub fn ansi_256_color(index: u8) -> Color {
 // Ghost text — dim gray, clearly below regular text brightness
 pub const GHOST_COLOR: Color = Color::new(0x55, 0x55, 0x55);
 
-
 pub const FONT_SIZE_PT: f32 = 14.0;
 pub const WINDOW_WIDTH: u32 = 960;
 pub const WINDOW_HEIGHT: u32 = 640;

@@ -20,11 +20,11 @@ fn bold(out: &mut impl Write) -> io::Result<()> {
 }
 
 // Catppuccin Mocha palette used for chrome (not syntax — that comes from the theme).
-const LAVENDER:  (u8,u8,u8) = (0xb4, 0xbe, 0xfe); // identifiers / header name
-const SUBTEXT0:  (u8,u8,u8) = (0xa6, 0xad, 0xc8); // language badge
-const OVERLAY0:  (u8,u8,u8) = (0x6c, 0x70, 0x86); // line numbers + gutter
-const SURFACE1:  (u8,u8,u8) = (0x45, 0x47, 0x5a); // subtle separator
-const GREEN:     (u8,u8,u8) = (0xa6, 0xe3, 0xa1); // language highlight
+const LAVENDER: (u8, u8, u8) = (0xb4, 0xbe, 0xfe); // identifiers / header name
+const SUBTEXT0: (u8, u8, u8) = (0xa6, 0xad, 0xc8); // language badge
+const OVERLAY0: (u8, u8, u8) = (0x6c, 0x70, 0x86); // line numbers + gutter
+const SURFACE1: (u8, u8, u8) = (0x45, 0x47, 0x5a); // subtle separator
+const GREEN: (u8, u8, u8) = (0xa6, 0xe3, 0xa1); // language highlight
 
 // ── Render a single highlighted span ─────────────────────────────────────────
 
@@ -32,9 +32,24 @@ fn write_span(out: &mut impl Write, style: Style, text: &str) -> io::Result<()> 
     let s = style.foreground;
     // Skip spans that are pure-background or invisible
     fg(out, s.r, s.g, s.b)?;
-    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD)      { out.write_all(b"\x1b[1m")?; }
-    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC)    { out.write_all(b"\x1b[3m")?; }
-    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) { out.write_all(b"\x1b[4m")?; }
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::BOLD)
+    {
+        out.write_all(b"\x1b[1m")?;
+    }
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::ITALIC)
+    {
+        out.write_all(b"\x1b[3m")?;
+    }
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::UNDERLINE)
+    {
+        out.write_all(b"\x1b[4m")?;
+    }
     out.write_all(text.as_bytes())?;
     reset(out)
 }
@@ -83,7 +98,13 @@ fn print_header(out: &mut impl Write, path: &str, lang: &str) -> io::Result<()> 
     // show directory path in dim
     let dir = std::path::Path::new(path)
         .parent()
-        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+        .and_then(|p| {
+            if p.as_os_str().is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        })
         .map(|p| p.to_string_lossy().to_string());
     if let Some(d) = dir {
         out.write_all(b"  ")?;
@@ -162,8 +183,14 @@ fn highlight_file(path: &str, ps: &SyntaxSet, ts: &ThemeSet) -> io::Result<()> {
         let ranges = h.highlight_line(line, ps).unwrap_or_default();
         for (style, text) in &ranges {
             // Strip trailing newline from the last span so reset doesn't leave colour on blank line
-            let t = if text.ends_with('\n') { &text[..text.len()-1] } else { text };
-            if !t.is_empty() { write_span(&mut out, *style, t)?; }
+            let t = if text.ends_with('\n') {
+                &text[..text.len() - 1]
+            } else {
+                text
+            };
+            if !t.is_empty() {
+                write_span(&mut out, *style, t)?;
+            }
         }
         writeln!(&mut out)?;
     }
