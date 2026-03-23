@@ -19,6 +19,13 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+impl Engine {
+    fn with_history(items: &[&str]) -> Self {
+        Self { history: items.iter().map(|s| s.to_string()).collect() }
+    }
+}
+
 fn load_history() -> Vec<String> {
     let path = match std::env::var("HOME") {
         Ok(h) => std::path::PathBuf::from(h).join(".zsh_history"),
@@ -47,4 +54,58 @@ fn load_history() -> Vec<String> {
         if seen.insert(cmd.clone()) { lines.push(cmd); }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ghost_returns_suffix_for_matching_prefix() {
+        let e = Engine::with_history(&["cargo build --release"]);
+        assert_eq!(e.ghost("cargo", true), Some(" build --release"));
+    }
+
+    #[test]
+    fn ghost_no_match_returns_none() {
+        let e = Engine::with_history(&["cargo build"]);
+        assert_eq!(e.ghost("git", true), None);
+    }
+
+    #[test]
+    fn ghost_empty_prefix_returns_none() {
+        let e = Engine::with_history(&["cargo build"]);
+        assert_eq!(e.ghost("", true), None);
+    }
+
+    #[test]
+    fn ghost_whitespace_only_prefix_returns_none() {
+        let e = Engine::with_history(&["cargo build"]);
+        assert_eq!(e.ghost("   ", true), None);
+    }
+
+    #[test]
+    fn ghost_exact_match_returns_none() {
+        let e = Engine::with_history(&["cargo build"]);
+        assert_eq!(e.ghost("cargo build", true), None);
+    }
+
+    #[test]
+    fn ghost_cursor_not_at_end_returns_none() {
+        let e = Engine::with_history(&["cargo build"]);
+        assert_eq!(e.ghost("cargo", false), None);
+    }
+
+    #[test]
+    fn ghost_returns_first_history_entry_match() {
+        // history is stored most-recent-first; first match wins
+        let e = Engine::with_history(&["cargo test", "cargo build"]);
+        assert_eq!(e.ghost("cargo", true), Some(" test"));
+    }
+
+    #[test]
+    fn ghost_full_prefix_match_with_trailing_space() {
+        let e = Engine::with_history(&["git commit -m 'fix'"]);
+        assert_eq!(e.ghost("git ", true), Some("commit -m 'fix'"));
+    }
 }

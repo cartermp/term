@@ -102,6 +102,25 @@ impl Renderer {
         }
     }
 
+    /// Thin circle outline (1–2 px) centred at (cx, cy) with radius r.
+    fn stroke_circle(buf: &mut [u32], bw: usize, bh: usize,
+                     cx: usize, cy: usize, r: usize, color: u32) {
+        let ro = (r as i32) + 1;
+        let ri = (r as i32) - 1;
+        for dy in -ro..=ro {
+            for dx in -ro..=ro {
+                let d2 = dx * dx + dy * dy;
+                if d2 <= ro * ro && d2 > ri * ri {
+                    let px = cx as i32 + dx;
+                    let py = cy as i32 + dy;
+                    if px >= 0 && px < bw as i32 && py >= 0 && py < bh as i32 {
+                        buf[py as usize * bw + px as usize] = color;
+                    }
+                }
+            }
+        }
+    }
+
     /// Filled rounded rectangle with radius `r` pixels (circular corners).
     fn fill_rounded(buf: &mut [u32], bw: usize, bh: usize,
                     x: usize, y: usize, w: usize, h: usize, r: usize, color: u32) {
@@ -123,65 +142,74 @@ impl Renderer {
 
     // ── Tab bar ───────────────────────────────────────────────────────────────
 
+    /// `hover` — index of hovered tab, or `tabs.len()` for the + button.
     fn draw_tab_bar(
         &mut self,
         buf: &mut [u32], bw: usize, bh: usize,
         tabs: &[String], active: usize,
+        hover: Option<usize>,
     ) {
         let tby = self.tab_bar_height;
         let cw  = self.cell_width;
         let ch  = self.cell_height;
 
-        // Colours
-        let bar_bg      = Color::new(0x18, 0x18, 0x25).to_u32(); // Mantle
-        let pill_bg     = Color::new(0x31, 0x32, 0x44).to_u32(); // Surface0 — active pill
-        let sep_col     = Color::new(0x45, 0x47, 0x5a).to_u32(); // Surface1 — separator
-        let border_col  = Color::new(0x31, 0x32, 0x44).to_u32(); // Surface0 — bottom rule
-        let fg_active   = DEFAULT_FG;
-        let fg_inactive = Color::new(0x6c, 0x70, 0x86); // Overlay0
-        let fg_shortcut = Color::new(0x58, 0x5b, 0x70); // Surface2 — very dim
+        // Neutral dark palette — mirrors terminal background aesthetic
+        let bar_bg       = Color::new(0x14, 0x14, 0x14).to_u32(); // slightly darker than bg
+        let outline_col  = Color::new(0x58, 0x58, 0x58).to_u32(); // medium gray — active outline
+        let hover_bg     = Color::new(0x26, 0x26, 0x26).to_u32(); // subtle hover fill
+        let sep_col      = Color::new(0x2e, 0x2e, 0x2e).to_u32(); // dim separator
+        let bottom_col   = Color::new(0x2e, 0x2e, 0x2e).to_u32(); // bottom rule
+        let fg_active    = DEFAULT_FG;
+        let fg_inactive  = Color::new(0x66, 0x66, 0x66); // dim gray
+        let fg_shortcut  = Color::new(0x3a, 0x3a, 0x3a); // very dim
 
         // Bar fill + bottom border
         Self::fill_rect(buf, bw, bh, 0, 0, bw, tby, bar_bg);
-        Self::fill_rect(buf, bw, bh, 0, tby.saturating_sub(1), bw, 1, border_col);
+        Self::fill_rect(buf, bw, bh, 0, tby.saturating_sub(1), bw, 1, bottom_col);
 
-        let n     = tabs.len().max(1);
-        let tab_w = bw / n;            // equal-width tabs
-        let pad_v = 5usize;            // vertical pill padding
-        let pill_h = tby.saturating_sub(pad_v * 2);
-        let text_y = (tby.saturating_sub(ch)) / 2;
-
-        // Width of the ⌘N shortcut region (⌘ + digit = 2 chars + 1 space right pad)
-        let shortcut_chars = 2usize;    // ⌘ + digit
-        let shortcut_w     = (shortcut_chars + 1) * cw;
+        // Reserve right side for + button
+        let plus_area = tby;
+        let tabs_w    = bw.saturating_sub(plus_area);
+        let n         = tabs.len().max(1);
+        let tab_w     = tabs_w / n;
+        let pad_v     = 4usize;
+        let pill_h    = tby.saturating_sub(pad_v * 2);
+        let text_y    = (tby.saturating_sub(ch)) / 2;
+        let shortcut_w = 3 * cw; // ⌘ + digit + 1 pad
 
         for (i, title) in tabs.iter().enumerate() {
             let is_active = i == active;
+            let is_hover  = hover == Some(i) && !is_active;
             let tx = i * tab_w;
-            if tx >= bw { break; }
-            let tw = if i + 1 == n { bw.saturating_sub(tx) } else { tab_w };
+            if tx >= tabs_w { break; }
+            let tw = if i + 1 == n { tabs_w.saturating_sub(tx) } else { tab_w };
+            let pill_x = tx + 4;
+            let pill_w = tw.saturating_sub(8);
 
-            // ── Active pill ───────────────────────────────────────────────────
-            if is_active {
-                let pill_x = tx + 4;
-                let pill_w = tw.saturating_sub(8);
-                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 4, pill_bg);
-                // Erase bottom border under active tab
-                Self::fill_rect(buf, bw, bh, tx, tby.saturating_sub(1), tw, 1, bar_bg);
+            // ── Hover fill ────────────────────────────────────────────────────
+            if is_hover {
+                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 4, hover_bg);
             }
 
-            // ── Vertical separator (skip first, and both sides of active) ─────
-            if i > 0 {
-                let sx = tx;
-                let sep_top    = pad_v + 3;
-                let sep_bottom = tby.saturating_sub(pad_v + 3);
+            // ── Active: outlined rounded rect (border only) ───────────────────
+            if is_active && pill_w > 2 && pill_h > 2 {
+                // Draw full rounded rect in outline colour, then overdraw interior
+                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, outline_col);
+                Self::fill_rounded(buf, bw, bh, pill_x + 1, pad_v + 1,
+                                   pill_w - 2, pill_h - 2, 4, bar_bg);
+            }
+
+            // ── Separator (skip first; hide on both sides of active) ──────────
+            if i > 0 && i != active && i != active + 1 {
+                let sep_top    = pad_v + 4;
+                let sep_bottom = tby.saturating_sub(pad_v + 4);
                 for y in sep_top..sep_bottom {
-                    if sx < bw { buf[y * bw + sx] = sep_col; }
+                    if tx < bw { buf[y * bw + tx] = sep_col; }
                 }
             }
 
             // ── ⌘N shortcut — right-aligned ───────────────────────────────────
-            let shortcut = format!("\u{2318}{}", i + 1); // ⌘N
+            let shortcut = format!("\u{2318}{}", i + 1);
             let sc_x = tx + tw.saturating_sub(shortcut_w);
             let mut col_x = sc_x;
             for c in shortcut.chars() {
@@ -192,25 +220,45 @@ impl Renderer {
 
             // ── Title — left-aligned, truncated ───────────────────────────────
             let fg = if is_active { fg_active } else { fg_inactive };
-            let left_pad  = tx + cw;
-            let right_edge = tx + tw.saturating_sub(shortcut_w + cw); // leave room for ⌘N
-            let max_cols  = right_edge.saturating_sub(left_pad) / cw;
+            let left_pad   = tx + cw;
+            let right_edge = tx + tw.saturating_sub(shortcut_w + cw);
+            let max_cols   = right_edge.saturating_sub(left_pad) / cw;
             let chars: Vec<char> = title.chars().collect();
-            let show_n = chars.len().min(max_cols);
+            let show_n    = chars.len().min(max_cols);
             let truncated = show_n < chars.len();
             for (ci, &c) in chars[..show_n].iter().enumerate() {
                 let px = left_pad + ci * cw;
                 if truncated && ci + 1 == show_n {
-                    self.blit(buf, bw, bh, px, text_y, '\u{2026}', fg); // …
+                    self.blit(buf, bw, bh, px, text_y, '\u{2026}', fg);
                 } else {
                     self.blit(buf, bw, bh, px, text_y, c, fg);
                 }
             }
         }
+
+        // ── + button (circle outline + cross) ────────────────────────────────
+        let plus_hover = hover == Some(tabs.len());
+        let plus_col = if plus_hover {
+            Color::new(0x88, 0x88, 0x88).to_u32() // hovered
+        } else {
+            Color::new(0x44, 0x44, 0x44).to_u32() // normal
+        };
+        let plus_cx = bw.saturating_sub(plus_area / 2);
+        let plus_cy = tby / 2;
+        let plus_r  = 9usize;
+        Self::stroke_circle(buf, bw, bh, plus_cx, plus_cy, plus_r, plus_col);
+        let arm = (plus_r / 2) as i32;
+        for d in -arm..=arm {
+            let px = (plus_cx as i32 + d) as usize;
+            let py = (plus_cy as i32 + d) as usize;
+            if px < bw && plus_cy < bh { buf[plus_cy * bw + px] = plus_col; }
+            if plus_cx < bw && py < bh { buf[py * bw + plus_cx] = plus_col; }
+        }
     }
 
     // ── Public render ─────────────────────────────────────────────────────────
 
+    /// `hover` — hovered tab index, or `tabs.len()` for the + button.
     pub fn render(
         &mut self,
         buf: &mut [u32], bw: usize, bh: usize,
@@ -219,11 +267,12 @@ impl Renderer {
         ghost: Option<&str>,
         tabs: &[String],
         active_tab: usize,
+        hover: Option<usize>,
     ) {
         buf.fill(DEFAULT_BG.to_u32());
 
         // ── Tab bar ───────────────────────────────────────────────────────────
-        self.draw_tab_bar(buf, bw, bh, tabs, active_tab);
+        self.draw_tab_bar(buf, bw, bh, tabs, active_tab, hover);
 
         let tby = self.tab_bar_height;   // y offset for terminal content
         let cw  = self.cell_width;
@@ -292,11 +341,11 @@ impl Renderer {
             let thumb_y  = tby + (view_top * (term_h - thumb_h)) / total.max(1);
 
             let bar_x      = bw.saturating_sub(3);
-            let track_col  = Color::new(0x31, 0x32, 0x44).to_u32();
+            let track_col  = Color::new(0x2a, 0x2a, 0x2a).to_u32();
             let thumb_col  = if state.is_scrolled_back() {
-                Color::new(0x58, 0x5b, 0x70).to_u32()
+                Color::new(0x66, 0x66, 0x66).to_u32()
             } else {
-                Color::new(0x45, 0x47, 0x5a).to_u32()
+                Color::new(0x44, 0x44, 0x44).to_u32()
             };
             for y in tby..bh {
                 let color = if y >= thumb_y && y < thumb_y + thumb_h { thumb_col } else { track_col };

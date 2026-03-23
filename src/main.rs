@@ -77,7 +77,8 @@ struct App {
     proxy:      EventLoopProxy<AppEvent>,
 
     // Input
-    modifiers: ModifiersState,
+    modifiers:   ModifiersState,
+    cursor_pos:  (f64, f64),
 
     // Cursor blink
     cursor_visible: bool,
@@ -95,7 +96,8 @@ impl App {
             active_tab: 0,
             next_id: 1,
             proxy,
-            modifiers: ModifiersState::empty(),
+            modifiers:   ModifiersState::empty(),
+            cursor_pos:  (-1.0, -1.0),
             cursor_visible: true,
             last_blink: Instant::now(),
             engine: Engine::new(),
@@ -341,6 +343,34 @@ impl App {
         let (w, h) = (size.width as usize, size.height as usize);
         if w == 0 || h == 0 { return; }
 
+        // Compute hover up-front: only needs cursor_pos + renderer.tab_bar_height + window width
+        let hover = {
+            let (mx, my) = self.cursor_pos;
+            match &self.renderer {
+                Some(r) if my >= 0.0 && my < r.tab_bar_height as f64 => {
+                    let tabs_w = w.saturating_sub(r.tab_bar_height);
+                    let n = self.tabs.len().max(1);
+                    let tab_w = tabs_w / n;
+                    if mx as usize >= tabs_w {
+                        Some(self.tabs.len())
+                    } else {
+                        let idx = (mx as usize) / tab_w;
+                        if idx < self.tabs.len() { Some(idx) } else { None }
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        let ai         = self.active_tab;
+        let tab_titles: Vec<String> = self.tabs.iter()
+            .map(|t| t.title().to_string()).collect();
+        // Capture borrows into self.tabs before taking &mut self.renderer / &mut self.surface.
+        // SAFETY: renderer and surface are disjoint from tabs in memory.
+        let state_ptr: *const _ = &self.tabs[ai].terminal.state;
+        let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
+        let show_cur = self.cursor_visible;
+
         let surface  = match &mut self.surface  { Some(s) => s, None => return };
         let renderer = match &mut self.renderer { Some(r) => r, None => return };
 
@@ -349,14 +379,10 @@ impl App {
             NonZeroU32::new(h as u32).unwrap(),
         ).unwrap();
 
-        let tab_titles: Vec<String> = self.tabs.iter()
-            .map(|t| t.title().to_string()).collect();
-        let ai    = self.active_tab;
-        let ghost = self.tabs[ai].ghost_text.as_deref();
-        let state = &self.tabs[ai].terminal.state;
-
+        let state = unsafe { &*state_ptr };
         let mut buf = surface.buffer_mut().unwrap();
-        renderer.render(buf.as_mut(), w, h, state, self.cursor_visible, ghost, &tab_titles, ai);
+        renderer.render(buf.as_mut(), w, h, state, show_cur,
+                        ghost_owned.as_deref(), &tab_titles, ai, hover);
         buf.present().unwrap();
     }
 
@@ -439,6 +465,50 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_key(event, event_loop);
                 if let Some(w) = &self.window { w.request_redraw(); }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+                // Redraw only when in tab bar so hover highlights update
+                let in_bar = self.renderer.as_ref()
+                    .map(|r| position.y < r.tab_bar_height as f64)
+                    .unwrap_or(false);
+                if in_bar {
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = (-1.0, -1.0);
+                if let Some(w) = &self.window { w.request_redraw(); }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left, ..
+            } => {
+                let (mx, my) = self.cursor_pos;
+                if let Some(r) = &self.renderer {
+                    if my >= 0.0 && my < r.tab_bar_height as f64 {
+                        let bw = self.window.as_ref()
+                            .map(|w| w.inner_size().width as usize).unwrap_or(0);
+                        let tabs_w = bw.saturating_sub(r.tab_bar_height);
+                        let n = self.tabs.len().max(1);
+                        let tab_w = tabs_w / n;
+                        if mx as usize >= tabs_w {
+                            // + button
+                            self.open_tab();
+                            self.sync_window_title();
+                        } else {
+                            let idx = (mx as usize) / tab_w;
+                            if idx < self.tabs.len() {
+                                self.switch_tab(idx);
+                                self.sync_window_title();
+                            }
+                        }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    }
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

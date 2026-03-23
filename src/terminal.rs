@@ -492,6 +492,446 @@ impl Perform for TerminalState {
     fn unhook(&mut self) {}
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn t(cols: usize, rows: usize) -> Terminal {
+        Terminal::new(cols, rows)
+    }
+
+    fn ch(term: &Terminal, row: usize, col: usize) -> char {
+        term.state.grid[row][col].c
+    }
+
+    // ── Basic character output ────────────────────────────────────────────────
+
+    #[test]
+    fn print_places_char_and_advances() {
+        let mut t = t(80, 24);
+        t.process(b"A");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn two_chars_side_by_side() {
+        let mut t = t(80, 24);
+        t.process(b"AB");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'B');
+    }
+
+    #[test]
+    fn crlf_advances_row() {
+        let mut t = t(80, 24);
+        t.process(b"A\r\nB");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 1, 0), 'B');
+        assert_eq!(t.state.cursor_row, 1);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn line_wrap_at_right_edge() {
+        let mut t = t(4, 4);
+        t.process(b"ABCDE"); // 5 chars into a 4-wide terminal
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 3), 'D');
+        assert_eq!(ch(&t, 1, 0), 'E');
+    }
+
+    #[test]
+    fn carriage_return_resets_col() {
+        let mut t = t(80, 24);
+        t.process(b"ABC\rX");
+        assert_eq!(ch(&t, 0, 0), 'X'); // overwrote 'A'
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn backspace_moves_cursor_left() {
+        let mut t = t(80, 24);
+        t.process(b"AB\x08X"); // write AB, backspace, write X
+        assert_eq!(ch(&t, 0, 1), 'X');
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn tab_advances_to_next_tabstop() {
+        let mut t = t(80, 24);
+        t.process(b"\t");
+        assert_eq!(t.state.cursor_col, 8);
+        t.process(b"\t");
+        assert_eq!(t.state.cursor_col, 16);
+    }
+
+    // ── Scrollback ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_captures_line_to_scrollback() {
+        let mut t = t(80, 3);
+        // 4 lines → first line scrolls off
+        t.process(b"line1\r\nline2\r\nline3\r\nline4");
+        assert_eq!(t.state.scrollback.len(), 1);
+        let row: String = t.state.scrollback[0].iter()
+            .map(|c| c.c).collect::<String>()
+            .trim_end_matches(' ').to_string();
+        assert_eq!(row, "line1");
+    }
+
+    #[test]
+    fn scrollback_capped_at_max() {
+        let mut t = t(80, 1);
+        for _ in 0..SCROLLBACK_MAX + 50 {
+            t.process(b"x\r\n");
+        }
+        assert_eq!(t.state.scrollback.len(), SCROLLBACK_MAX);
+    }
+
+    #[test]
+    fn scroll_region_does_not_fill_scrollback() {
+        // When scroll_top != 0, lines leave the viewport but shouldn't go to scrollback
+        let mut t = t(80, 6);
+        t.process(b"\x1b[3;6r"); // scroll region rows 3-6 (0-indexed: 2-5)
+        let sb_before = t.state.scrollback.len();
+        // Force several scrolls within the region
+        for _ in 0..5 {
+            t.process(b"\x1b[6;1H\r\n"); // cursor to bottom of region + newline
+        }
+        assert_eq!(t.state.scrollback.len(), sb_before);
+    }
+
+    // ── Viewport scrolling ────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_viewport_sets_offset() {
+        let mut t = t(80, 3);
+        t.process(b"a\r\nb\r\nc\r\nd");
+        assert!(!t.state.is_scrolled_back());
+        t.state.scroll_viewport(1);
+        assert!(t.state.is_scrolled_back());
+        assert_eq!(t.state.viewport_offset, 1);
+    }
+
+    #[test]
+    fn snap_to_bottom_clears_offset() {
+        let mut t = t(80, 3);
+        t.process(b"a\r\nb\r\nc\r\nd");
+        t.state.scroll_viewport(1);
+        t.state.snap_to_bottom();
+        assert!(!t.state.is_scrolled_back());
+        assert_eq!(t.state.viewport_offset, 0);
+    }
+
+    #[test]
+    fn viewport_clamped_to_scrollback_len() {
+        let mut t = t(80, 3);
+        t.process(b"a\r\nb\r\nc\r\nd");
+        let sb_len = t.state.scrollback.len();
+        t.state.scroll_viewport(9999);
+        assert_eq!(t.state.viewport_offset, sb_len);
+    }
+
+    #[test]
+    fn visual_cell_live_view() {
+        let mut t = t(80, 3);
+        t.process(b"Z");
+        assert_eq!(t.state.visual_cell(0, 0).c, 'Z');
+    }
+
+    #[test]
+    fn visual_cell_shows_scrollback_when_scrolled() {
+        let mut t = t(80, 3);
+        t.process(b"line1\r\nline2\r\nline3\r\nline4");
+        // "line1" is in scrollback; scroll back 1 row
+        t.state.scroll_viewport(1);
+        assert_eq!(t.state.visual_cell(0, 0).c, 'l'); // first char of "line1"
+    }
+
+    // ── Erase ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn el0_erases_from_cursor_to_eol() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDE\x1b[1;3H\x1b[K"); // write, move to col 3, EL0
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'B');
+        assert_eq!(ch(&t, 0, 2), ' '); // erased
+        assert_eq!(ch(&t, 0, 4), ' '); // erased
+    }
+
+    #[test]
+    fn el1_erases_from_bol_to_cursor() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDE\x1b[1;3H\x1b[1K"); // write, move to col 3, EL1
+        assert_eq!(ch(&t, 0, 0), ' ');
+        assert_eq!(ch(&t, 0, 1), ' ');
+        assert_eq!(ch(&t, 0, 2), ' ');
+        assert_eq!(ch(&t, 0, 3), 'D'); // not erased
+    }
+
+    #[test]
+    fn el2_erases_whole_line() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDE\x1b[1;1H\x1b[2K");
+        for col in 0..5 { assert_eq!(ch(&t, 0, col), ' ', "col {col}"); }
+    }
+
+    #[test]
+    fn ed2_clears_screen() {
+        let mut t = t(10, 3);
+        t.process(b"AAA\r\nBBB\r\nCCC\x1b[2J");
+        for row in 0..3 {
+            for col in 0..3 { assert_eq!(ch(&t, row, col), ' ', "({row},{col})"); }
+        }
+    }
+
+    // ── SGR attributes ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sgr_bold_on_off() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[1mA\x1b[22mB");
+        assert!(t.state.grid[0][0].attrs.bold, "A should be bold");
+        assert!(!t.state.grid[0][1].attrs.bold, "B should not be bold");
+    }
+
+    #[test]
+    fn sgr_inverse_on_off() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[7mA\x1b[27mB");
+        assert!(t.state.grid[0][0].attrs.inverse);
+        assert!(!t.state.grid[0][1].attrs.inverse);
+    }
+
+    #[test]
+    fn sgr_fg_ansi_color() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[31mA"); // ANSI red = index 1
+        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ANSI_COLORS[1].to_u32());
+    }
+
+    #[test]
+    fn sgr_bg_ansi_color() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[41mA"); // ANSI red bg = index 1
+        assert_eq!(t.state.grid[0][0].attrs.bg.to_u32(), ANSI_COLORS[1].to_u32());
+    }
+
+    #[test]
+    fn sgr_256_fg_color() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[38;5;200mA");
+        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ansi_256_color(200).to_u32());
+    }
+
+    #[test]
+    fn sgr_truecolor_fg() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[38;2;10;20;30mA");
+        let c = t.state.grid[0][0].attrs.fg;
+        assert_eq!((c.r, c.g, c.b), (10, 20, 30));
+    }
+
+    #[test]
+    fn sgr_truecolor_bg() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[48;2;50;60;70mA");
+        let c = t.state.grid[0][0].attrs.bg;
+        assert_eq!((c.r, c.g, c.b), (50, 60, 70));
+    }
+
+    #[test]
+    fn sgr_reset_clears_all() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[1;3;4;7mA\x1b[0mB");
+        let b = t.state.grid[0][1].attrs;
+        assert!(!b.bold && !b.italic && !b.underline && !b.inverse);
+    }
+
+    #[test]
+    fn sgr_bright_fg_uses_high_ansi() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[91mA"); // bright red = index 9
+        assert_eq!(t.state.grid[0][0].attrs.fg.to_u32(), ANSI_COLORS[9].to_u32());
+    }
+
+    // ── Cursor movement ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cup_positions_cursor_1indexed() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;10H");
+        assert_eq!(t.state.cursor_row, 4);
+        assert_eq!(t.state.cursor_col, 9);
+    }
+
+    #[test]
+    fn cup_default_params_go_to_home() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;10H\x1b[H");
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 0);
+    }
+
+    #[test]
+    fn csi_abcd_relative_moves() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[10;10H"); // row 9, col 9
+        t.process(b"\x1b[2A");  // up 2 → row 7
+        assert_eq!(t.state.cursor_row, 7);
+        t.process(b"\x1b[3B");  // down 3 → row 10
+        assert_eq!(t.state.cursor_row, 10);
+        t.process(b"\x1b[4D");  // left 4 → col 5
+        assert_eq!(t.state.cursor_col, 5);
+        t.process(b"\x1b[2C");  // right 2 → col 7
+        assert_eq!(t.state.cursor_col, 7);
+    }
+
+    #[test]
+    fn cursor_up_clamped_at_scroll_top() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[1;1H\x1b[5A"); // at row 0, move up 5
+        assert_eq!(t.state.cursor_row, 0);
+    }
+
+    #[test]
+    fn cha_sets_column() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[10;5H\x1b[20G"); // move to col 20 (1-indexed → 19)
+        assert_eq!(t.state.cursor_col, 19);
+    }
+
+    #[test]
+    fn esc_save_restore_cursor() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;10H\x1b7\x1b[1;1H\x1b8");
+        assert_eq!(t.state.cursor_row, 4);
+        assert_eq!(t.state.cursor_col, 9);
+    }
+
+    #[test]
+    fn csi_s_u_save_restore_cursor() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;10H\x1b[s\x1b[1;1H\x1b[u");
+        assert_eq!(t.state.cursor_row, 4);
+        assert_eq!(t.state.cursor_col, 9);
+    }
+
+    // ── Scroll region (DECSTBM) ───────────────────────────────────────────────
+
+    #[test]
+    fn decstbm_sets_region_and_homes_cursor() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;15r");
+        assert_eq!(t.state.scroll_top, 4);
+        assert_eq!(t.state.scroll_bottom, 14);
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 0);
+    }
+
+    // ── OSC handlers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn osc_0_sets_title() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b]0;hello world\x07");
+        assert_eq!(t.state.title, "hello world");
+    }
+
+    #[test]
+    fn osc_2_sets_title() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b]2;my tab\x07");
+        assert_eq!(t.state.title, "my tab");
+    }
+
+    #[test]
+    fn osc_7_sets_cwd() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b]7;file://localhost/home/user/repos\x07");
+        assert_eq!(t.state.current_dir, "/home/user/repos");
+    }
+
+    #[test]
+    fn osc_9001_sets_input_buffer() {
+        // vte strips C0 control chars (including \x1c) from OSC content,
+        // so we exercise the no-separator branch — cursor is set to buffer len.
+        let mut t = t(80, 24);
+        t.process(b"\x1b]9001;hello world\x07");
+        assert_eq!(t.state.input_buffer, "hello world");
+        assert_eq!(t.state.input_cursor, 11);
+    }
+
+    #[test]
+    fn osc_9001_separator_parsed_when_injected_directly() {
+        // Call osc_dispatch directly (bypassing vte) to test the \x1c branch.
+        let mut s = TerminalState::new(80, 24);
+        s.osc_dispatch(&[b"9001", b"hello\x1c5"], false);
+        assert_eq!(s.input_buffer, "hello");
+        assert_eq!(s.input_cursor, 5);
+    }
+
+    // ── Device status report ──────────────────────────────────────────────────
+
+    #[test]
+    fn dsr_replies_with_cursor_position() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[5;10H\x1b[6n");
+        assert!(!t.state.pending_responses.is_empty());
+        let resp = std::str::from_utf8(&t.state.pending_responses[0]).unwrap();
+        assert_eq!(resp, "\x1b[5;10R");
+    }
+
+    // ── Insert / delete characters ────────────────────────────────────────────
+
+    #[test]
+    fn dch_deletes_chars_at_cursor() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDE\x1b[1;2H\x1b[2P"); // cursor to col 2, delete 2 chars
+        // "ABCDE" → after deleting 2 at col 1: "ADEX  "
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'D'); // was 'B','C' — both deleted
+        assert_eq!(ch(&t, 0, 2), 'E');
+        assert_eq!(ch(&t, 0, 3), ' '); // blank filled from right
+    }
+
+    #[test]
+    fn ich_inserts_blank_at_cursor() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDE\x1b[1;2H\x1b[2@"); // cursor to col 2, insert 2 blanks
+        // "ABCDE" → after inserting 2 blanks at col 1: "A  BCD" (E shifted off)
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), ' ');
+        assert_eq!(ch(&t, 0, 2), ' ');
+        assert_eq!(ch(&t, 0, 3), 'B');
+    }
+
+    // ── Resize ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_adjusts_grid_dimensions() {
+        let mut t = t(80, 24);
+        t.resize(40, 12);
+        assert_eq!(t.state.cols, 40);
+        assert_eq!(t.state.rows, 12);
+        assert_eq!(t.state.grid.len(), 12);
+        assert!(t.state.grid.iter().all(|r| r.len() == 40));
+    }
+
+    #[test]
+    fn resize_clamps_cursor_into_new_bounds() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[20;70H"); // cursor at (19, 69)
+        t.resize(40, 10);
+        assert!(t.state.cursor_row < 10, "row {} out of bounds", t.state.cursor_row);
+        assert!(t.state.cursor_col < 40, "col {} out of bounds", t.state.cursor_col);
+    }
+}
+
 pub struct Terminal {
     parser: vte::Parser,
     pub state: TerminalState,
