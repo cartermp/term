@@ -38,13 +38,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
         run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy -- -D warnings

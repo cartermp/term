@@ -85,7 +85,6 @@ impl Renderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // buf+bw+bh are an inherent unit for pixel buffers
     fn blit(
         &mut self,
         buf: &mut [u32],
@@ -131,7 +130,6 @@ impl Renderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn fill_rect(
         buf: &mut [u32],
         bw: usize,
@@ -177,7 +175,6 @@ impl Renderer {
     }
 
     /// Filled rounded rectangle with radius `r` pixels (circular corners).
-    #[allow(clippy::too_many_arguments)]
     fn fill_rounded(
         buf: &mut [u32],
         bw: usize,
@@ -363,7 +360,6 @@ impl Renderer {
     // ── Public render ─────────────────────────────────────────────────────────
 
     /// `hover` — hovered tab index, or `tabs.len()` for the + button.
-    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         buf: &mut [u32],
