@@ -26,6 +26,27 @@ enum AppEvent {
     PtyExit { tab_id: usize },
 }
 
+// ── Selection ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct Selection {
+    start: (usize, usize), // (row, col) in viewport coordinates
+    end: (usize, usize),
+}
+
+impl Selection {
+    /// Returns (r0, c0, r1, c1) with r0≤r1 (and c0≤c1 when r0==r1).
+    fn normalized(self) -> (usize, usize, usize, usize) {
+        let (r0, c0) = self.start;
+        let (r1, c1) = self.end;
+        if r0 < r1 || (r0 == r1 && c0 <= c1) {
+            (r0, c0, r1, c1)
+        } else {
+            (r1, c1, r0, c0)
+        }
+    }
+}
+
 // ── Tab ───────────────────────────────────────────────────────────────────────
 
 struct Tab {
@@ -81,6 +102,11 @@ struct App {
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
 
+    // Selection
+    sel_anchor: Option<(usize, usize)>,
+    selection: Option<Selection>,
+    selecting: bool,
+
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
@@ -102,6 +128,9 @@ impl App {
             proxy,
             modifiers: ModifiersState::empty(),
             cursor_pos: (-1.0, -1.0),
+            sel_anchor: None,
+            selection: None,
+            selecting: false,
             cursor_visible: true,
             last_blink: Instant::now(),
             engine: Engine::new(),
@@ -209,7 +238,51 @@ impl App {
     fn switch_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab = idx;
+            self.selection = None;
         }
+    }
+
+    /// Convert a pixel coordinate to a terminal (row, col), or None if in the tab bar.
+    fn pixel_to_cell(&self, mx: f64, my: f64) -> Option<(usize, usize)> {
+        let r = self.renderer.as_ref()?;
+        let tby = r.tab_bar_height;
+        if mx < 0.0 || my < tby as f64 {
+            return None;
+        }
+        let (cols, rows) = self.term_size();
+        let row = ((my as usize).saturating_sub(tby)) / r.cell_height;
+        let col = mx as usize / r.cell_width;
+        Some((row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))))
+    }
+
+    /// Extract the text covered by the current selection.
+    fn selection_text(&self) -> String {
+        let sel = match self.selection {
+            Some(s) => s,
+            None => return String::new(),
+        };
+        let state = &self.active().terminal.state;
+        let (r0, c0, r1, c1) = sel.normalized();
+        let mut result = String::new();
+        for row in r0..=r1 {
+            let col_start = if row == r0 { c0 } else { 0 };
+            let col_end = if row == r1 { c1 + 1 } else { state.cols };
+            let mut line = String::new();
+            for col in col_start..col_end.min(state.cols) {
+                let cell = state.visual_cell(row, col);
+                line.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+            if row > r0 {
+                result.push('\n');
+            }
+            // Trim trailing spaces on wrapped lines, keep them on the last line
+            if row < r1 {
+                result.push_str(line.trim_end());
+            } else {
+                result.push_str(line.trim_end());
+            }
+        }
+        result
     }
 
     fn prev_tab(&mut self) {
@@ -261,6 +334,30 @@ impl App {
         let alt = self.modifiers.alt_key();
         let sup = self.modifiers.super_key();
 
+        // Clear selection on any keypress, except Cmd+C (which copies it) and
+        // bare modifier key presses (Cmd/Shift/Alt/Ctrl alone must not clear the
+        // selection before the chord is complete).
+        let is_cmd_c = sup
+            && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "c");
+        let is_modifier_only = matches!(
+            &event.logical_key,
+            Key::Named(
+                NamedKey::Shift
+                    | NamedKey::Control
+                    | NamedKey::Alt
+                    | NamedKey::Super
+                    | NamedKey::Hyper
+                    | NamedKey::Meta
+                    | NamedKey::CapsLock
+            )
+        );
+        if !is_cmd_c && !is_modifier_only && self.selection.is_some() {
+            self.selection = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
         // ── Cmd chords ────────────────────────────────────────────────────────
         if sup {
             match &event.logical_key {
@@ -288,6 +385,25 @@ impl App {
                     self.pty_write(b"\x15");
                 }
                 Key::Character(c) => match c.as_str() {
+                    "c" => {
+                        // Copy selection if active; otherwise do nothing.
+                        if self.selection.is_some() {
+                            let text = self.selection_text();
+                            if !text.is_empty() {
+                                copy_to_clipboard(&text);
+                            }
+                            self.selection = None;
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                    "v" => {
+                        let text = paste_from_clipboard();
+                        if !text.is_empty() {
+                            self.pty_write(text.as_bytes());
+                        }
+                    }
                     "t" => {
                         self.open_tab();
                         self.sync_window_title();
@@ -462,6 +578,7 @@ impl App {
         let state_ptr: *const _ = &self.tabs[ai].terminal.state;
         let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
         let show_cur = self.cursor_visible;
+        let sel = self.selection.map(|s| s.normalized());
 
         let surface = match &mut self.surface {
             Some(s) => s,
@@ -491,6 +608,7 @@ impl App {
             &tab_titles,
             ai,
             hover,
+            sel,
         );
         buf.present().unwrap();
     }
@@ -592,16 +710,29 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
-                // Redraw only when in tab bar so hover highlights update
                 let in_bar = self
                     .renderer
                     .as_ref()
                     .map(|r| position.y < r.tab_bar_height as f64)
                     .unwrap_or(false);
-                if in_bar
-                    && let Some(w) = &self.window {
+                if self.selecting {
+                    if let (Some(anchor), Some(cell)) =
+                        (self.sel_anchor, self.pixel_to_cell(position.x, position.y))
+                    {
+                        self.selection = if cell != anchor {
+                            Some(Selection { start: anchor, end: cell })
+                        } else {
+                            None
+                        };
+                    }
+                    if let Some(w) = &self.window {
                         w.request_redraw();
                     }
+                } else if in_bar {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
             }
 
             WindowEvent::CursorLeft { .. } => {
@@ -618,30 +749,54 @@ impl ApplicationHandler<AppEvent> for App {
             } => {
                 let (mx, my) = self.cursor_pos;
                 if let Some(r) = &self.renderer
-                    && my >= 0.0 && my < r.tab_bar_height as f64 {
-                        let bw = self
-                            .window
-                            .as_ref()
-                            .map(|w| w.inner_size().width as usize)
-                            .unwrap_or(0);
-                        let tabs_w = bw.saturating_sub(r.tab_bar_height);
-                        let n = self.tabs.len().max(1);
-                        let tab_w = tabs_w / n;
-                        if mx as usize >= tabs_w {
-                            // + button
-                            self.open_tab();
+                    && my >= 0.0 && my < r.tab_bar_height as f64
+                {
+                    // Tab bar click
+                    let bw = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.inner_size().width as usize)
+                        .unwrap_or(0);
+                    let tabs_w = bw.saturating_sub(r.tab_bar_height);
+                    let n = self.tabs.len().max(1);
+                    let tab_w = tabs_w / n;
+                    if mx as usize >= tabs_w {
+                        self.open_tab();
+                        self.sync_window_title();
+                    } else {
+                        let idx = (mx as usize) / tab_w;
+                        if idx < self.tabs.len() {
+                            self.switch_tab(idx);
                             self.sync_window_title();
-                        } else {
-                            let idx = (mx as usize) / tab_w;
-                            if idx < self.tabs.len() {
-                                self.switch_tab(idx);
-                                self.sync_window_title();
-                            }
-                        }
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
                         }
                     }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                } else {
+                    // Terminal area: start a new selection drag
+                    self.selection = None;
+                    self.sel_anchor = self.pixel_to_cell(mx, my);
+                    self.selecting = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                self.selecting = false;
+                // A click without drag leaves no selection
+                if self.selection.is_none() {
+                    self.sel_anchor = None;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -717,6 +872,27 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
     }
+}
+
+// ── Clipboard ─────────────────────────────────────────────────────────────────
+
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+fn paste_from_clipboard() -> String {
+    use std::process::Command;
+    Command::new("pbpaste")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 // ── Shell environment setup ───────────────────────────────────────────────────

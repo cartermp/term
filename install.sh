@@ -19,6 +19,49 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$BIN_DIR/term" "$APP_BUNDLE/Contents/MacOS/term"
 cp "$BIN_DIR/tcat" "$APP_BUNDLE/Contents/MacOS/tcat"
 
+# Build .icns from assets/icon.svg using macOS-native NSImage (no external tools needed)
+ICON_SVG="$REPO_DIR/assets/icon.svg"
+ICON_ICNS="$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+if [ -f "$ICON_SVG" ]; then
+  echo "→ Generating AppIcon.icns from assets/icon.svg"
+  ICONSET=$(mktemp -d)
+  ICONSET_DIR="$ICONSET/AppIcon.iconset"
+  mkdir -p "$ICONSET_DIR"
+
+  # Render SVG to PNG at a given size using macOS NSImage — no brew deps required.
+  render_png() {
+    local size=$1 out=$2
+    osascript - "$ICON_SVG" "$out" "$size" <<'APPLESCRIPT'
+on run {svgPath, pngPath, sizeStr}
+  set sz to sizeStr as integer
+  set img to current application's NSImage's alloc()'s initWithContentsOfFile:svgPath
+  img's setSize:{sz, sz}
+  set rep to current application's NSBitmapImageRep's imageRepWithData:(img's TIFFRepresentation())
+  set dat to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:{|}
+  dat's writeToFile:pngPath atomically:true
+end run
+APPLESCRIPT
+  }
+
+  render_png  16  "$ICONSET_DIR/icon_16x16.png"
+  render_png  32  "$ICONSET_DIR/icon_16x16@2x.png"
+  render_png  32  "$ICONSET_DIR/icon_32x32.png"
+  render_png  64  "$ICONSET_DIR/icon_32x32@2x.png"
+  render_png 128  "$ICONSET_DIR/icon_128x128.png"
+  render_png 256  "$ICONSET_DIR/icon_128x128@2x.png"
+  render_png 256  "$ICONSET_DIR/icon_256x256.png"
+  render_png 512  "$ICONSET_DIR/icon_256x256@2x.png"
+  render_png 512  "$ICONSET_DIR/icon_512x512.png"
+  render_png 1024 "$ICONSET_DIR/icon_512x512@2x.png"
+
+  if iconutil -c icns "$ICONSET_DIR" -o "$ICON_ICNS" 2>/dev/null; then
+    echo "  ✓ AppIcon.icns written"
+  else
+    echo "  ⚠ iconutil failed — icon skipped"
+  fi
+  rm -rf "$ICONSET"
+fi
+
 # Info.plist — minimum viable for macOS to treat this as an app
 cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +75,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key>          <string>1.0</string>
   <key>CFBundleExecutable</key>       <string>term</string>
   <key>CFBundlePackageType</key>      <string>APPL</string>
+  <key>CFBundleIconFile</key>         <string>AppIcon</string>
   <key>NSHighResolutionCapable</key>  <true/>
   <key>LSUIElement</key>              <false/>
 </dict>

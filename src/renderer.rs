@@ -360,6 +360,7 @@ impl Renderer {
     // ── Public render ─────────────────────────────────────────────────────────
 
     /// `hover` — hovered tab index, or `tabs.len()` for the + button.
+    /// `selection` — normalized (r0, c0, r1, c1) in viewport coordinates, if any.
     pub fn render(
         &mut self,
         buf: &mut [u32],
@@ -371,6 +372,7 @@ impl Renderer {
         tabs: &[String],
         active_tab: usize,
         hover: Option<usize>,
+        selection: Option<(usize, usize, usize, usize)>,
     ) {
         buf.fill(DEFAULT_BG.to_u32());
 
@@ -385,6 +387,8 @@ impl Renderer {
         let vis_cols = (bw / cw).min(state.cols);
 
         // ── 1. Terminal grid ──────────────────────────────────────────────────
+        let sel_bg = Color::new(0x26, 0x4a, 0x7a).to_u32(); // muted blue selection
+
         for row in 0..vis_rows {
             for col in 0..vis_cols {
                 let cell = state.visual_cell(row, col);
@@ -394,9 +398,18 @@ impl Renderer {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
+                let selected = if let Some((r0, c0, r1, c1)) = selection {
+                    row >= r0
+                        && row <= r1
+                        && !(row == r0 && col < c0)
+                        && !(row == r1 && col > c1)
+                } else {
+                    false
+                };
+
                 let px = col * cw;
                 let py = tby + row * ch;
-                let bg32 = bg.to_u32();
+                let bg32 = if selected { sel_bg } else { bg.to_u32() };
                 for dy in 0..ch {
                     let y = py + dy;
                     if y >= bh {
