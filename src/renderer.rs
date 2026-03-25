@@ -382,7 +382,7 @@ impl Renderer {
     // ── Tab bar ───────────────────────────────────────────────────────────────
 
     /// `hover` — visual index of hovered tab, or `tabs.len()` for the + button.
-    /// `drag`  — `(from_orig, to_visual)` preview while a tab is being dragged.
+    /// `drag`  — `(from_orig, to_visual, cursor_x)` while a tab is being dragged.
     fn draw_tab_bar(
         &mut self,
         buf: &mut [u32],
@@ -391,7 +391,7 @@ impl Renderer {
         tabs: &[String],
         active: usize,
         hover: Option<usize>,
-        drag: Option<(usize, usize)>,
+        drag: Option<(usize, usize, f64)>,
     ) {
         let tby = self.tab_bar_height;
         let cw = self.cell_width;
@@ -423,7 +423,7 @@ impl Renderer {
 
         // Compute visual tab order for drag preview.
         // visual_order[vi] = original tab index shown at visual position vi.
-        let visual_order: Vec<usize> = if let Some((from, to)) = drag {
+        let visual_order: Vec<usize> = if let Some((from, to, _)) = drag {
             let mut order: Vec<usize> = (0..tabs.len()).collect();
             if from < order.len() {
                 let item = order.remove(from);
@@ -437,7 +437,7 @@ impl Renderer {
             .iter()
             .position(|&i| i == active)
             .unwrap_or(active);
-        let drag_orig = drag.map(|(from, _)| from);
+        let drag_orig = drag.map(|(from, _, _)| from);
 
         for (vi, &orig_idx) in visual_order.iter().enumerate() {
             let title = &tabs[orig_idx];
@@ -458,19 +458,35 @@ impl Renderer {
             let pill_x = tx + 4;
             let pill_w = tw.saturating_sub(8);
 
+            // ── Dragging: draw a dim placeholder "drop here" slot ─────────────
+            if is_dragging {
+                // Separator rules
+                if vi > 0 && vi != visual_active && vi != visual_active + 1 {
+                    let sep_top = pad_v + 4;
+                    let sep_bottom = tby.saturating_sub(pad_v + 4);
+                    for y in sep_top..sep_bottom {
+                        if tx < bw {
+                            buf[y * bw + tx] = sep_col;
+                        }
+                    }
+                }
+                // Dim dashed-ish outline as drop-target hint
+                let ghost_col = Color::new(0x38, 0x38, 0x38).to_u32();
+                if pill_w > 2 && pill_h > 2 {
+                    Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, ghost_col);
+                    Self::fill_rounded(buf, bw, bh, pill_x + 1, pad_v + 1, pill_w - 2, pill_h - 2, 4, bar_bg);
+                }
+                continue;
+            }
+
             // ── Hover fill ────────────────────────────────────────────────────
             if is_hover {
                 Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 4, hover_bg);
             }
 
-            // ── Active / dragging: outlined rounded rect ──────────────────────
-            let pill_outline = if is_dragging {
-                Color::new(0x90, 0x90, 0x90).to_u32() // brighter — tab looks "lifted"
-            } else {
-                outline_col
-            };
-            if (is_active || is_dragging) && pill_w > 2 && pill_h > 2 {
-                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, pill_outline);
+            // ── Active: outlined rounded rect ─────────────────────────────────
+            if is_active && pill_w > 2 && pill_h > 2 {
+                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, outline_col);
                 Self::fill_rounded(
                     buf,
                     bw,
@@ -508,13 +524,48 @@ impl Renderer {
             }
 
             // ── Title — left-aligned, truncated ───────────────────────────────
-            let fg = if is_active || is_dragging {
-                fg_active
-            } else {
-                fg_inactive
-            };
+            let fg = if is_active { fg_active } else { fg_inactive };
             let left_pad = tx + cw;
             let right_edge = tx + tw.saturating_sub(shortcut_w + cw);
+            let max_cols = right_edge.saturating_sub(left_pad) / cw;
+            let chars: Vec<char> = title.chars().collect();
+            let show_n = chars.len().min(max_cols);
+            let truncated = show_n < chars.len();
+            for (ci, &c) in chars[..show_n].iter().enumerate() {
+                let px = left_pad + ci * cw;
+                if truncated && ci + 1 == show_n {
+                    self.blit(buf, bw, bh, px, text_y, '\u{2026}', fg);
+                } else {
+                    self.blit(buf, bw, bh, px, text_y, c, fg);
+                }
+            }
+        }
+
+        // ── Floating dragged tab (rendered on top, follows cursor) ────────────
+        if let Some((from_orig, _, cursor_x)) = drag {
+            let title = &tabs[from_orig];
+            let is_active = from_orig == active;
+
+            // Center the floating tab under the cursor, clamped inside tab area
+            let half = (tab_w / 2) as isize;
+            let float_left = ((cursor_x as isize) - half)
+                .max(0)
+                .min(tabs_w.saturating_sub(tab_w) as isize) as usize;
+            let pill_x = float_left + 4;
+            let pill_w = tab_w.saturating_sub(8);
+
+            // Bright lifted outline with a slightly lighter fill
+            let lifted_outline = Color::new(0xa0, 0xa0, 0xa0).to_u32();
+            let lifted_bg = Color::new(0x20, 0x20, 0x20).to_u32();
+            if pill_w > 2 && pill_h > 2 {
+                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, lifted_outline);
+                Self::fill_rounded(buf, bw, bh, pill_x + 1, pad_v + 1, pill_w - 2, pill_h - 2, 4, lifted_bg);
+            }
+
+            // Title (active color always — it's the "held" tab)
+            let fg = if is_active { fg_active } else { Color::new(0xcc, 0xcc, 0xcc) };
+            let left_pad = float_left + cw;
+            let right_edge = float_left + tab_w.saturating_sub(shortcut_w + cw);
             let max_cols = right_edge.saturating_sub(left_pad) / cw;
             let chars: Vec<char> = title.chars().collect();
             let show_n = chars.len().min(max_cols);
@@ -557,7 +608,7 @@ impl Renderer {
 
     /// `hover`     — visual index of hovered tab, or `tabs.len()` for the + button.
     /// `selection` — normalized (r0, c0, r1, c1) in viewport coordinates, if any.
-    /// `drag`      — (from_orig, to_visual) preview while dragging a tab.
+    /// `drag`      — (from_orig, to_visual, cursor_x) preview while dragging a tab.
     pub fn render(
         &mut self,
         buf: &mut [u32],
@@ -570,7 +621,7 @@ impl Renderer {
         active_tab: usize,
         hover: Option<usize>,
         selection: Option<(usize, usize, usize, usize)>,
-        drag: Option<(usize, usize)>,
+        drag: Option<(usize, usize, f64)>,
     ) {
         buf.fill(DEFAULT_BG.to_u32());
 

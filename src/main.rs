@@ -631,7 +631,7 @@ impl App {
         let drag_vals = self.tab_drag.as_ref().map(|d| (d.active, d.from_idx, d.current_x));
         let drag_preview = drag_vals.and_then(|(active, from, cx)| {
             if active {
-                Some((from, self.drag_target_idx(cx)))
+                Some((from, self.drag_target_idx(cx), cx))
             } else {
                 None
             }
