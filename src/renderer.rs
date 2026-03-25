@@ -246,7 +246,8 @@ impl Renderer {
 
     // ── Tab bar ───────────────────────────────────────────────────────────────
 
-    /// `hover` — index of hovered tab, or `tabs.len()` for the + button.
+    /// `hover` — visual index of hovered tab, or `tabs.len()` for the + button.
+    /// `drag`  — `(from_orig, to_visual)` preview while a tab is being dragged.
     fn draw_tab_bar(
         &mut self,
         buf: &mut [u32],
@@ -255,6 +256,7 @@ impl Renderer {
         tabs: &[String],
         active: usize,
         hover: Option<usize>,
+        drag: Option<(usize, usize)>,
     ) {
         let tby = self.tab_bar_height;
         let cw = self.cell_width;
@@ -284,14 +286,36 @@ impl Renderer {
         let text_y = (tby.saturating_sub(ch)) / 2;
         let shortcut_w = 3 * cw; // ⌘ + digit + 1 pad
 
-        for (i, title) in tabs.iter().enumerate() {
-            let is_active = i == active;
-            let is_hover = hover == Some(i) && !is_active;
-            let tx = i * tab_w;
+        // Compute visual tab order for drag preview.
+        // visual_order[vi] = original tab index shown at visual position vi.
+        let visual_order: Vec<usize> = if let Some((from, to)) = drag {
+            let mut order: Vec<usize> = (0..tabs.len()).collect();
+            if from < order.len() {
+                let item = order.remove(from);
+                order.insert(to.min(order.len()), item);
+            }
+            order
+        } else {
+            (0..tabs.len()).collect()
+        };
+        let visual_active = visual_order
+            .iter()
+            .position(|&i| i == active)
+            .unwrap_or(active);
+        let drag_orig = drag.map(|(from, _)| from);
+
+        for (vi, &orig_idx) in visual_order.iter().enumerate() {
+            let title = &tabs[orig_idx];
+            let is_active = orig_idx == active;
+            let is_dragging = drag_orig == Some(orig_idx);
+            // Suppress hover highlight while dragging
+            let is_hover = drag.is_none() && hover == Some(vi) && !is_active;
+
+            let tx = vi * tab_w;
             if tx >= tabs_w {
                 break;
             }
-            let tw = if i + 1 == n {
+            let tw = if vi + 1 == n {
                 tabs_w.saturating_sub(tx)
             } else {
                 tab_w
@@ -304,10 +328,14 @@ impl Renderer {
                 Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 4, hover_bg);
             }
 
-            // ── Active: outlined rounded rect (border only) ───────────────────
-            if is_active && pill_w > 2 && pill_h > 2 {
-                // Draw full rounded rect in outline colour, then overdraw interior
-                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, outline_col);
+            // ── Active / dragging: outlined rounded rect ──────────────────────
+            let pill_outline = if is_dragging {
+                Color::new(0x90, 0x90, 0x90).to_u32() // brighter — tab looks "lifted"
+            } else {
+                outline_col
+            };
+            if (is_active || is_dragging) && pill_w > 2 && pill_h > 2 {
+                Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, pill_outline);
                 Self::fill_rounded(
                     buf,
                     bw,
@@ -321,8 +349,8 @@ impl Renderer {
                 );
             }
 
-            // ── Separator (skip first; hide on both sides of active) ──────────
-            if i > 0 && i != active && i != active + 1 {
+            // ── Separator (hide on both sides of the visual active position) ──
+            if vi > 0 && vi != visual_active && vi != visual_active + 1 {
                 let sep_top = pad_v + 4;
                 let sep_bottom = tby.saturating_sub(pad_v + 4);
                 for y in sep_top..sep_bottom {
@@ -332,8 +360,8 @@ impl Renderer {
                 }
             }
 
-            // ── ⌘N shortcut — right-aligned ───────────────────────────────────
-            let shortcut = format!("\u{2318}{}", i + 1);
+            // ── ⌘N shortcut (original index so ⌘1 stays bound to tab[0]) ─────
+            let shortcut = format!("\u{2318}{}", orig_idx + 1);
             let sc_x = tx + tw.saturating_sub(shortcut_w);
             let mut col_x = sc_x;
             for c in shortcut.chars() {
@@ -345,7 +373,11 @@ impl Renderer {
             }
 
             // ── Title — left-aligned, truncated ───────────────────────────────
-            let fg = if is_active { fg_active } else { fg_inactive };
+            let fg = if is_active || is_dragging {
+                fg_active
+            } else {
+                fg_inactive
+            };
             let left_pad = tx + cw;
             let right_edge = tx + tw.saturating_sub(shortcut_w + cw);
             let max_cols = right_edge.saturating_sub(left_pad) / cw;
@@ -388,8 +420,9 @@ impl Renderer {
 
     // ── Public render ─────────────────────────────────────────────────────────
 
-    /// `hover` — hovered tab index, or `tabs.len()` for the + button.
+    /// `hover`     — visual index of hovered tab, or `tabs.len()` for the + button.
     /// `selection` — normalized (r0, c0, r1, c1) in viewport coordinates, if any.
+    /// `drag`      — (from_orig, to_visual) preview while dragging a tab.
     pub fn render(
         &mut self,
         buf: &mut [u32],
@@ -402,11 +435,12 @@ impl Renderer {
         active_tab: usize,
         hover: Option<usize>,
         selection: Option<(usize, usize, usize, usize)>,
+        drag: Option<(usize, usize)>,
     ) {
         buf.fill(DEFAULT_BG.to_u32());
 
         // ── Tab bar ───────────────────────────────────────────────────────────
-        self.draw_tab_bar(buf, bw, bh, tabs, active_tab, hover);
+        self.draw_tab_bar(buf, bw, bh, tabs, active_tab, hover, drag);
 
         let tby = self.tab_bar_height; // y offset for terminal content
         let cw = self.cell_width;

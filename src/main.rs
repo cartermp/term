@@ -26,6 +26,15 @@ enum AppEvent {
     PtyExit { tab_id: usize },
 }
 
+// ── Tab drag ──────────────────────────────────────────────────────────────────
+
+struct TabDrag {
+    from_idx: usize,
+    start_x: f64,
+    current_x: f64,
+    active: bool, // threshold exceeded → real drag, not a click
+}
+
 // ── Selection ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -102,6 +111,9 @@ struct App {
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
 
+    // Tab drag
+    tab_drag: Option<TabDrag>,
+
     // Selection
     sel_anchor: Option<(usize, usize)>,
     selection: Option<Selection>,
@@ -128,6 +140,7 @@ impl App {
             proxy,
             modifiers: ModifiersState::empty(),
             cursor_pos: (-1.0, -1.0),
+            tab_drag: None,
             sel_anchor: None,
             selection: None,
             selecting: false,
@@ -240,6 +253,41 @@ impl App {
             self.active_tab = idx;
             self.selection = None;
         }
+    }
+
+    /// Which tab slot does pixel x land in (clamped to 0..tabs.len()-1).
+    fn drag_target_idx(&self, mx: f64) -> usize {
+        let r = match self.renderer.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        let bw = self
+            .window
+            .as_ref()
+            .map(|w| w.inner_size().width as usize)
+            .unwrap_or(0);
+        let tabs_w = bw.saturating_sub(r.tab_bar_height);
+        let n = self.tabs.len().max(1);
+        let tab_w = tabs_w / n;
+        let mx = mx.clamp(0.0, tabs_w.saturating_sub(1) as f64) as usize;
+        (mx / tab_w).min(n - 1)
+    }
+
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = if self.active_tab == from {
+            to
+        } else if from < self.active_tab && to >= self.active_tab {
+            self.active_tab - 1
+        } else if from > self.active_tab && to <= self.active_tab {
+            self.active_tab + 1
+        } else {
+            self.active_tab
+        };
     }
 
     /// Convert a pixel coordinate to a terminal (row, col), or None if in the tab bar.
@@ -579,6 +627,15 @@ impl App {
         let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
         let show_cur = self.cursor_visible;
         let sel = self.selection.map(|s| s.normalized());
+        // Extract drag state as owned values before any &mut borrows.
+        let drag_vals = self.tab_drag.as_ref().map(|d| (d.active, d.from_idx, d.current_x));
+        let drag_preview = drag_vals.and_then(|(active, from, cx)| {
+            if active {
+                Some((from, self.drag_target_idx(cx)))
+            } else {
+                None
+            }
+        });
 
         let surface = match &mut self.surface {
             Some(s) => s,
@@ -609,6 +666,7 @@ impl App {
             ai,
             hover,
             sel,
+            drag_preview,
         );
         buf.present().unwrap();
     }
@@ -715,6 +773,16 @@ impl ApplicationHandler<AppEvent> for App {
                     .as_ref()
                     .map(|r| position.y < r.tab_bar_height as f64)
                     .unwrap_or(false);
+
+                // Update tab drag
+                if let Some(ref mut drag) = self.tab_drag {
+                    drag.current_x = position.x;
+                    if !drag.active && (position.x - drag.start_x).abs() > 8.0 {
+                        drag.active = true;
+                    }
+                }
+                let drag_active = self.tab_drag.as_ref().map(|d| d.active).unwrap_or(false);
+
                 if self.selecting {
                     if let (Some(anchor), Some(cell)) =
                         (self.sel_anchor, self.pixel_to_cell(position.x, position.y))
@@ -728,7 +796,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
-                } else if in_bar {
+                } else if drag_active || in_bar {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -748,16 +816,20 @@ impl ApplicationHandler<AppEvent> for App {
                 ..
             } => {
                 let (mx, my) = self.cursor_pos;
-                if let Some(r) = &self.renderer
-                    && my >= 0.0 && my < r.tab_bar_height as f64
-                {
-                    // Tab bar click
+                let in_bar = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| my >= 0.0 && my < r.tab_bar_height as f64)
+                    .unwrap_or(false);
+                if in_bar {
                     let bw = self
                         .window
                         .as_ref()
                         .map(|w| w.inner_size().width as usize)
                         .unwrap_or(0);
-                    let tabs_w = bw.saturating_sub(r.tab_bar_height);
+                    let tab_bar_h =
+                        self.renderer.as_ref().map(|r| r.tab_bar_height).unwrap_or(0);
+                    let tabs_w = bw.saturating_sub(tab_bar_h);
                     let n = self.tabs.len().max(1);
                     let tab_w = tabs_w / n;
                     if mx as usize >= tabs_w {
@@ -768,13 +840,21 @@ impl ApplicationHandler<AppEvent> for App {
                         if idx < self.tabs.len() {
                             self.switch_tab(idx);
                             self.sync_window_title();
+                            // Arm drag detection — activates once the mouse moves far enough
+                            self.tab_drag = Some(TabDrag {
+                                from_idx: idx,
+                                start_x: mx,
+                                current_x: mx,
+                                active: false,
+                            });
                         }
                     }
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
                 } else {
-                    // Terminal area: start a new selection drag
+                    // Terminal area: start a selection drag
+                    self.tab_drag = None;
                     self.selection = None;
                     self.sel_anchor = self.pixel_to_cell(mx, my);
                     self.selecting = true;
@@ -789,8 +869,14 @@ impl ApplicationHandler<AppEvent> for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
+                // Finalize tab drag
+                if let Some(drag) = self.tab_drag.take() {
+                    if drag.active {
+                        let to = self.drag_target_idx(drag.current_x);
+                        self.reorder_tab(drag.from_idx, to);
+                    }
+                }
                 self.selecting = false;
-                // A click without drag leaves no selection
                 if self.selection.is_none() {
                     self.sel_anchor = None;
                 }
