@@ -777,7 +777,10 @@ _term_title_precmd
 "#;
 
     let zshrc = format!(
-        "ZDOTDIR='{home}'\n[ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n{cat_fn}{zle_hooks}"
+        "ZDOTDIR='{home}'\n\
+         [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
+         [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
+         {cat_fn}{zle_hooks}"
     );
     let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 

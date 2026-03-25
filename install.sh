@@ -4,7 +4,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Term"
-APP_BUNDLE="$HOME/Applications/$APP_NAME.app"
+APP_BUNDLE="/Applications/$APP_NAME.app"
 BIN_DIR="$REPO_DIR/target/release"
 
 echo "→ Building (release)…"
