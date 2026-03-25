@@ -28,19 +28,24 @@ if [ -f "$ICON_SVG" ]; then
   ICONSET_DIR="$ICONSET/AppIcon.iconset"
   mkdir -p "$ICONSET_DIR"
 
-  # Render SVG to PNG at a given size using macOS NSImage — no brew deps required.
+  # Render SVG → TIFF via NSImage (no NSDictionary needed), then TIFF → PNG via sips.
   render_png() {
     local size=$1 out=$2
-    osascript - "$ICON_SVG" "$out" "$size" <<'APPLESCRIPT'
-on run {svgPath, pngPath, sizeStr}
+    local tmp
+    tmp=$(mktemp /tmp/term_icon_XXXXXX.tiff)
+    osascript - "$ICON_SVG" "$tmp" "$size" <<'APPLESCRIPT'
+use framework "AppKit"
+use framework "Foundation"
+use scripting additions
+on run {svgPath, tiffPath, sizeStr}
   set sz to sizeStr as integer
   set img to current application's NSImage's alloc()'s initWithContentsOfFile:svgPath
   img's setSize:{sz, sz}
-  set rep to current application's NSBitmapImageRep's imageRepWithData:(img's TIFFRepresentation())
-  set dat to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:{|}
-  dat's writeToFile:pngPath atomically:true
+  img's TIFFRepresentation()'s writeToFile:tiffPath atomically:true
 end run
 APPLESCRIPT
+    sips -s format png "$tmp" --out "$out" &>/dev/null
+    rm -f "$tmp"
   }
 
   render_png  16  "$ICONSET_DIR/icon_16x16.png"
@@ -81,6 +86,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Tell Finder/Spotlight about the new bundle
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_BUNDLE" 2>/dev/null || true
 
 echo "→ Symlinking 'term' into /usr/local/bin (for CLI use)"
 sudo ln -sf "$APP_BUNDLE/Contents/MacOS/term" /usr/local/bin/term
