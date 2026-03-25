@@ -1076,7 +1076,7 @@ _term_title_precmd
     let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 
     cmd.env("ZDOTDIR", &zdotdir);
-    cmd.env("TERM_PROGRAM", "term");
+    cmd.env("TERM_PROGRAM", "ghostty");
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

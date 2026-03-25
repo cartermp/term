@@ -84,16 +84,8 @@ impl Renderer {
     }
 
     fn load_font() -> Vec<u8> {
-        for path in &[
-            "/System/Library/Fonts/Menlo.ttc",
-            "/System/Library/Fonts/Monaco.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ] {
-            if let Ok(data) = std::fs::read(path) {
-                return data;
-            }
-        }
-        panic!("No monospace font found");
+        // Embedded JetBrains Mono — always available, excellent Unicode coverage.
+        include_bytes!("../assets/JetBrainsMono-Regular.ttf").to_vec()
     }
 
     // ── Low-level blit ────────────────────────────────────────────────────────
@@ -124,6 +116,10 @@ impl Renderer {
         c: char,
         fg: Color,
     ) {
+        // Skip characters not in the font — avoids rendering the .notdef box.
+        if self.font.lookup_glyph_index(c) == 0 {
+            return;
+        }
         self.ensure(c);
         let g = &self.cache[&c];
         if g.width == 0 || g.height == 0 {
@@ -175,6 +171,145 @@ impl Renderer {
                 buf[base + x] = color;
             }
         }
+    }
+
+    /// Draw a Unicode Block Element (U+2580–U+259F) as a direct pixel fill.
+    /// Returns true if the character was handled; false means fall through to fontdue.
+    fn draw_block_char(
+        buf: &mut [u32],
+        bw: usize,
+        bh: usize,
+        px: usize, // cell left pixel
+        py: usize, // cell top pixel
+        cw: usize,
+        ch: usize,
+        c: char,
+        fg: u32,
+    ) -> bool {
+        // Fill [x0..x1) × [y0..y1) within the cell with fg, clipped.
+        fn fill(
+            buf: &mut [u32],
+            bw: usize,
+            bh: usize,
+            px: usize,
+            py: usize,
+            cw: usize,
+            ch: usize,
+            x0: usize,
+            y0: usize,
+            x1: usize,
+            y1: usize,
+            fg: u32,
+        ) {
+            let x1 = x1.min(cw);
+            let y1 = y1.min(ch);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+            for dy in y0..y1 {
+                let y = py + dy;
+                if y >= bh {
+                    break;
+                }
+                let row = y * bw;
+                for dx in x0..x1 {
+                    let x = px + dx;
+                    if x < bw {
+                        buf[row + x] = fg;
+                    }
+                }
+            }
+        }
+        macro_rules! f {
+            ($x0:expr,$y0:expr,$x1:expr,$y1:expr) => {
+                fill(buf, bw, bh, px, py, cw, ch, $x0, $y0, $x1, $y1, fg)
+            };
+        }
+        match c {
+            // ── Vertical (lower N/8) ──────────────────────────────────────────
+            '\u{2581}' => f!(0, ch * 7 / 8, cw, ch),
+            '\u{2582}' => f!(0, ch * 3 / 4, cw, ch),
+            '\u{2583}' => f!(0, ch * 5 / 8, cw, ch),
+            '\u{2584}' => f!(0, ch / 2, cw, ch),
+            '\u{2585}' => f!(0, ch * 3 / 8, cw, ch),
+            '\u{2586}' => f!(0, ch / 4, cw, ch),
+            '\u{2587}' => f!(0, ch / 8, cw, ch),
+            '\u{2588}' => f!(0, 0, cw, ch),
+            // ── Upper half / upper 1/8 ───────────────────────────────────────
+            '\u{2580}' => f!(0, 0, cw, ch / 2),
+            '\u{2594}' => f!(0, 0, cw, (ch / 8).max(1)),
+            // ── Horizontal (left N/8) ─────────────────────────────────────────
+            '\u{258F}' => f!(0, 0, (cw / 8).max(1), ch),
+            '\u{258E}' => f!(0, 0, cw / 4, ch),
+            '\u{258D}' => f!(0, 0, cw * 3 / 8, ch),
+            '\u{258C}' => f!(0, 0, cw / 2, ch),
+            '\u{258B}' => f!(0, 0, cw * 5 / 8, ch),
+            '\u{258A}' => f!(0, 0, cw * 3 / 4, ch),
+            '\u{2589}' => f!(0, 0, cw * 7 / 8, ch),
+            // ── Right half / right 1/8 ───────────────────────────────────────
+            '\u{2590}' => f!(cw / 2, 0, cw, ch),
+            '\u{2595}' => f!(cw * 7 / 8, 0, cw, ch),
+            // ── Quadrants ────────────────────────────────────────────────────
+            '\u{2596}' => f!(0, ch / 2, cw / 2, ch),
+            '\u{2597}' => f!(cw / 2, ch / 2, cw, ch),
+            '\u{2598}' => f!(0, 0, cw / 2, ch / 2),
+            '\u{259D}' => f!(cw / 2, 0, cw, ch / 2),
+            '\u{2599}' => {
+                f!(0, 0, cw / 2, ch / 2);
+                f!(0, ch / 2, cw, ch);
+            }
+            '\u{259A}' => {
+                f!(0, 0, cw / 2, ch / 2);
+                f!(cw / 2, ch / 2, cw, ch);
+            }
+            '\u{259B}' => {
+                f!(0, 0, cw, ch / 2);
+                f!(0, ch / 2, cw / 2, ch);
+            }
+            '\u{259C}' => {
+                f!(0, 0, cw, ch / 2);
+                f!(cw / 2, ch / 2, cw, ch);
+            }
+            '\u{259E}' => {
+                f!(cw / 2, 0, cw, ch / 2);
+                f!(0, ch / 2, cw / 2, ch);
+            }
+            '\u{259F}' => {
+                f!(cw / 2, 0, cw, ch / 2);
+                f!(0, ch / 2, cw, ch);
+            }
+            // ── Braille patterns U+2800–U+28FF ───────────────────────────────
+            // Each character encodes an 8-dot (2×4) grid.
+            // Bit layout: 0=r0c0, 1=r1c0, 2=r2c0, 3=r0c1,
+            //              4=r1c1, 5=r2c1, 6=r3c0, 7=r3c1
+            '\u{2800}'..='\u{28FF}' => {
+                let bits = c as u32 - 0x2800;
+                if bits == 0 {
+                    return true; // blank braille — nothing to draw
+                }
+                // dot column widths / row heights (split cell evenly into 2×4)
+                let col0_w = cw / 2;
+                let col1_w = cw - col0_w;
+                let row_h = [ch / 4, ch / 4, ch / 4, ch - 3 * (ch / 4)];
+                let mut ry = 0usize;
+                for row in 0..4usize {
+                    let rh = row_h[row];
+                    // col 0: bits 0,1,2,6
+                    let bit_c0 = [0u32, 1, 2, 6][row];
+                    if bits & (1 << bit_c0) != 0 {
+                        f!(0, ry, col0_w, ry + rh);
+                    }
+                    // col 1: bits 3,4,5,7
+                    let bit_c1 = [3u32, 4, 5, 7][row];
+                    if bits & (1 << bit_c1) != 0 {
+                        f!(col0_w, ry, col0_w + col1_w, ry + rh);
+                    }
+                    ry += rh;
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Thin circle outline (1–2 px) centred at (cx, cy) with radius r.
@@ -496,7 +631,11 @@ impl Renderer {
                 }
                 let c = cell.c;
                 if c != ' ' && c != '\0' {
-                    self.blit(buf, bw, bh, px, py, c, fg);
+                    // Block elements are drawn as direct pixel fills — fontdue
+                    // can't rasterize them correctly.
+                    if !Self::draw_block_char(buf, bw, bh, px, py, cw, ch, c, fg.to_u32()) {
+                        self.blit(buf, bw, bh, px, py, c, fg);
+                    }
                 }
             }
         }
