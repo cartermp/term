@@ -388,9 +388,9 @@ impl App {
                     "c" => {
                         // Copy selection if active; otherwise do nothing.
                         if self.selection.is_some() {
-                            let text = self.selection_text();
-                            if !text.is_empty() {
-                                copy_to_clipboard(&text);
+                            let raw = self.selection_text();
+                            if !raw.is_empty() {
+                                copy_to_clipboard(&strip_tcat_gutter(&raw));
                             }
                             self.selection = None;
                             if let Some(w) = &self.window {
@@ -885,6 +885,35 @@ fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// Strip tcat's line-number gutter from copied text.
+/// tcat renders each line as "  {N} │ {content}".  We find the U+2502
+/// separator flanked by spaces, verify the prefix is digits+spaces, and
+/// return only the content.
+fn strip_tcat_gutter(text: &str) -> String {
+    const SEP: char = '\u{2502}'; // │
+    text.lines()
+        .map(|line| {
+            // Find │ with a space on each side
+            let chars: Vec<char> = line.chars().collect();
+            for i in 1..chars.len().saturating_sub(1) {
+                if chars[i] != SEP || chars[i - 1] != ' ' || chars[i + 1] != ' ' {
+                    continue;
+                }
+                // Prefix (0..i-1) must be spaces/digits with at least one digit
+                let prefix = &chars[..i - 1];
+                if prefix.iter().all(|&c| c == ' ' || c == '\0' || c.is_ascii_digit())
+                    && prefix.iter().any(|c| c.is_ascii_digit())
+                {
+                    // Content starts at i+2 (after │ and trailing space)
+                    return chars[i + 2..].iter().collect::<String>();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 fn paste_from_clipboard() -> String {

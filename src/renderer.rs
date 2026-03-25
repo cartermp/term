@@ -22,6 +22,35 @@ pub struct Renderer {
     font_size: f32,
 }
 
+/// Find the first content column of a tcat gutter line, or 0 if this row is
+/// not tcat output.  tcat renders: `  {digits} │ content` — we detect the
+/// BOX-DRAWINGS LIGHT VERTICAL (U+2502) with a space on each side, preceded
+/// only by spaces and digits.
+fn tcat_gutter_end(state: &TerminalState, row: usize, vis_cols: usize) -> usize {
+    // │ can't appear at col 0 (needs a space before it) or at the last col
+    for c in 1..vis_cols.saturating_sub(1) {
+        if state.visual_cell(row, c).c != '\u{2502}' {
+            continue;
+        }
+        if state.visual_cell(row, c - 1).c != ' ' {
+            continue;
+        }
+        if state.visual_cell(row, c + 1).c != ' ' {
+            continue;
+        }
+        // Everything in 0..c-1 must be spaces/null/digits, with at least one digit
+        let mut prefix = 0..c - 1;
+        let has_digit = prefix.clone().any(|i| state.visual_cell(row, i).c.is_ascii_digit());
+        let all_ok = prefix.all(|i| {
+            matches!(state.visual_cell(row, i).c, ' ' | '\0' | '0'..='9')
+        });
+        if has_digit && all_ok {
+            return c + 2; // column after "│ "
+        }
+    }
+    0
+}
+
 impl Renderer {
     pub fn new(scale_factor: f64) -> Self {
         let font_size = (FONT_SIZE_PT * scale_factor as f32).round();
@@ -390,6 +419,13 @@ impl Renderer {
         let sel_bg = Color::new(0x26, 0x4a, 0x7a).to_u32(); // muted blue selection
 
         for row in 0..vis_rows {
+            // Per-row: detect tcat gutter so it's excluded from selection highlight.
+            let gutter = if selection.is_some() {
+                tcat_gutter_end(state, row, vis_cols)
+            } else {
+                0
+            };
+
             for col in 0..vis_cols {
                 let cell = state.visual_cell(row, col);
                 let mut fg = cell.attrs.fg;
@@ -403,6 +439,7 @@ impl Renderer {
                         && row <= r1
                         && !(row == r0 && col < c0)
                         && !(row == r1 && col > c1)
+                        && col >= gutter
                 } else {
                     false
                 };
