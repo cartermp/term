@@ -150,7 +150,7 @@ impl Renderer {
                     g: ((ex >> 8) & 0xff) as u8,
                     b: (ex & 0xff) as u8,
                 };
-                buf[idx] = bg.blend(fg, alpha).to_u32();
+                buf[idx] = bg.blend(fg, alpha).to_u32_opaque();
             }
         }
     }
@@ -398,11 +398,11 @@ impl Renderer {
         let ch = self.cell_height;
 
         // Neutral dark palette — mirrors terminal background aesthetic
-        let bar_bg = Color::new(0x14, 0x14, 0x14).to_u32(); // slightly darker than bg
-        let outline_col = Color::new(0x58, 0x58, 0x58).to_u32(); // medium gray — active outline
-        let hover_bg = Color::new(0x26, 0x26, 0x26).to_u32(); // subtle hover fill
-        let sep_col = Color::new(0x2e, 0x2e, 0x2e).to_u32(); // dim separator
-        let bottom_col = Color::new(0x2e, 0x2e, 0x2e).to_u32(); // bottom rule
+        let bar_bg = Color::new(0x14, 0x14, 0x14).to_u32_opaque(); // slightly darker than bg
+        let outline_col = Color::new(0x58, 0x58, 0x58).to_u32_opaque(); // medium gray — active outline
+        let hover_bg = Color::new(0x26, 0x26, 0x26).to_u32_opaque(); // subtle hover fill
+        let sep_col = Color::new(0x2e, 0x2e, 0x2e).to_u32_opaque(); // dim separator
+        let bottom_col = Color::new(0x2e, 0x2e, 0x2e).to_u32_opaque(); // bottom rule
         let fg_active = DEFAULT_FG;
         let fg_inactive = Color::new(0x66, 0x66, 0x66); // dim gray
         let fg_shortcut = Color::new(0x3a, 0x3a, 0x3a); // very dim
@@ -471,7 +471,7 @@ impl Renderer {
                     }
                 }
                 // Dim dashed-ish outline as drop-target hint
-                let ghost_col = Color::new(0x38, 0x38, 0x38).to_u32();
+                let ghost_col = Color::new(0x38, 0x38, 0x38).to_u32_opaque();
                 if pill_w > 2 && pill_h > 2 {
                     Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, ghost_col);
                     Self::fill_rounded(buf, bw, bh, pill_x + 1, pad_v + 1, pill_w - 2, pill_h - 2, 4, bar_bg);
@@ -555,8 +555,8 @@ impl Renderer {
             let pill_w = tab_w.saturating_sub(8);
 
             // Bright lifted outline with a slightly lighter fill
-            let lifted_outline = Color::new(0xa0, 0xa0, 0xa0).to_u32();
-            let lifted_bg = Color::new(0x20, 0x20, 0x20).to_u32();
+            let lifted_outline = Color::new(0xa0, 0xa0, 0xa0).to_u32_opaque();
+            let lifted_bg = Color::new(0x20, 0x20, 0x20).to_u32_opaque();
             if pill_w > 2 && pill_h > 2 {
                 Self::fill_rounded(buf, bw, bh, pill_x, pad_v, pill_w, pill_h, 5, lifted_outline);
                 Self::fill_rounded(buf, bw, bh, pill_x + 1, pad_v + 1, pill_w - 2, pill_h - 2, 4, lifted_bg);
@@ -583,9 +583,9 @@ impl Renderer {
         // ── + button (circle outline + cross) ────────────────────────────────
         let plus_hover = hover == Some(tabs.len());
         let plus_col = if plus_hover {
-            Color::new(0x88, 0x88, 0x88).to_u32() // hovered
+            Color::new(0x88, 0x88, 0x88).to_u32_opaque() // hovered
         } else {
-            Color::new(0x44, 0x44, 0x44).to_u32() // normal
+            Color::new(0x44, 0x44, 0x44).to_u32_opaque() // normal
         };
         let plus_cx = bw.saturating_sub(plus_area / 2);
         let plus_cy = tby / 2;
@@ -625,7 +625,11 @@ impl Renderer {
         drag: Option<(usize, usize, f64)>,
         url_underlines: &[(usize, usize, usize)],
     ) {
-        buf.fill(DEFAULT_BG.to_u32());
+        // Start fully transparent.  Cells with DEFAULT_BG will be filled with
+        // BG_ALPHA opacity; everything else (tab bar, glyphs, cursor…) is
+        // fully opaque.  On macOS this lets the NSVisualEffectView blur show
+        // through in background areas.
+        buf.fill(0);
 
         // ── Tab bar ───────────────────────────────────────────────────────────
         self.draw_tab_bar(buf, bw, bh, tabs, active_tab, hover, drag);
@@ -638,7 +642,7 @@ impl Renderer {
         let vis_cols = (bw / cw).min(state.cols);
 
         // ── 1. Terminal grid ──────────────────────────────────────────────────
-        let sel_bg = Color::new(0x26, 0x4a, 0x7a).to_u32(); // muted blue selection
+        let sel_bg = Color::new(0x26, 0x4a, 0x7a).to_u32_opaque(); // muted blue selection (opaque)
 
         for row in 0..vis_rows {
             // Per-row: detect tcat gutter so it's excluded from selection highlight.
@@ -668,7 +672,15 @@ impl Renderer {
 
                 let px = col * cw;
                 let py = tby + row * ch;
-                let bg32 = if selected { sel_bg } else { bg.to_u32() };
+                // DEFAULT_BG cells are semi-transparent (vibrancy shows through).
+                // Any other background (custom colour, selection) is fully opaque.
+                let bg32 = if selected {
+                    sel_bg
+                } else if bg == DEFAULT_BG {
+                    ((BG_ALPHA as u32) << 24) | DEFAULT_BG.to_u32()
+                } else {
+                    bg.to_u32_opaque()
+                };
                 for dy in 0..ch {
                     let y = py + dy;
                     if y >= bh {
@@ -686,7 +698,7 @@ impl Renderer {
                 if c != ' ' && c != '\0' {
                     // Block elements are drawn as direct pixel fills — fontdue
                     // can't rasterize them correctly.
-                    if !Self::draw_block_char(buf, bw, bh, px, py, cw, ch, c, fg.to_u32()) {
+                    if !Self::draw_block_char(buf, bw, bh, px, py, cw, ch, c, fg.to_u32_opaque()) {
                         self.blit(buf, bw, bh, px, py, c, fg);
                     }
                 }
@@ -695,7 +707,7 @@ impl Renderer {
 
         // ── 2. URL underlines (drawn when Cmd held) ───────────────────────────
         if !url_underlines.is_empty() {
-            let u_col = Color::new(0x58, 0x9a, 0xdd).to_u32(); // muted blue
+            let u_col = Color::new(0x58, 0x9a, 0xdd).to_u32_opaque(); // muted blue
             for &(row, c0, c1) in url_underlines {
                 if row >= vis_rows {
                     continue;
@@ -736,7 +748,7 @@ impl Renderer {
         {
             let px = state.cursor_col * cw;
             let py = tby + state.cursor_row * ch;
-            let c32 = CURSOR_COLOR.to_u32();
+            let c32 = CURSOR_COLOR.to_u32_opaque();
             for dy in 0..ch {
                 let y = py + dy;
                 if y >= bh {
@@ -761,11 +773,11 @@ impl Renderer {
             let thumb_y = tby + (view_top * (term_h - thumb_h)) / total.max(1);
 
             let bar_x = bw.saturating_sub(3);
-            let track_col = Color::new(0x2a, 0x2a, 0x2a).to_u32();
+            let track_col = Color::new(0x2a, 0x2a, 0x2a).to_u32_opaque();
             let thumb_col = if state.is_scrolled_back() {
-                Color::new(0x66, 0x66, 0x66).to_u32()
+                Color::new(0x66, 0x66, 0x66).to_u32_opaque()
             } else {
-                Color::new(0x44, 0x44, 0x44).to_u32()
+                Color::new(0x44, 0x44, 0x44).to_u32_opaque()
             };
             for y in tby..bh {
                 let color = if y >= thumb_y && y < thumb_y + thumb_h {

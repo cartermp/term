@@ -15,6 +15,9 @@ path = "src/bin/tcat.rs"
 
 [dependencies]
 winit = "0.30"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
 softbuffer = "0.4"
 vte = "0.13"
 portable-pty = "0.8"

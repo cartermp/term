@@ -1572,6 +1572,7 @@ name = "term"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "objc2 0.5.2",
  "portable-pty",
  "softbuffer",
  "syntect",

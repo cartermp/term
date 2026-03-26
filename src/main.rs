@@ -1,5 +1,6 @@
 mod completion;
 mod config;
+mod platform;
 mod renderer;
 mod terminal;
 
@@ -37,15 +38,19 @@ struct TabDrag {
 
 // ── Selection ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Selection {
-    start: (usize, usize), // (row, col) in viewport coordinates
-    end: (usize, usize),
+    // grid_row = visual_row as i64 - viewport_offset as i64.
+    // Negative = rows in scrollback above the live grid; 0 = top of live grid.
+    // Stable across viewport changes: scrolling shifts visual_row and viewport_offset
+    // by the same amount, so grid_row for a given cell never changes.
+    start: (i64, usize), // (grid_row, col)
+    end: (i64, usize),
 }
 
 impl Selection {
-    /// Returns (r0, c0, r1, c1) with r0≤r1 (and c0≤c1 when r0==r1).
-    fn normalized(self) -> (usize, usize, usize, usize) {
+    /// Returns (r0, c0, r1, c1) with r0≤r1 (and c0≤c1 when r0==r1), in grid_row space.
+    fn normalized(self) -> (i64, usize, i64, usize) {
         let (r0, c0) = self.start;
         let (r1, c1) = self.end;
         if r0 < r1 || (r0 == r1 && c0 <= c1) {
@@ -53,6 +58,17 @@ impl Selection {
         } else {
             (r1, c1, r0, c0)
         }
+    }
+
+    /// Convert to viewport-relative row range for rendering.
+    /// `viewport_offset` is the current scroll position.
+    /// Returns (r0, c0, r1, c1) in visual (viewport) row coordinates.
+    fn to_viewport(self, viewport_offset: usize) -> (usize, usize, usize, usize) {
+        let vo = viewport_offset as i64;
+        let (gr0, c0, gr1, c1) = self.normalized();
+        let r0 = (gr0 + vo).max(0) as usize;
+        let r1 = (gr1 + vo).max(0) as usize;
+        (r0, c0, r1, c1)
     }
 }
 
@@ -162,9 +178,10 @@ struct App {
     tab_drag: Option<TabDrag>,
 
     // Selection
-    sel_anchor: Option<(usize, usize)>,
+    sel_anchor: Option<(i64, usize)>, // grid_row coords, stable across scroll
     selection: Option<Selection>,
     selecting: bool,
+    sel_scroll: i32, // non-zero while dragging outside terminal bounds (auto-scroll)
 
     // Cursor blink
     cursor_visible: bool,
@@ -191,6 +208,7 @@ impl App {
             sel_anchor: None,
             selection: None,
             selecting: false,
+            sel_scroll: 0,
             cursor_visible: true,
             last_blink: Instant::now(),
             engine: Engine::new(),
@@ -350,6 +368,14 @@ impl App {
         Some((row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))))
     }
 
+    /// Like `pixel_to_cell` but returns grid-relative row coordinates stable across scrolling.
+    /// `grid_row = visual_row - viewport_offset`; negative values are scrollback rows.
+    fn pixel_to_grid_cell(&self, mx: f64, my: f64) -> Option<(i64, usize)> {
+        let (vrow, col) = self.pixel_to_cell(mx, my)?;
+        let vo = self.active().terminal.state.viewport_offset as i64;
+        Some((vrow as i64 - vo, col))
+    }
+
     /// Set the cursor icon based on whether Cmd is held and a URL is under the pointer.
     fn update_cursor_icon(&self) {
         let icon = if self.modifiers.super_key() {
@@ -378,7 +404,8 @@ impl App {
             None => return String::new(),
         };
         let state = &self.active().terminal.state;
-        let (r0, c0, r1, c1) = sel.normalized();
+        // Convert from grid-relative to viewport-relative rows for visual_cell().
+        let (r0, c0, r1, c1) = sel.to_viewport(state.viewport_offset);
         let mut result = String::new();
         for row in r0..=r1 {
             let col_start = if row == r0 { c0 } else { 0 };
@@ -391,12 +418,7 @@ impl App {
             if row > r0 {
                 result.push('\n');
             }
-            // Trim trailing spaces on wrapped lines, keep them on the last line
-            if row < r1 {
-                result.push_str(line.trim_end());
-            } else {
-                result.push_str(line.trim_end());
-            }
+            result.push_str(line.trim_end());
         }
         result
     }
@@ -694,7 +716,9 @@ impl App {
         let state_ptr: *const _ = &self.tabs[ai].terminal.state;
         let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
         let show_cur = self.cursor_visible;
-        let sel = self.selection.map(|s| s.normalized());
+        let sel = self.selection.map(|s| {
+            s.to_viewport(self.tabs[ai].terminal.state.viewport_offset)
+        });
         // Compute URL underlines (only when Cmd is held so they don't render every frame)
         let url_underlines: Vec<(usize, usize, usize)> = if self.modifiers.super_key() {
             let (vis_cols, vis_rows) = self.term_size();
@@ -809,6 +833,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.context = Some(context);
         self.surface = Some(surface);
         self.renderer = Some(renderer);
+        platform::setup_vibrancy(&window);
         self.window = Some(window);
     }
 
@@ -868,15 +893,46 @@ impl ApplicationHandler<AppEvent> for App {
                 let drag_active = self.tab_drag.as_ref().map(|d| d.active).unwrap_or(false);
 
                 if self.selecting {
-                    if let (Some(anchor), Some(cell)) =
-                        (self.sel_anchor, self.pixel_to_cell(position.x, position.y))
-                    {
-                        self.selection = if cell != anchor {
-                            Some(Selection { start: anchor, end: cell })
-                        } else {
-                            None
-                        };
+                    if let Some(anchor) = self.sel_anchor {
+                        // pixel_to_grid_cell returns None outside the terminal area;
+                        // clamp to the nearest edge row so the selection can extend
+                        // past the top/bottom while the user drags.
+                        let cell = self.pixel_to_grid_cell(position.x, position.y)
+                            .or_else(|| {
+                                let r = self.renderer.as_ref()?;
+                                let (vis_cols, vis_rows) = self.term_size();
+                                let vo = self.active().terminal.state.viewport_offset as i64;
+                                let col = (position.x.max(0.0) as usize / r.cell_width)
+                                    .min(vis_cols.saturating_sub(1));
+                                if position.y < r.tab_bar_height as f64 {
+                                    Some((-vo, col)) // visual row 0
+                                } else {
+                                    Some((vis_rows as i64 - 1 - vo, col)) // last visible row
+                                }
+                            });
+                        if let Some(c) = cell {
+                            self.selection = if c != anchor {
+                                Some(Selection { start: anchor, end: c })
+                            } else {
+                                None
+                            };
+                        }
                     }
+                    // Auto-scroll when the cursor is dragged outside the terminal area.
+                    let tby = self.renderer.as_ref().map(|r| r.tab_bar_height as f64).unwrap_or(0.0);
+                    let (_, vis_rows) = self.term_size();
+                    let ch = self.renderer.as_ref().map(|r| r.cell_height as f64).unwrap_or(1.0);
+                    let term_bottom = tby + vis_rows as f64 * ch;
+                    // Positive sel_scroll → scroll_viewport(positive) → viewport_offset
+                    // increases → older content revealed at top (scroll up).
+                    // Negative → scroll down (toward live output).
+                    self.sel_scroll = if position.y < tby {
+                        1  // cursor above terminal: scroll up toward older content
+                    } else if position.y >= term_bottom {
+                        -1 // cursor below terminal: scroll down toward live output
+                    } else {
+                        0
+                    };
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -962,7 +1018,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if !opened {
                         self.tab_drag = None;
                         self.selection = None;
-                        self.sel_anchor = self.pixel_to_cell(mx, my);
+                        self.sel_anchor = self.pixel_to_grid_cell(mx, my);
                         self.selecting = true;
                     }
                     if let Some(w) = &self.window {
@@ -984,6 +1040,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 self.selecting = false;
+                self.sel_scroll = 0;
                 if self.selection.is_none() {
                     self.sel_anchor = None;
                 }
@@ -1015,16 +1072,54 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        const PERIOD: Duration = Duration::from_millis(530);
+        const BLINK_PERIOD: Duration = Duration::from_millis(530);
+        const SCROLL_PERIOD: Duration = Duration::from_millis(50);
         let now = Instant::now();
-        if now.duration_since(self.last_blink) >= PERIOD {
+
+        // Cursor blink
+        if now.duration_since(self.last_blink) >= BLINK_PERIOD {
             self.cursor_visible = !self.cursor_visible;
             self.last_blink = now;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_blink + PERIOD));
+
+        // Auto-scroll while selection drag extends beyond the terminal area
+        if self.selecting && self.sel_scroll != 0 {
+            let dir = self.sel_scroll;
+            self.active_mut().terminal.state.scroll_viewport(dir);
+            // Extend selection endpoint to the edge row that's now scrolled into view
+            if let Some(anchor) = self.sel_anchor {
+                let (_, vis_rows) = self.term_size();
+                let vo = self.active().terminal.state.viewport_offset as i64;
+                let (mx, _) = self.cursor_pos;
+                let col = self.renderer.as_ref()
+                    .map(|r| (mx.max(0.0) as usize / r.cell_width)
+                        .min(self.active().terminal.state.cols.saturating_sub(1)))
+                    .unwrap_or(0);
+                // dir > 0 = scrolled up (older content) → endpoint at top of viewport
+                // dir < 0 = scrolled down (newer content) → endpoint at bottom
+                let edge_row = if dir > 0 { -vo } else { vis_rows as i64 - 1 - vo };
+                let c = (edge_row, col);
+                self.selection = if c != anchor {
+                    Some(Selection { start: anchor, end: c })
+                } else {
+                    None
+                };
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
+        let next_blink = self.last_blink + BLINK_PERIOD;
+        let deadline = if self.selecting && self.sel_scroll != 0 {
+            now + SCROLL_PERIOD
+        } else {
+            next_blink
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.min(next_blink)));
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
