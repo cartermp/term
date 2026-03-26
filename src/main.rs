@@ -994,14 +994,14 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
+                    MouseScrollDelta::LineDelta(_, y) => (y * 4.5) as i32,
                     MouseScrollDelta::PixelDelta(pos) => {
                         let ch = self
                             .renderer
                             .as_ref()
                             .map(|r| r.cell_height as f64)
                             .unwrap_or(20.0);
-                        (pos.y / ch * 1.5) as i32
+                        (pos.y / ch * 2.25) as i32
                     }
                 };
                 self.active_mut().terminal.state.scroll_viewport(lines);

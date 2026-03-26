@@ -64,6 +64,18 @@ pub struct TerminalState {
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
     wrap_next: bool,
+    // Alternate screen buffer (?1049h / ?47h)
+    alt_screen: bool,
+    alt_grid: Vec<Vec<Cell>>,
+    /// Cursor position saved on ?1049h entry, restored on ?1049l exit.
+    alt_saved_cursor: (usize, usize),
+}
+
+impl TerminalState {
+    #[allow(dead_code)]
+    pub fn is_alt_screen(&self) -> bool {
+        self.alt_screen
+    }
 }
 
 impl TerminalState {
@@ -87,7 +99,50 @@ impl TerminalState {
             saved_cursor: (0, 0),
             saved_attrs: Attrs::default(),
             wrap_next: false,
+            alt_screen: false,
+            alt_grid: vec![vec![Cell::default(); cols]; rows],
+            alt_saved_cursor: (0, 0),
         }
+    }
+
+    /// Switch to the alternate screen.  When `save_cursor` is true (?1049h)
+    /// the current cursor position is remembered for restoration on exit.
+    fn enter_alt_screen(&mut self, save_cursor: bool) {
+        if self.alt_screen {
+            return;
+        }
+        if save_cursor {
+            self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
+        }
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.alt_screen = true;
+        self.viewport_offset = 0;
+        // Clear the now-active alt grid
+        let blank = Cell::default();
+        for row in &mut self.grid {
+            row.fill(blank);
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.wrap_next = false;
+    }
+
+    /// Switch back to the normal screen.  When `restore_cursor` is true
+    /// (?1049l) the cursor is returned to where it was before ?1049h.
+    fn leave_alt_screen(&mut self, restore_cursor: bool) {
+        if !self.alt_screen {
+            return;
+        }
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.alt_screen = false;
+        if restore_cursor {
+            (self.cursor_row, self.cursor_col) = self.alt_saved_cursor;
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.wrap_next = false;
     }
 
     /// Adjust the viewport. Positive = scroll toward older content; negative = toward live.
@@ -135,6 +190,10 @@ impl TerminalState {
             row.resize(cols, Cell::default());
         }
         self.grid.resize(rows, vec![Cell::default(); cols]);
+        for row in &mut self.alt_grid {
+            row.resize(cols, Cell::default());
+        }
+        self.alt_grid.resize(rows, vec![Cell::default(); cols]);
         self.cols = cols;
         self.rows = rows;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
@@ -147,8 +206,8 @@ impl TerminalState {
     fn scroll_up(&mut self, n: usize) {
         for _ in 0..n {
             let row = self.grid.remove(self.scroll_top);
-            // Capture into scrollback only for full-screen scrolls (no active scroll region)
-            if self.scroll_top == 0 {
+            // Capture into scrollback only for full-screen scrolls on the normal screen
+            if self.scroll_top == 0 && !self.alt_screen {
                 self.scrollback.push_back(row);
                 if self.scrollback.len() > SCROLLBACK_MAX {
                     self.scrollback.pop_front();
@@ -470,8 +529,25 @@ impl Perform for TerminalState {
             (0, 'c') => {
                 self.pending_responses.push(b"\x1b[?1;2c".to_vec());
             }
-            // Private modes — accept but mostly ignore
-            (b'?', 'h') | (b'?', 'l') => {}
+            // Private modes
+            (b'?', 'h') => {
+                for &param in &p {
+                    match param {
+                        47 | 1047 => self.enter_alt_screen(false),
+                        1049 => self.enter_alt_screen(true),
+                        _ => {}
+                    }
+                }
+            }
+            (b'?', 'l') => {
+                for &param in &p {
+                    match param {
+                        47 | 1047 => self.leave_alt_screen(false),
+                        1049 => self.leave_alt_screen(true),
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1021,6 +1097,124 @@ mod tests {
             "col {} out of bounds",
             t.state.cursor_col
         );
+    }
+
+    // ── Alternate screen ──────────────────────────────────────────────────────
+
+    /// Feed the ?1049h / ?1049l sequences as the real shell would.
+    const ENTER_ALT: &[u8] = b"\x1b[?1049h";
+    const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+    const ENTER_ALT47: &[u8] = b"\x1b[?47h";
+    const LEAVE_ALT47: &[u8] = b"\x1b[?47l";
+
+    #[test]
+    fn alt_screen_enter_sets_flag() {
+        let mut t = t(80, 24);
+        t.process(ENTER_ALT);
+        assert!(t.state.is_alt_screen());
+    }
+
+    #[test]
+    fn alt_screen_leave_clears_flag() {
+        let mut t = t(80, 24);
+        t.process(ENTER_ALT);
+        t.process(LEAVE_ALT);
+        assert!(!t.state.is_alt_screen());
+    }
+
+    #[test]
+    fn alt_screen_is_cleared_on_entry() {
+        let mut t = t(80, 24);
+        t.process(b"hello");
+        t.process(ENTER_ALT);
+        // The alt screen should be blank — row 0, col 0 must be space
+        assert_eq!(ch(&t, 0, 0), ' ');
+    }
+
+    #[test]
+    fn alt_screen_cursor_resets_to_origin_on_entry() {
+        let mut t = t(80, 24);
+        t.process(b"ABC"); // moves cursor to col 3
+        t.process(ENTER_ALT);
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 0);
+    }
+
+    #[test]
+    fn alt_screen_1049_saves_and_restores_cursor() {
+        let mut t = t(80, 24);
+        // Position cursor at (2, 5) on the normal screen
+        t.process(b"\x1b[3;6H"); // CSI row;col H (1-indexed)
+        assert_eq!(t.state.cursor_row, 2);
+        assert_eq!(t.state.cursor_col, 5);
+        t.process(ENTER_ALT);
+        // Move somewhere else in alt screen
+        t.process(b"\x1b[10;10H");
+        t.process(LEAVE_ALT);
+        // Cursor should be back at (2, 5)
+        assert_eq!(t.state.cursor_row, 2);
+        assert_eq!(t.state.cursor_col, 5);
+    }
+
+    #[test]
+    fn alt_screen_content_invisible_on_normal_screen() {
+        let mut t = t(80, 24);
+        t.process(b"NORMAL");
+        t.process(ENTER_ALT);
+        t.process(b"ALT");
+        t.process(LEAVE_ALT);
+        // Normal screen row 0 should still start with 'N', not 'A'
+        assert_eq!(ch(&t, 0, 0), 'N');
+    }
+
+    #[test]
+    fn normal_screen_content_preserved_after_alt_exit() {
+        let mut t = t(80, 24);
+        t.process(b"KEEP");
+        t.process(ENTER_ALT);
+        t.process(b"DISCARD");
+        t.process(LEAVE_ALT);
+        assert_eq!(ch(&t, 0, 0), 'K');
+        assert_eq!(ch(&t, 0, 1), 'E');
+        assert_eq!(ch(&t, 0, 2), 'E');
+        assert_eq!(ch(&t, 0, 3), 'P');
+    }
+
+    #[test]
+    fn alt_screen_does_not_fill_scrollback() {
+        let mut t = t(80, 3); // 3-row terminal — easy to force scrolling
+        t.process(ENTER_ALT);
+        let before = t.state.scrollback.len();
+        // Force several scroll events on the alt screen
+        t.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        assert_eq!(t.state.scrollback.len(), before, "alt-screen must not add to scrollback");
+    }
+
+    #[test]
+    fn alt_screen_47h_47l_no_cursor_restore() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[3;6H"); // row 2, col 5
+        t.process(ENTER_ALT47);
+        assert!(t.state.is_alt_screen());
+        t.process(b"\x1b[10;10H");
+        t.process(LEAVE_ALT47);
+        assert!(!t.state.is_alt_screen());
+        // ?47 does NOT restore cursor — it should be wherever it was left
+        assert_eq!(t.state.cursor_row, 9);
+        assert_eq!(t.state.cursor_col, 9);
+    }
+
+    #[test]
+    fn enter_alt_screen_idempotent() {
+        let mut t = t(80, 24);
+        t.process(b"CONTENT");
+        t.process(ENTER_ALT);
+        t.process(b"ALT");
+        // Second enter should be a no-op
+        t.process(ENTER_ALT);
+        assert_eq!(ch(&t, 0, 0), 'A'); // alt content still there
+        t.process(LEAVE_ALT);
+        assert_eq!(ch(&t, 0, 0), 'C'); // normal content restored
     }
 }
 
