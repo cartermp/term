@@ -1232,6 +1232,71 @@ mod tests {
         t.process(LEAVE_ALT);
         assert_eq!(ch(&t, 0, 0), 'C'); // normal content restored
     }
+
+    // ── Bracketed paste mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn bracketed_paste_enabled_by_2004h() {
+        let mut t = t(80, 24);
+        assert!(!t.state.bracketed_paste);
+        t.process(b"\x1b[?2004h");
+        assert!(t.state.bracketed_paste);
+    }
+
+    #[test]
+    fn bracketed_paste_disabled_by_2004l() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?2004h");
+        t.process(b"\x1b[?2004l");
+        assert!(!t.state.bracketed_paste);
+    }
+
+    #[test]
+    fn bracketed_paste_toggle_independent_of_alt_screen() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?2004h");
+        t.process(ENTER_ALT);
+        assert!(t.state.bracketed_paste);
+        t.process(LEAVE_ALT);
+        assert!(t.state.bracketed_paste);
+    }
+
+    // ── OSC 52 clipboard query ────────────────────────────────────────────────
+
+    #[test]
+    fn osc_52_query_sets_flag() {
+        let mut t = t(80, 24);
+        assert!(!t.state.osc_52_query);
+        // vte splits OSC params on ';', so params will be ["52", "c", "?"]
+        t.process(b"\x1b]52;c;?\x07");
+        assert!(t.state.osc_52_query);
+    }
+
+    #[test]
+    fn osc_52_query_flag_via_dispatch() {
+        // Direct osc_dispatch call — isolates parsing from vte.
+        let mut s = TerminalState::new(80, 24);
+        s.osc_dispatch(&[b"52", b"c", b"?"], false);
+        assert!(s.osc_52_query);
+    }
+
+    #[test]
+    fn osc_52_non_query_does_not_set_flag() {
+        let mut s = TerminalState::new(80, 24);
+        // A write (non-"?") payload must not set the query flag.
+        s.osc_dispatch(&[b"52", b"c", b"aGVsbG8="], false);
+        assert!(!s.osc_52_query);
+    }
+
+    #[test]
+    fn osc_52_query_flag_cleared_externally() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b]52;c;?\x07");
+        assert!(t.state.osc_52_query);
+        // Simulate host clearing the flag after responding.
+        t.state.osc_52_query = false;
+        assert!(!t.state.osc_52_query);
+    }
 }
 
 pub struct Terminal {

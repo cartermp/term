@@ -1480,7 +1480,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::find_urls;
+    use super::{base64_encode, find_urls};
     use crate::terminal::TerminalState;
 
     /// Write `text` into row 0 of a freshly-created state.
@@ -1621,5 +1621,56 @@ mod tests {
     fn preserves_path_and_query() {
         let u = "https://example.com/path?q=1&r=2#frag";
         assert_eq!(urls(u), vec![u]);
+    }
+
+    // ── base64_encode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn base64_empty() {
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn base64_well_known_vectors() {
+        // RFC 4648 test vectors
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_hello() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn base64_all_zeros() {
+        assert_eq!(base64_encode(&[0u8; 3]), "AAAA");
+    }
+
+    #[test]
+    fn base64_output_length_always_multiple_of_four() {
+        for len in 0..=9 {
+            let data = vec![0xffu8; len];
+            let encoded = base64_encode(&data);
+            assert_eq!(encoded.len() % 4, 0, "length {len} → encoded len {}", encoded.len());
+        }
+    }
+
+    #[test]
+    fn base64_padding_one_equals() {
+        // 2-byte input → 3 output chars + 1 '='
+        let enc = base64_encode(b"ab");
+        assert!(enc.ends_with('=') && !enc.ends_with("=="), "got: {enc}");
+    }
+
+    #[test]
+    fn base64_padding_two_equals() {
+        // 1-byte input → 2 output chars + "=="
+        let enc = base64_encode(b"a");
+        assert!(enc.ends_with("=="), "got: {enc}");
     }
 }
