@@ -77,9 +77,8 @@ pub fn ansi_256_color(index: u8) -> Color {
 // Ghost text — dim gray, clearly below regular text brightness
 pub const GHOST_COLOR: Color = Color::new(0x55, 0x55, 0x55);
 
-/// Alpha applied to terminal background cells (0x00 = pure vibrancy, 0xFF = opaque).
-/// At 0xCC (80 %) the blur shows through while text remains fully readable.
-pub const BG_ALPHA: u8 = 0xCC;
+/// Alpha applied to terminal background cells (0xFF = fully opaque).
+pub const BG_ALPHA: u8 = 0xFF;
 
 pub const FONT_SIZE_PT: f32 = 14.0;
 pub const WINDOW_WIDTH: u32 = 960;

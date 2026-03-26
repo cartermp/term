@@ -183,10 +183,6 @@ struct App {
     selecting: bool,
     sel_scroll: i32, // non-zero while dragging outside terminal bounds (auto-scroll)
 
-    // Custom presentation layer (macOS): bypasses softbuffer's NoneSkipFirst alpha
-    #[cfg(target_os = "macos")]
-    present_layer: Option<platform::PresentLayer>,
-
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
@@ -213,8 +209,6 @@ impl App {
             selection: None,
             selecting: false,
             sel_scroll: 0,
-            #[cfg(target_os = "macos")]
-            present_layer: None,
             cursor_visible: true,
             last_blink: Instant::now(),
             engine: Engine::new(),
@@ -832,18 +826,6 @@ impl App {
             &url_underlines,
         );
 
-        // On macOS, bypass softbuffer's present() which uses CGImageAlphaInfo::NoneSkipFirst
-        // (alpha byte ignored → everything opaque).  Our PresentLayer uses AlphaFirst so
-        // alpha=0 terminal-background pixels are genuinely transparent.
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(pl) = &mut self.present_layer {
-                pl.present(buf.as_ref(), w as u32, h as u32);
-                // Drop buf without calling .present() — no panic, softbuffer's buffer
-                // just frees its Vec on drop when present() is not called.
-                return;
-            }
-        }
         buf.present().unwrap();
     }
 
@@ -906,11 +888,6 @@ impl ApplicationHandler<AppEvent> for App {
         self.context = Some(context);
         self.surface = Some(surface);
         self.renderer = Some(renderer);
-        platform::setup_vibrancy(&window);
-        #[cfg(target_os = "macos")]
-        {
-            self.present_layer = platform::PresentLayer::new(&window);
-        }
         self.window = Some(window);
     }
 
