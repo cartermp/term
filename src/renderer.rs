@@ -606,9 +606,10 @@ impl Renderer {
 
     // ── Public render ─────────────────────────────────────────────────────────
 
-    /// `hover`     — visual index of hovered tab, or `tabs.len()` for the + button.
-    /// `selection` — normalized (r0, c0, r1, c1) in viewport coordinates, if any.
-    /// `drag`      — (from_orig, to_visual, cursor_x) preview while dragging a tab.
+    /// `hover`          — visual index of hovered tab, or `tabs.len()` for the + button.
+    /// `selection`      — normalized (r0, c0, r1, c1) in viewport coordinates, if any.
+    /// `drag`           — (from_orig, to_visual, cursor_x) preview while dragging a tab.
+    /// `url_underlines` — (row, col_start, col_end) spans to underline (URLs, shown when Cmd held).
     pub fn render(
         &mut self,
         buf: &mut [u32],
@@ -622,6 +623,7 @@ impl Renderer {
         hover: Option<usize>,
         selection: Option<(usize, usize, usize, usize)>,
         drag: Option<(usize, usize, f64)>,
+        url_underlines: &[(usize, usize, usize)],
     ) {
         buf.fill(DEFAULT_BG.to_u32());
 
@@ -691,7 +693,29 @@ impl Renderer {
             }
         }
 
-        // ── 2. Ghost text ─────────────────────────────────────────────────────
+        // ── 2. URL underlines (drawn when Cmd held) ───────────────────────────
+        if !url_underlines.is_empty() {
+            let u_col = Color::new(0x58, 0x9a, 0xdd).to_u32(); // muted blue
+            for &(row, c0, c1) in url_underlines {
+                if row >= vis_rows {
+                    continue;
+                }
+                let uy = tby + row * ch + ch.saturating_sub(2);
+                if uy >= bh {
+                    continue;
+                }
+                for col in c0..c1.min(vis_cols) {
+                    let base = uy * bw + col * cw;
+                    for dx in 0..cw {
+                        if base + dx < buf.len() {
+                            buf[base + dx] = u_col;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 3. Ghost text ─────────────────────────────────────────────────────
         if !state.is_scrolled_back()
             && let Some(g) = ghost {
                 let py = tby + state.cursor_row * ch;

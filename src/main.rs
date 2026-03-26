@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes};
+use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use completion::Engine;
 use config::{WINDOW_HEIGHT, WINDOW_WIDTH};
@@ -90,6 +90,53 @@ impl Tab {
             t
         }
     }
+}
+
+// ── URL detection ─────────────────────────────────────────────────────────────
+
+/// Scan the visible rows of `state` for http(s):// URLs.
+/// Returns `(row, col_start, col_end_exclusive, url_string)` for each span found.
+fn find_urls(
+    state: &terminal::TerminalState,
+    vis_rows: usize,
+    vis_cols: usize,
+) -> Vec<(usize, usize, usize, String)> {
+    let mut out = Vec::new();
+    for row in 0..vis_rows {
+        let cells: Vec<char> =
+            (0..vis_cols).map(|col| state.visual_cell(row, col).c).collect();
+        let mut col = 0;
+        while col < vis_cols {
+            let https = col + 8 <= vis_cols
+                && cells[col..col + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
+            let http = !https
+                && col + 7 <= vis_cols
+                && cells[col..col + 7] == ['h', 't', 't', 'p', ':', '/', '/'];
+            if https || http {
+                let start = col;
+                let mut end = col + if https { 8 } else { 7 };
+                while end < vis_cols {
+                    match cells[end] {
+                        ' ' | '\0' | '"' | '\'' | '`' | '<' | '>' | '\t' => break,
+                        _ => end += 1,
+                    }
+                }
+                // strip trailing punctuation unlikely to be part of the URL
+                while end > start {
+                    match cells[end - 1] {
+                        '.' | ',' | ')' | ';' | ':' => end -= 1,
+                        _ => break,
+                    }
+                }
+                let url: String = cells[start..end].iter().collect();
+                out.push((row, start, end, url));
+                col = end;
+            } else {
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -301,6 +348,27 @@ impl App {
         let row = ((my as usize).saturating_sub(tby)) / r.cell_height;
         let col = mx as usize / r.cell_width;
         Some((row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))))
+    }
+
+    /// Set the cursor icon based on whether Cmd is held and a URL is under the pointer.
+    fn update_cursor_icon(&self) {
+        let icon = if self.modifiers.super_key() {
+            let is_url = self
+                .pixel_to_cell(self.cursor_pos.0, self.cursor_pos.1)
+                .map(|(row, col)| {
+                    let (vis_cols, vis_rows) = self.term_size();
+                    find_urls(&self.active().terminal.state, vis_rows, vis_cols)
+                        .iter()
+                        .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+                })
+                .unwrap_or(false);
+            if is_url { CursorIcon::Pointer } else { CursorIcon::Default }
+        } else {
+            CursorIcon::Default
+        };
+        if let Some(w) = &self.window {
+            w.set_cursor(icon);
+        }
     }
 
     /// Extract the text covered by the current selection.
@@ -627,6 +695,16 @@ impl App {
         let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
         let show_cur = self.cursor_visible;
         let sel = self.selection.map(|s| s.normalized());
+        // Compute URL underlines (only when Cmd is held so they don't render every frame)
+        let url_underlines: Vec<(usize, usize, usize)> = if self.modifiers.super_key() {
+            let (vis_cols, vis_rows) = self.term_size();
+            find_urls(&self.tabs[ai].terminal.state, vis_rows, vis_cols)
+                .into_iter()
+                .map(|(r, c0, c1, _)| (r, c0, c1))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Extract drag state as owned values before any &mut borrows.
         let drag_vals = self.tab_drag.as_ref().map(|d| (d.active, d.from_idx, d.current_x));
         let drag_preview = drag_vals.and_then(|(active, from, cx)| {
@@ -667,6 +745,7 @@ impl App {
             hover,
             sel,
             drag_preview,
+            &url_underlines,
         );
         buf.present().unwrap();
     }
@@ -757,6 +836,10 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::ModifiersChanged(state) => {
                 self.modifiers = state.state();
+                self.update_cursor_icon();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -768,6 +851,7 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                self.update_cursor_icon();
                 let in_bar = self
                     .renderer
                     .as_ref()
@@ -853,11 +937,34 @@ impl ApplicationHandler<AppEvent> for App {
                         w.request_redraw();
                     }
                 } else {
-                    // Terminal area: start a selection drag
-                    self.tab_drag = None;
-                    self.selection = None;
-                    self.sel_anchor = self.pixel_to_cell(mx, my);
-                    self.selecting = true;
+                    // Terminal area: Cmd+click opens URL if one is under the cursor
+                    let sup = self.modifiers.super_key();
+                    let opened = if sup {
+                        let clicked = self.pixel_to_cell(mx, my);
+                        if let Some((row, col)) = clicked {
+                            let (vis_cols, vis_rows) = self.term_size();
+                            let url = find_urls(&self.active().terminal.state, vis_rows, vis_cols)
+                                .into_iter()
+                                .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+                                .map(|(_, _, _, u)| u);
+                            if let Some(u) = url {
+                                let _ = std::process::Command::new("open").arg(&u).spawn();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !opened {
+                        self.tab_drag = None;
+                        self.selection = None;
+                        self.sel_anchor = self.pixel_to_cell(mx, my);
+                        self.selecting = true;
+                    }
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1140,4 +1247,150 @@ fn main() {
     let mut app = App::new(first_tab, proxy);
     app.next_id = 1;
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_urls;
+    use crate::terminal::TerminalState;
+
+    /// Write `text` into row 0 of a freshly-created state.
+    fn make_state(text: &str) -> TerminalState {
+        let cols = text.chars().count().max(1);
+        let mut s = TerminalState::new(cols, 1);
+        for (i, c) in text.chars().enumerate() {
+            s.grid[0][i].c = c;
+        }
+        s
+    }
+
+    /// Convenience: collect just the URL strings from a single-row state.
+    fn urls(text: &str) -> Vec<String> {
+        let s = make_state(text);
+        let cols = s.cols;
+        find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect()
+    }
+
+    // ── happy-path detection ──────────────────────────────────────────────────
+
+    #[test]
+    fn detects_https() {
+        assert_eq!(urls("https://example.com"), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn detects_http() {
+        assert_eq!(urls("http://example.com"), vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn url_embedded_in_prose() {
+        assert_eq!(
+            urls("see https://example.com for details"),
+            vec!["https://example.com"]
+        );
+    }
+
+    // ── column span accuracy ──────────────────────────────────────────────────
+
+    #[test]
+    fn col_span_is_accurate() {
+        let text = "go to https://x.com now";
+        let s = make_state(text);
+        let cols = s.cols;
+        let spans = find_urls(&s, 1, cols);
+        assert_eq!(spans.len(), 1);
+        let (row, c0, c1, url) = &spans[0];
+        assert_eq!(*row, 0);
+        assert_eq!(*c0, 6); // "go to " is 6 chars
+        assert_eq!(*c1, 6 + url.len());
+        assert_eq!(url, "https://x.com");
+    }
+
+    // ── trailing punctuation stripping ────────────────────────────────────────
+
+    #[test]
+    fn strips_trailing_dot() {
+        assert_eq!(urls("https://example.com."), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn strips_trailing_comma() {
+        assert_eq!(urls("https://example.com,"), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn strips_trailing_paren() {
+        assert_eq!(urls("(https://example.com)"), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn strips_trailing_semicolon() {
+        assert_eq!(urls("https://example.com;"), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn strips_trailing_colon() {
+        assert_eq!(urls("https://example.com:"), vec!["https://example.com"]);
+    }
+
+    // ── termination at delimiters ─────────────────────────────────────────────
+
+    #[test]
+    fn stops_at_space() {
+        assert_eq!(urls("https://a.com https://b.com"), vec!["https://a.com", "https://b.com"]);
+    }
+
+    #[test]
+    fn stops_at_double_quote() {
+        assert_eq!(urls("\"https://a.com\""), vec!["https://a.com"]);
+    }
+
+    #[test]
+    fn stops_at_angle_bracket() {
+        assert_eq!(urls("<https://a.com>"), vec!["https://a.com"]);
+    }
+
+    // ── multi-row scanning ────────────────────────────────────────────────────
+
+    #[test]
+    fn finds_url_on_second_row() {
+        let cols = 20;
+        let mut s = TerminalState::new(cols, 2);
+        for (i, c) in "plain text".chars().enumerate() {
+            s.grid[0][i].c = c;
+        }
+        for (i, c) in "https://row2.io".chars().enumerate() {
+            s.grid[1][i].c = c;
+        }
+        let spans = find_urls(&s, 2, cols);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 1); // row 1
+        assert_eq!(spans[0].3, "https://row2.io");
+    }
+
+    // ── non-matches ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_urls_in_plain_text() {
+        assert!(urls("just some text").is_empty());
+    }
+
+    #[test]
+    fn partial_scheme_not_matched() {
+        assert!(urls("http:/only-one-slash").is_empty());
+    }
+
+    #[test]
+    fn empty_row_not_matched() {
+        assert!(urls(" ").is_empty());
+    }
+
+    // ── path and query preservation ───────────────────────────────────────────
+
+    #[test]
+    fn preserves_path_and_query() {
+        let u = "https://example.com/path?q=1&r=2#frag";
+        assert_eq!(urls(u), vec![u]);
+    }
 }
