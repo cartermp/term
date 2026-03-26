@@ -61,6 +61,10 @@ pub struct TerminalState {
     pub input_cursor: usize,
     /// Current working directory (sent via OSC 7 on each chpwd).
     pub current_dir: String,
+    /// Set by OSC 52 `?` query; cleared after the host responds.
+    pub osc_52_query: bool,
+    /// Whether the app has enabled bracketed paste mode (?2004h).
+    pub bracketed_paste: bool,
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
     wrap_next: bool,
@@ -102,6 +106,8 @@ impl TerminalState {
             alt_screen: false,
             alt_grid: vec![vec![Cell::default(); cols]; rows],
             alt_saved_cursor: (0, 0),
+            osc_52_query: false,
+            bracketed_paste: false,
         }
     }
 
@@ -535,6 +541,7 @@ impl Perform for TerminalState {
                     match param {
                         47 | 1047 => self.enter_alt_screen(false),
                         1049 => self.enter_alt_screen(true),
+                        2004 => self.bracketed_paste = true,
                         _ => {}
                     }
                 }
@@ -544,6 +551,7 @@ impl Perform for TerminalState {
                     match param {
                         47 | 1047 => self.leave_alt_screen(false),
                         1049 => self.leave_alt_screen(true),
+                        2004 => self.bracketed_paste = false,
                         _ => {}
                     }
                 }
@@ -604,6 +612,14 @@ impl Perform for TerminalState {
                     .unwrap_or(content);
                 if !path.is_empty() {
                     self.current_dir = path;
+                }
+            }
+            b"52" => {
+                // OSC 52 clipboard access.
+                // params: ["52", <selections>, <data>]
+                // A "?" payload is a read query; anything else is a write.
+                if params.len() >= 3 && params[2] == b"?" {
+                    self.osc_52_query = true;
                 }
             }
             b"9001" => {

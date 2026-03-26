@@ -183,6 +183,10 @@ struct App {
     selecting: bool,
     sel_scroll: i32, // non-zero while dragging outside terminal bounds (auto-scroll)
 
+    // Custom presentation layer (macOS): bypasses softbuffer's NoneSkipFirst alpha
+    #[cfg(target_os = "macos")]
+    present_layer: Option<platform::PresentLayer>,
+
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
@@ -209,6 +213,8 @@ impl App {
             selection: None,
             selecting: false,
             sel_scroll: 0,
+            #[cfg(target_os = "macos")]
+            present_layer: None,
             cursor_visible: true,
             last_blink: Instant::now(),
             engine: Engine::new(),
@@ -423,6 +429,63 @@ impl App {
         result
     }
 
+    /// Handle Cmd+V: paste text (with bracketed-paste wrapping if enabled),
+    /// or save a clipboard image to a temp file and write the path.
+    fn do_paste(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            // Image takes priority: save PNG to a temp file, write path to PTY.
+            if let Some(png) = platform::clipboard_png() {
+                let path = std::env::temp_dir().join(format!(
+                    "term_paste_{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                ));
+                if std::fs::write(&path, &png).is_ok() {
+                    let path_str = path.to_string_lossy();
+                    let bracketed = self.active().terminal.state.bracketed_paste;
+                    if bracketed {
+                        self.pty_write(b"\x1b[200~");
+                    }
+                    self.pty_write(path_str.as_bytes());
+                    if bracketed {
+                        self.pty_write(b"\x1b[201~");
+                    }
+                }
+                return;
+            }
+            if let Some(text) = platform::clipboard_text() {
+                if !text.is_empty() {
+                    let bracketed = self.active().terminal.state.bracketed_paste;
+                    if bracketed {
+                        self.pty_write(b"\x1b[200~");
+                    }
+                    self.pty_write(text.as_bytes());
+                    if bracketed {
+                        self.pty_write(b"\x1b[201~");
+                    }
+                }
+                return;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let text = paste_from_clipboard();
+            if !text.is_empty() {
+                let bracketed = self.active().terminal.state.bracketed_paste;
+                if bracketed {
+                    self.pty_write(b"\x1b[200~");
+                }
+                self.pty_write(text.as_bytes());
+                if bracketed {
+                    self.pty_write(b"\x1b[201~");
+                }
+            }
+        }
+    }
+
     fn prev_tab(&mut self) {
         self.active_tab = if self.active_tab == 0 {
             self.tabs.len() - 1
@@ -537,10 +600,7 @@ impl App {
                         }
                     }
                     "v" => {
-                        let text = paste_from_clipboard();
-                        if !text.is_empty() {
-                            self.pty_write(text.as_bytes());
-                        }
+                        self.do_paste();
                     }
                     "t" => {
                         self.open_tab();
@@ -771,6 +831,19 @@ impl App {
             drag_preview,
             &url_underlines,
         );
+
+        // On macOS, bypass softbuffer's present() which uses CGImageAlphaInfo::NoneSkipFirst
+        // (alpha byte ignored → everything opaque).  Our PresentLayer uses AlphaFirst so
+        // alpha=0 terminal-background pixels are genuinely transparent.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(pl) = &mut self.present_layer {
+                pl.present(buf.as_ref(), w as u32, h as u32);
+                // Drop buf without calling .present() — no panic, softbuffer's buffer
+                // just frees its Vec on drop when present() is not called.
+                return;
+            }
+        }
         buf.present().unwrap();
     }
 
@@ -834,6 +907,10 @@ impl ApplicationHandler<AppEvent> for App {
         self.surface = Some(surface);
         self.renderer = Some(renderer);
         platform::setup_vibrancy(&window);
+        #[cfg(target_os = "macos")]
+        {
+            self.present_layer = platform::PresentLayer::new(&window);
+        }
         self.window = Some(window);
     }
 
@@ -1134,6 +1211,14 @@ impl ApplicationHandler<AppEvent> for App {
                         let _ = tab.pty_writer.write_all(&r);
                         let _ = tab.pty_writer.flush();
                     }
+                    // OSC 52 clipboard query: respond with clipboard content.
+                    if tab.terminal.state.osc_52_query {
+                        tab.terminal.state.osc_52_query = false;
+                        let payload = osc52_clipboard_payload();
+                        let response = format!("\x1b]52;c;{payload}\x07");
+                        let _ = tab.pty_writer.write_all(response.as_bytes());
+                        let _ = tab.pty_writer.flush();
+                    }
                 }
                 // Update ghost text only for the active tab
                 if self.tabs.get(self.active_tab).map(|t| t.id) == Some(tab_id) {
@@ -1163,6 +1248,54 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
+
+/// Return the base64-encoded clipboard payload for an OSC 52 response.
+/// Prefers image (PNG) over text; returns empty string if clipboard is empty.
+fn osc52_clipboard_payload() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(png) = platform::clipboard_png() {
+            return base64_encode(&png);
+        }
+        if let Some(text) = platform::clipboard_text() {
+            if !text.is_empty() {
+                return base64_encode(text.as_bytes());
+            }
+        }
+        return String::new();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let text = paste_from_clipboard();
+        if text.is_empty() {
+            return String::new();
+        }
+        base64_encode(text.as_bytes())
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 3) << 4 | b1 >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((b1 & 15) << 2 | b2 >> 6) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
 
 fn copy_to_clipboard(text: &str) {
     use std::io::Write;
@@ -1204,6 +1337,7 @@ fn strip_tcat_gutter(text: &str) -> String {
         .join("\n")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn paste_from_clipboard() -> String {
     use std::process::Command;
     Command::new("pbpaste")
