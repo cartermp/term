@@ -56,15 +56,18 @@ Keyboard input goes the other direction: `winit KeyboardInput → handle_key →
 
 Glyph cache key is `(char, bold)`. Cache is never evicted (terminals use a small glyph set).
 
-## Syntax highlighting (`tcat`)
+## Syntax highlighting (`tcat` and `tdiff`)
 
-A second binary `src/bin/tcat.rs` is compiled alongside `term`. It reads a file, applies 24-bit true-color ANSI syntax highlighting via `syntect` (theme: `base16-ocean.dark`), and prints to stdout.
+`src/bin/tcat.rs` reads a file, applies 24-bit true-color ANSI syntax highlighting via `syntect` (theme: `base16-ocean.dark`), and prints to stdout.
+
+`src/bin/tdiff.rs` reads a unified diff from stdin, applies syntax highlighting to the code content, and renders added/removed lines with green/red background tints (Catppuccin Mocha palette). It is used as `GIT_PAGER` so `git diff`, `git show`, `git log -p`, etc. automatically render with syntax colors.
 
 On startup, `term` writes a ZDOTDIR-based zsh init that:
 1. Sources the user's real `~/.zshenv` and `~/.zshrc`
-2. Defines `function cat()` that calls `tcat` for single-file invocations, falling through to `command cat` otherwise
+2. Defines `function cat()` that calls `tcat` for single-file invocations
+3. Sets `GIT_PAGER=tdiff` and `GIT_COLOR_UI=never` so git hands raw diff to `tdiff`
 
-`tcat` lives next to the `term` binary in the build output dir (`target/debug/` or `target/release/`). Both must be built together — `cargo build` does this automatically.
+Both `tcat` and `tdiff` live next to the `term` binary in the build output dir. `cargo build` builds all three.
 
 ## Cursor
 

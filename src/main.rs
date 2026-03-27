@@ -1393,6 +1393,10 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
         .as_ref()
         .map(|d| d.join("tcat"))
         .filter(|p| p.exists());
+    let tdiff = exe_dir
+        .as_ref()
+        .map(|d| d.join("tdiff"))
+        .filter(|p| p.exists());
 
     let zdotdir = std::env::temp_dir().join(format!("term_zsh_{}", std::process::id()));
     if std::fs::create_dir_all(&zdotdir).is_err() {
@@ -1407,6 +1411,13 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
     let cat_fn = match &tcat {
         Some(p) => format!(
             "_TCAT='{}'\nfunction cat() {{\n  if [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
+            p.display()
+        ),
+        None => String::new(),
+    };
+    let diff_fn = match &tdiff {
+        Some(p) => format!(
+            "export GIT_PAGER='{}'\nexport GIT_COLOR_UI=never\n",
             p.display()
         ),
         None => String::new(),
@@ -1439,7 +1450,7 @@ _term_title_precmd
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
-         {cat_fn}{zle_hooks}"
+         {cat_fn}{diff_fn}{zle_hooks}"
     );
     let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 

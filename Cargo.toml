@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "tcat"
 path = "src/bin/tcat.rs"
 
+[[bin]]
+name = "tdiff"
+path = "src/bin/tdiff.rs"
+
 [dependencies]
 winit = "0.30"
 
