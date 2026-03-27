@@ -5,7 +5,6 @@ mod renderer;
 mod terminal;
 
 use std::io::{Read, Write};
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -192,8 +191,8 @@ fn find_urls(
 struct App {
     // Window / rendering
     window: Option<Arc<Window>>,
-    context: Option<softbuffer::Context<Arc<Window>>>,
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    wgpu_surface: Option<wgpu::Surface<'static>>,
+    wgpu_config: Option<wgpu::SurfaceConfiguration>,
     renderer: Option<Renderer>,
 
     // Tabs
@@ -227,8 +226,8 @@ impl App {
     fn new(first_tab: Tab, proxy: EventLoopProxy<AppEvent>) -> Self {
         Self {
             window: None,
-            context: None,
-            surface: None,
+            wgpu_surface: None,
+            wgpu_config: None,
             renderer: None,
             tabs: vec![first_tab],
             active_tab: 0,
@@ -846,7 +845,7 @@ impl App {
             }
         });
 
-        let surface = match &mut self.surface {
+        let wgpu_surface = match &self.wgpu_surface {
             Some(s) => s,
             None => return,
         };
@@ -855,19 +854,28 @@ impl App {
             None => return,
         };
 
-        surface
-            .resize(
-                NonZeroU32::new(w as u32).unwrap(),
-                NonZeroU32::new(h as u32).unwrap(),
-            )
-            .unwrap();
+        let output = match wgpu_surface.get_current_texture() {
+            Ok(o) => o,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                if let Some(cfg) = &self.wgpu_config {
+                    wgpu_surface.configure(&renderer.device, cfg);
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("surface error: {e}");
+                return;
+            }
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let state = unsafe { &*state_ptr };
-        let mut buf = surface.buffer_mut().unwrap();
         renderer.render(
-            buf.as_mut(),
-            w,
-            h,
+            &view,
+            w as u32,
+            h as u32,
             state,
             show_cur,
             ghost_owned.as_deref(),
@@ -879,10 +887,21 @@ impl App {
             &url_underlines,
         );
 
-        buf.present().unwrap();
+        output.present();
     }
 
     fn on_resize(&mut self, width: u32, height: u32) {
+        // Reconfigure the wgpu swap chain
+        if let (Some(surface), Some(cfg), Some(renderer)) = (
+            &self.wgpu_surface,
+            &mut self.wgpu_config,
+            &self.renderer,
+        ) {
+            cfg.width = width.max(1);
+            cfg.height = height.max(1);
+            surface.configure(&renderer.device, cfg);
+        }
+
         let (Some(renderer), _) = (&self.renderer, ()) else {
             return;
         };
@@ -913,9 +932,62 @@ impl ApplicationHandler<AppEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
-        let scale = window.scale_factor();
-        let renderer = Renderer::new(scale);
+        // ── wgpu initialisation ───────────────────────────────────────────────
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+
+        // Surface must be created before adapter so we can pass compatible_surface.
+        // Arc<Window> satisfies the 'static bound required for Surface<'static>.
+        let surface: wgpu::Surface<'static> = instance
+            .create_surface(window.clone())
+            .expect("create wgpu surface");
+
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            },
+        ))
+        .expect("no suitable GPU adapter");
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("term"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ))
+        .expect("request_device");
+
         let size = window.inner_size();
+        let caps = surface.get_capabilities(&adapter);
+        // Prefer non-sRGB to match existing colour values (raw u8 → float passthrough)
+        let surface_format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        // ── Build renderer ────────────────────────────────────────────────────
+        let scale = window.scale_factor();
+        let renderer = Renderer::new(device, queue, surface_format, scale);
+
         let (cols, rows) = {
             let cw = renderer.cell_width;
             let ch = renderer.cell_height;
@@ -936,10 +1008,8 @@ impl ApplicationHandler<AppEvent> for App {
             let _ = tab.pty_master.resize(pty_size);
         }
 
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.wgpu_surface = Some(surface);
+        self.wgpu_config = Some(config);
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -963,7 +1033,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.renderer = Some(Renderer::new(scale_factor));
+                if let Some(r) = self.renderer.take() {
+                    self.renderer = Some(r.rescale(scale_factor));
+                }
             }
 
             WindowEvent::ModifiersChanged(state) => {

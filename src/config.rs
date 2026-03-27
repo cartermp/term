@@ -14,14 +14,6 @@ impl Color {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
 
-    /// Pack as 0xFF_RR_GG_BB — fully opaque pixel for the softbuffer framebuffer.
-    /// On macOS the framebuffer format is BGRA; the top byte is the alpha channel.
-    /// Using 0xFF makes the pixel opaque; 0x00 (from `to_u32`) makes it transparent,
-    /// letting the NSVisualEffectView vibrancy show through.
-    pub fn to_u32_opaque(self) -> u32 {
-        0xFF_00_00_00 | self.to_u32()
-    }
-
     pub fn blend(self, fg: Color, alpha: u8) -> Color {
         let a = alpha as u32;
         let ia = 255 - a;
