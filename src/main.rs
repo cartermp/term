@@ -1233,7 +1233,9 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::PtyData { tab_id, data } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                    tab.terminal.state.snap_to_bottom();
+                    if !tab.terminal.state.is_scrolled_back() {
+                        tab.terminal.state.snap_to_bottom();
+                    }
                     tab.terminal.process(&data);
                     let responses: Vec<Vec<u8>> =
                         tab.terminal.state.pending_responses.drain(..).collect();
