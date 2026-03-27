@@ -13,7 +13,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use completion::Engine;
@@ -112,6 +112,38 @@ impl Tab {
 
 /// Scan the visible rows of `state` for http(s):// URLs.
 /// Returns `(row, col_start, col_end_exclusive, url_string)` for each span found.
+/// Map a physical key code to its base ASCII byte (unshifted, no modifiers).
+/// Used to recover the intended letter when Alt/Option produces a Unicode character (macOS).
+fn physical_key_to_ascii(kc: KeyCode) -> Option<u8> {
+    match kc {
+        KeyCode::KeyA => Some(b'a'), KeyCode::KeyB => Some(b'b'),
+        KeyCode::KeyC => Some(b'c'), KeyCode::KeyD => Some(b'd'),
+        KeyCode::KeyE => Some(b'e'), KeyCode::KeyF => Some(b'f'),
+        KeyCode::KeyG => Some(b'g'), KeyCode::KeyH => Some(b'h'),
+        KeyCode::KeyI => Some(b'i'), KeyCode::KeyJ => Some(b'j'),
+        KeyCode::KeyK => Some(b'k'), KeyCode::KeyL => Some(b'l'),
+        KeyCode::KeyM => Some(b'm'), KeyCode::KeyN => Some(b'n'),
+        KeyCode::KeyO => Some(b'o'), KeyCode::KeyP => Some(b'p'),
+        KeyCode::KeyQ => Some(b'q'), KeyCode::KeyR => Some(b'r'),
+        KeyCode::KeyS => Some(b's'), KeyCode::KeyT => Some(b't'),
+        KeyCode::KeyU => Some(b'u'), KeyCode::KeyV => Some(b'v'),
+        KeyCode::KeyW => Some(b'w'), KeyCode::KeyX => Some(b'x'),
+        KeyCode::KeyY => Some(b'y'), KeyCode::KeyZ => Some(b'z'),
+        KeyCode::Digit0 => Some(b'0'), KeyCode::Digit1 => Some(b'1'),
+        KeyCode::Digit2 => Some(b'2'), KeyCode::Digit3 => Some(b'3'),
+        KeyCode::Digit4 => Some(b'4'), KeyCode::Digit5 => Some(b'5'),
+        KeyCode::Digit6 => Some(b'6'), KeyCode::Digit7 => Some(b'7'),
+        KeyCode::Digit8 => Some(b'8'), KeyCode::Digit9 => Some(b'9'),
+        KeyCode::Minus => Some(b'-'),    KeyCode::Equal => Some(b'='),
+        KeyCode::BracketLeft => Some(b'['), KeyCode::BracketRight => Some(b']'),
+        KeyCode::Backslash => Some(b'\\'), KeyCode::Semicolon => Some(b';'),
+        KeyCode::Quote => Some(b'\''),   KeyCode::Backquote => Some(b'`'),
+        KeyCode::Comma => Some(b','),    KeyCode::Period => Some(b'.'),
+        KeyCode::Slash => Some(b'/'),
+        _ => None,
+    }
+}
+
 fn find_urls(
     state: &terminal::TerminalState,
     vis_rows: usize,
@@ -528,6 +560,7 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let sup = self.modifiers.super_key();
+        let shift = self.modifiers.shift_key();
 
         // Clear selection on any keypress, except Cmd+C (which copies it) and
         // bare modifier key presses (Cmd/Shift/Alt/Ctrl alone must not clear the
@@ -657,6 +690,18 @@ impl App {
             }
         }
 
+        // Shift+Enter → kitty Shift+Enter (must come before text path, which would send \r)
+        if shift && !ctrl && !alt && matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
+            self.active_mut().ghost_text = None;
+            self.pty_write(b"\x1b[13;2u");
+            return;
+        }
+        // Shift+Tab → reverse tab
+        if shift && !ctrl && !alt && matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
+            self.pty_write(b"\x1b[Z");
+            return;
+        }
+
         // ── Printable text ────────────────────────────────────────────────────
         if !ctrl && !alt
             && let Some(text) = &event.text {
@@ -709,19 +754,27 @@ impl App {
             Key::Named(NamedKey::Delete) => self.pty_write(b"\x1b[3~"),
             Key::Character(c) if ctrl => {
                 if let Some(ch) = c.chars().next() {
-                    let byte = (ch.to_ascii_lowercase() as u8)
-                        .wrapping_sub(b'a')
-                        .wrapping_add(1);
+                    let byte = match ch {
+                        // ctrl+shift+- on US keyboard produces '_'; readline uses \x1f for undo
+                        '_' => 0x1f_u8,
+                        ch => (ch.to_ascii_lowercase() as u8)
+                            .wrapping_sub(b'a')
+                            .wrapping_add(1),
+                    };
                     if byte > 0 && byte < 32 {
                         self.active_mut().ghost_text = None;
                         self.pty_write(&[byte]);
                     }
                 }
             }
-            Key::Character(c) if alt => {
-                let mut v = vec![0x1b_u8];
-                v.extend_from_slice(c.as_str().as_bytes());
-                self.pty_write(&v);
+            Key::Character(_) if alt => {
+                // On macOS, Option+letter produces a Unicode char (e.g. Option+P → "π").
+                // Use physical key to recover the base ASCII letter for ESC+letter encoding.
+                if let PhysicalKey::Code(kc) = event.physical_key {
+                    if let Some(ascii) = physical_key_to_ascii(kc) {
+                        self.pty_write(&[0x1b, ascii]);
+                    }
+                }
             }
             _ => {}
         }
