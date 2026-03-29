@@ -1,20 +1,28 @@
 //! tjson — streaming JSON prettifier with syntax highlighting.
 //!
-//! Reads stdin line by line. Lines that parse as JSON objects or arrays are
-//! pretty-printed with 24-bit ANSI colour (syntect, base16-ocean.dark theme).
-//! All other lines pass through unchanged.
+//! Two modes:
+//!   some-cmd | tjson          — filter mode: reads stdin line by line
+//!   tjson pnpm dev [args…]    — PTY mode: runs the command in a PTY so it
+//!                               sees a real terminal on stdout/stderr, then
+//!                               filters its combined output the same way.
+//!
+//! Lines that parse as JSON objects or arrays are pretty-printed with 24-bit
+//! ANSI colour (syntect, base16-ocean.dark theme). All other lines pass
+//! through unchanged.
 //!
 //! Usage:
 //!   pnpm dev | tjson
-//!   some-command | tjson
+//!   json pnpm dev            # via the shell alias (preferred — preserves TTY)
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-// ── ANSI helpers (mirrors tcat) ───────────────────────────────────────────────
+// ── ANSI helpers ──────────────────────────────────────────────────────────────
 
 fn fg(out: &mut impl Write, r: u8, g: u8, b: u8) -> io::Result<()> {
     write!(out, "\x1b[38;2;{r};{g};{b}m")
@@ -56,28 +64,44 @@ fn print_highlighted(
     Ok(())
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Core line processor (shared by both modes) ────────────────────────────────
 
-fn main() {
-    let ps = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+fn process_line(
+    line: &str,
+    out: &mut impl Write,
+    ps: &SyntaxSet,
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+    drain: &mut bool,
+) {
+    let trimmed = line.trim();
 
-    let syntax = ps
-        .find_syntax_by_extension("json")
-        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                match print_highlighted(out, &pretty, ps, syntax, theme) {
+                    Ok(()) => return,
+                    Err(_) => { *drain = true; return; }
+                }
+            }
+        }
+    }
 
-    let theme = ["base16-ocean.dark", "Solarized (dark)"]
-        .iter()
-        .find_map(|n| ts.themes.get(*n))
-        .or_else(|| ts.themes.values().next())
-        .expect("syntect has no themes");
+    // Non-JSON or failed parse: pass through unchanged.
+    if writeln!(out, "{line}").is_err() {
+        *drain = true;
+    }
+}
 
+// ── Filter mode: read from stdin ──────────────────────────────────────────────
+
+fn run_filter(
+    ps: &SyntaxSet,
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+) {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-
-    // When stdout breaks we switch to drain mode: keep reading stdin until EOF
-    // so the upstream process never sees a broken pipe (EPIPE). Node.js in
-    // particular crashes with an uncaughtException on unhandled EPIPE.
     let mut drain = false;
 
     for line in io::stdin().lock().lines() {
@@ -85,30 +109,89 @@ fn main() {
             Ok(l) => l,
             Err(_) => break,
         };
-
         if drain { continue; }
+        process_line(&line, &mut out, ps, syntax, theme, &mut drain);
+    }
+    let _ = out.flush();
+}
 
-        let trimmed = line.trim();
+// ── PTY mode: run a command so it sees a real terminal ────────────────────────
 
-        // Only attempt to parse lines that look like JSON objects or arrays.
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                    match print_highlighted(&mut out, &pretty, &ps, syntax, theme) {
-                        Ok(()) => continue,
-                        Err(_) => { drain = true; continue; }
-                    }
-                }
-            }
-        }
+fn run_pty(
+    args: &[String],
+    ps: &SyntaxSet,
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+) {
+    // Inherit terminal dimensions if available.
+    let cols: u16 = std::env::var("COLUMNS").ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(220);
+    let rows: u16 = std::env::var("LINES").ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
 
-        // Non-JSON or failed parse: pass through unchanged.
-        if writeln!(out, "{line}").is_err() {
-            drain = true;
-        }
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .expect("openpty failed");
+
+    let mut cmd = CommandBuilder::new(&args[0]);
+    for arg in &args[1..] {
+        cmd.arg(arg);
+    }
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn failed");
+    drop(pair.slave); // child owns the slave end
+
+    // PTY master gives us combined stdout+stderr from the child.
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut drain = false;
+
+    for line in BufReader::new(reader).lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if drain { continue; }
+        // PTY line endings are \r\n; BufRead::lines strips \n but leaves \r.
+        let line = line.strip_suffix('\r').unwrap_or(&line).to_owned();
+        process_line(&line, &mut out, ps, syntax, theme, &mut drain);
     }
 
     let _ = out.flush();
+
+    let exit_code = match child.wait() {
+        Ok(status) => if status.success() { 0 } else { 1 },
+        Err(_) => 1,
+    };
+    std::process::exit(exit_code);
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let ps = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+    let syntax = ps
+        .find_syntax_by_extension("json")
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
+    let theme = ["base16-ocean.dark", "Solarized (dark)"]
+        .iter()
+        .find_map(|n| ts.themes.get(*n))
+        .or_else(|| ts.themes.values().next())
+        .expect("syntect has no themes");
+
+    if args.is_empty() {
+        run_filter(&ps, syntax, theme);
+    } else {
+        run_pty(&args, &ps, syntax, theme);
+    }
 }
 
 #[cfg(test)]
@@ -153,15 +236,12 @@ mod tests {
     #[test]
     fn test_pretty_printed_multiline() {
         let out = highlighted(r#"{"a":1,"b":2}"#);
-        // Pretty-printing should produce at least 3 lines: opening brace, fields, closing brace
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() >= 3, "expected multi-line pretty output, got: {out:?}");
     }
 
-    // parse_check: non-JSON lines should not be accidentally parsed
     #[test]
     fn test_non_json_passthrough() {
-        // Simulate the passthrough branch directly.
         let line = "Next.js 16.2.0 (Turbopack)";
         let trimmed = line.trim();
         let would_parse = (trimmed.starts_with('{') || trimmed.starts_with('['))

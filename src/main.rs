@@ -1500,7 +1500,7 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
     };
     let json_fn = match &tjson {
         Some(p) => format!(
-            "_TJSON='{}'\nfunction json() {{ \"$_TJSON\"; }}\n",
+            "_TJSON='{}'\nfunction json() {{ \"$_TJSON\" \"$@\"; }}\n",
             p.display()
         ),
         None => String::new(),
@@ -1542,6 +1542,14 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 
     cmd.env("ZDOTDIR", &zdotdir);
     cmd.env("TERM_PROGRAM", "ghostty");
+    // Ensure UTF-8 locale so multi-byte characters aren't re-encoded via Mac Roman.
+    // Only set if not already present — respect the user's explicit locale choice.
+    if std::env::var("LANG").is_err() {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
+    if std::env::var("LC_ALL").is_err() {
+        cmd.env("LC_ALL", "en_US.UTF-8");
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
