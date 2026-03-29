@@ -15,9 +15,11 @@ echo "→ Creating app bundle at $APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
-# Copy both binaries — tcat must live next to term
-cp "$BIN_DIR/term" "$APP_BUNDLE/Contents/MacOS/term"
-cp "$BIN_DIR/tcat" "$APP_BUNDLE/Contents/MacOS/tcat"
+# Copy all binaries — tcat, tdiff, and tjson must live next to term
+cp "$BIN_DIR/term"  "$APP_BUNDLE/Contents/MacOS/term"
+cp "$BIN_DIR/tcat"  "$APP_BUNDLE/Contents/MacOS/tcat"
+cp "$BIN_DIR/tdiff" "$APP_BUNDLE/Contents/MacOS/tdiff"
+cp "$BIN_DIR/tjson" "$APP_BUNDLE/Contents/MacOS/tjson"
 
 # Build .icns from assets/icon.svg using macOS-native NSImage (no external tools needed)
 ICON_SVG="$REPO_DIR/assets/icon.svg"
