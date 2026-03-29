@@ -754,6 +754,120 @@ impl Renderer {
 
     // ── Tab bar builder ───────────────────────────────────────────────────────
 
+} // end impl Renderer (temporarily close so tab_bar_rects can be a free fn)
+
+/// Pure rect geometry for the tab bar — no GPU, no glyph cache, fully testable.
+///
+/// Returns `(bg_rects, fg_rects)`.  **bg_rects must be submitted to the GPU
+/// before the glyph pass** so that tab titles are drawn on top of the pill
+/// backgrounds.  fg_rects (separators, drag overlays, + button) go after.
+fn tab_bar_rects(
+    tby: f32,
+    bw: f32,
+    n_tabs: usize,
+    active: usize,
+    hover: Option<usize>,
+    drag: Option<(usize, usize, f64)>,
+) -> (Vec<RectInst>, Vec<RectInst>) {
+    let mut bg: Vec<RectInst> = Vec::new();
+    let mut fg: Vec<RectInst> = Vec::new();
+
+    let bar_bg   = rgb_f(0x14, 0x14, 0x14);
+    let outline  = rgb_f(0x58, 0x58, 0x58);
+    let hover_bg = rgb_f(0x26, 0x26, 0x26);
+    let sep_col  = rgb_f(0x2e, 0x2e, 0x2e);
+    let bottom   = rgb_f(0x2e, 0x2e, 0x2e);
+
+    // Bar background + bottom border
+    push_rect(&mut bg, 0., 0., bw, tby, bar_bg);
+    push_rect(&mut bg, 0., tby - 1., bw, 1., bottom);
+
+    let plus_area = tby;
+    let tabs_w    = bw - plus_area;
+    let n         = n_tabs.max(1);
+    let tab_w     = tabs_w / n as f32;
+    let pad_v     = 4.;
+    let pill_h    = tby - pad_v * 2.;
+
+    let visual_order: Vec<usize> = if let Some((from, to, _)) = drag {
+        let mut order: Vec<usize> = (0..n_tabs).collect();
+        if from < order.len() {
+            let item = order.remove(from);
+            order.insert(to.min(order.len()), item);
+        }
+        order
+    } else {
+        (0..n_tabs).collect()
+    };
+    let visual_active = visual_order.iter().position(|&i| i == active).unwrap_or(active);
+    let drag_orig = drag.map(|(from, _, _)| from);
+
+    for (vi, &orig_idx) in visual_order.iter().enumerate() {
+        let is_active   = orig_idx == active;
+        let is_dragging = drag_orig == Some(orig_idx);
+        let is_hover    = drag.is_none() && hover == Some(vi) && !is_active;
+
+        let tx = vi as f32 * tab_w;
+        if tx >= tabs_w { break; }
+        let tw    = if vi + 1 == n { tabs_w - tx } else { tab_w };
+        let pill_x = tx + 4.;
+        let pill_w = tw - 8.;
+
+        if is_dragging {
+            if vi > 0 && vi != visual_active && vi != visual_active + 1 {
+                push_rect(&mut fg, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
+            }
+            let ghost = rgb_f(0x38, 0x38, 0x38);
+            if pill_w > 2. && pill_h > 2. {
+                push_rect(&mut fg, pill_x, pad_v, pill_w, pill_h, ghost);
+                push_rect(&mut fg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
+            }
+            continue;
+        }
+
+        // Active pill and hover fill go in bg_rects so glyphs render on top.
+        if is_hover {
+            push_rect(&mut bg, pill_x, pad_v, pill_w, pill_h, hover_bg);
+        }
+        if is_active && pill_w > 2. && pill_h > 2. {
+            push_rect(&mut bg, pill_x, pad_v, pill_w, pill_h, outline);
+            push_rect(&mut bg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
+        }
+
+        // Separator
+        if vi > 0 && vi != visual_active && vi != visual_active + 1 {
+            push_rect(&mut fg, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
+        }
+    }
+
+    // Floating dragged tab pill
+    if let Some((_, _, cursor_x)) = drag {
+        let half       = tab_w / 2.;
+        let float_left = (cursor_x as f32 - half).max(0.).min(tabs_w - tab_w);
+        let pill_x     = float_left + 4.;
+        let pill_w     = tab_w - 8.;
+        let lifted_outline = rgb_f(0xa0, 0xa0, 0xa0);
+        let lifted_bg      = rgb_f(0x20, 0x20, 0x20);
+        if pill_w > 2. && pill_h > 2. {
+            push_rect(&mut fg, pill_x, pad_v, pill_w, pill_h, lifted_outline);
+            push_rect(&mut fg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., lifted_bg);
+        }
+    }
+
+    // + button (two thin rects forming a cross)
+    let plus_hover = hover == Some(n_tabs);
+    let plus_col   = if plus_hover { rgb_f(0x88, 0x88, 0x88) } else { rgb_f(0x44, 0x44, 0x44) };
+    let plus_cx    = bw - plus_area / 2.;
+    let plus_cy    = tby / 2.;
+    let arm        = 5.;
+    push_rect(&mut fg, plus_cx - arm, plus_cy - 1., arm * 2., 2., plus_col);
+    push_rect(&mut fg, plus_cx - 1., plus_cy - arm, 2., arm * 2., plus_col);
+
+    (bg, fg)
+}
+
+impl Renderer { // re-open impl
+
     fn build_tab_bar(
         &mut self,
         bg_rects: &mut Vec<RectInst>,
@@ -769,29 +883,23 @@ impl Renderer {
         let cw = self.cell_width as f32;
         let ch = self.cell_height as f32;
 
-        let bar_bg   = rgb_f(0x14, 0x14, 0x14);
-        let outline  = rgb_f(0x58, 0x58, 0x58);
-        let hover_bg = rgb_f(0x26, 0x26, 0x26);
-        let sep_col  = rgb_f(0x2e, 0x2e, 0x2e);
-        let bottom   = rgb_f(0x2e, 0x2e, 0x2e);
+        // All rect geometry delegated to the pure helper (testable without GPU).
+        let (new_bg, new_fg) = tab_bar_rects(tby, bw, tabs.len(), active, hover, drag);
+        bg_rects.extend(new_bg);
+        fg_rects.extend(new_fg);
+
+        // ── Glyph rendering ───────────────────────────────────────────────────
         let fg_act   = c2f(DEFAULT_FG);
         let fg_inact = rgb_f(0x66, 0x66, 0x66);
         let fg_sc    = rgb_f(0x3a, 0x3a, 0x3a);
 
-        // Bar background + bottom border
-        push_rect(bg_rects, 0., 0., bw, tby, bar_bg);
-        push_rect(bg_rects, 0., tby - 1., bw, 1., bottom);
-
         let plus_area = tby;
-        let tabs_w = bw - plus_area;
-        let n = tabs.len().max(1);
-        let tab_w = tabs_w / n as f32;
-        let pad_v = 4.;
-        let pill_h = tby - pad_v * 2.;
-        let text_y = (tby - ch) / 2.;
+        let tabs_w    = bw - plus_area;
+        let n         = tabs.len().max(1);
+        let tab_w     = tabs_w / n as f32;
+        let text_y    = (tby - ch) / 2.;
         let shortcut_w = 3. * cw;
 
-        // Compute visual order for drag
         let visual_order: Vec<usize> = if let Some((from, to, _)) = drag {
             let mut order: Vec<usize> = (0..tabs.len()).collect();
             if from < order.len() {
@@ -802,52 +910,18 @@ impl Renderer {
         } else {
             (0..tabs.len()).collect()
         };
-        let visual_active = visual_order
-            .iter()
-            .position(|&i| i == active)
-            .unwrap_or(active);
         let drag_orig = drag.map(|(from, _, _)| from);
 
         for (vi, &orig_idx) in visual_order.iter().enumerate() {
             let title = &tabs[orig_idx];
-            let is_active = orig_idx == active;
+            let is_active  = orig_idx == active;
             let is_dragging = drag_orig == Some(orig_idx);
-            let is_hover = drag.is_none() && hover == Some(vi) && !is_active;
 
             let tx = vi as f32 * tab_w;
-            if tx >= tabs_w {
-                break;
-            }
+            if tx >= tabs_w { break; }
             let tw = if vi + 1 == n { tabs_w - tx } else { tab_w };
-            let pill_x = tx + 4.;
-            let pill_w = tw - 8.;
 
-            if is_dragging {
-                // Separator on dragged slot
-                if vi > 0 && vi != visual_active && vi != visual_active + 1 {
-                    push_rect(fg_rects, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
-                }
-                // Ghost outline (simple rect approximation for rounded rect)
-                let ghost = rgb_f(0x38, 0x38, 0x38);
-                if pill_w > 2. && pill_h > 2. {
-                    push_rect(fg_rects, pill_x, pad_v, pill_w, pill_h, ghost);
-                    push_rect(fg_rects, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
-                }
-                continue;
-            }
-
-            if is_hover {
-                push_rect(fg_rects, pill_x, pad_v, pill_w, pill_h, hover_bg);
-            }
-            if is_active && pill_w > 2. && pill_h > 2. {
-                push_rect(fg_rects, pill_x, pad_v, pill_w, pill_h, outline);
-                push_rect(fg_rects, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
-            }
-
-            // Separator
-            if vi > 0 && vi != visual_active && vi != visual_active + 1 {
-                push_rect(fg_rects, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
-            }
+            if is_dragging { continue; }
 
             // ⌘N shortcut
             let shortcut = format!("\u{2318}{}", orig_idx + 1);
@@ -861,66 +935,38 @@ impl Renderer {
 
             // Title
             let fg = if is_active { fg_act } else { fg_inact };
-            let left_pad = tx + cw;
+            let left_pad  = tx + cw;
             let right_edge = tx + tw - shortcut_w - cw;
-            let max_cols = ((right_edge - left_pad) / cw).max(0.) as usize;
+            let max_cols  = ((right_edge - left_pad) / cw).max(0.) as usize;
             let chars: Vec<char> = title.chars().collect();
-            let show_n = chars.len().min(max_cols);
+            let show_n    = chars.len().min(max_cols);
             let truncated = show_n < chars.len();
             for (ci, &c) in chars[..show_n].iter().enumerate() {
-                let cpx = left_pad + ci as f32 * cw;
+                let cpx    = left_pad + ci as f32 * cw;
                 let draw_c = if truncated && ci + 1 == show_n { '\u{2026}' } else { c };
                 self.emit_char(glyphs, draw_c, cpx, text_y, fg);
             }
         }
 
-        // Floating dragged tab
+        // Floating dragged tab title
         if let Some((from_orig, _, cursor_x)) = drag {
-            let title = &tabs[from_orig];
+            let title     = &tabs[from_orig];
             let is_active = from_orig == active;
-
-            let half = tab_w / 2.;
-            let float_left = (cursor_x as f32 - half)
-                .max(0.)
-                .min(tabs_w - tab_w);
-            let pill_x = float_left + 4.;
-            let pill_w = tab_w - 8.;
-
-            let lifted_outline = rgb_f(0xa0, 0xa0, 0xa0);
-            let lifted_bg = rgb_f(0x20, 0x20, 0x20);
-            if pill_w > 2. && pill_h > 2. {
-                push_rect(fg_rects, pill_x, pad_v, pill_w, pill_h, lifted_outline);
-                push_rect(fg_rects, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., lifted_bg);
-            }
-
-            let fg = if is_active { fg_act } else { rgb_f(0xcc, 0xcc, 0xcc) };
-            let left_pad = float_left + cw;
+            let half      = tab_w / 2.;
+            let float_left = (cursor_x as f32 - half).max(0.).min(tabs_w - tab_w);
+            let left_pad  = float_left + cw;
             let right_edge = float_left + tab_w - shortcut_w - cw;
-            let max_cols = ((right_edge - left_pad) / cw).max(0.) as usize;
+            let max_cols  = ((right_edge - left_pad) / cw).max(0.) as usize;
             let chars: Vec<char> = title.chars().collect();
-            let show_n = chars.len().min(max_cols);
+            let show_n    = chars.len().min(max_cols);
             let truncated = show_n < chars.len();
+            let fg = if is_active { fg_act } else { rgb_f(0xcc, 0xcc, 0xcc) };
             for (ci, &c) in chars[..show_n].iter().enumerate() {
-                let cpx = left_pad + ci as f32 * cw;
+                let cpx    = left_pad + ci as f32 * cw;
                 let draw_c = if truncated && ci + 1 == show_n { '\u{2026}' } else { c };
                 self.emit_char(glyphs, draw_c, cpx, text_y, fg);
             }
         }
-
-        // + button: draw a simple cross (two thin rects)
-        let plus_hover = hover == Some(tabs.len());
-        let plus_col = if plus_hover {
-            rgb_f(0x88, 0x88, 0x88)
-        } else {
-            rgb_f(0x44, 0x44, 0x44)
-        };
-        let plus_cx = bw - plus_area / 2.;
-        let plus_cy = tby / 2.;
-        let arm = 5.;
-        // horizontal bar
-        push_rect(fg_rects, plus_cx - arm, plus_cy - 1., arm * 2., 2., plus_col);
-        // vertical bar
-        push_rect(fg_rects, plus_cx - 1., plus_cy - arm, 2., arm * 2., plus_col);
     }
 
     // ── Public render ─────────────────────────────────────────────────────────
@@ -1201,5 +1247,99 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convenience: call tab_bar_rects with typical screen dimensions.
+    fn geom(
+        n_tabs: usize,
+        active: usize,
+        hover: Option<usize>,
+        drag: Option<(usize, usize, f64)>,
+    ) -> (Vec<RectInst>, Vec<RectInst>) {
+        tab_bar_rects(
+            36.,   // tby — typical tab bar height
+            800.,  // bw  — typical window width
+            n_tabs,
+            active,
+            hover,
+            drag,
+        )
+    }
+
+    // ── Regression: active tab pill must not overwrite tab title text ─────────
+    //
+    // Draw order: bg_rects (pass 1) → glyphs (pass 3) → fg_rects (pass 4).
+    // If the active pill lands in fg_rects it is drawn AFTER the glyphs and
+    // paints over the title, making it invisible.
+
+    #[test]
+    fn active_pill_outline_in_bg_not_fg() {
+        let outline = rgb_f(0x58, 0x58, 0x58);
+        let (bg, fg) = geom(2, 0, None, None);
+        assert!(
+            bg.iter().any(|r| r.color == outline),
+            "active tab outline must be in bg_rects so glyphs render on top"
+        );
+        assert!(
+            !fg.iter().any(|r| r.color == outline),
+            "active tab outline in fg_rects — it would be drawn after glyphs and cover the title"
+        );
+    }
+
+    #[test]
+    fn active_pill_only_one_outline_rect() {
+        // Exactly one outline rect regardless of how many tabs exist.
+        let outline = rgb_f(0x58, 0x58, 0x58);
+        for n in 1..=5 {
+            let (bg, _) = geom(n, 0, None, None);
+            let count = bg.iter().filter(|r| r.color == outline).count();
+            assert_eq!(count, 1, "expected exactly 1 outline rect with {n} tabs");
+        }
+    }
+
+    #[test]
+    fn hover_bg_in_bg_not_fg() {
+        let hover_bg = rgb_f(0x26, 0x26, 0x26);
+        // Hover over tab 1 while tab 0 is active.
+        let (bg, fg) = geom(3, 0, Some(1), None);
+        assert!(
+            bg.iter().any(|r| r.color == hover_bg),
+            "hover background must be in bg_rects"
+        );
+        assert!(
+            !fg.iter().any(|r| r.color == hover_bg),
+            "hover background in fg_rects — it would cover the tab title"
+        );
+    }
+
+    #[test]
+    fn inactive_tab_gets_no_outline() {
+        // Only the active tab should have an outline rect.
+        let outline = rgb_f(0x58, 0x58, 0x58);
+        let (bg, _) = geom(3, 1, None, None); // active = 1
+        let count = bg.iter().filter(|r| r.color == outline).count();
+        assert_eq!(count, 1, "inactive tabs must not get an outline pill");
+    }
+
+    #[test]
+    fn bar_background_is_first_bg_rect() {
+        let bar_bg = rgb_f(0x14, 0x14, 0x14);
+        let (bg, _) = geom(1, 0, None, None);
+        assert!(!bg.is_empty());
+        assert_eq!(bg[0].color, bar_bg, "first bg rect must be the bar background fill");
+    }
+
+    #[test]
+    fn plus_button_rects_are_in_fg() {
+        // The + button is always in fg_rects (it's an overlay, not a background).
+        let plus_col = rgb_f(0x44, 0x44, 0x44); // non-hover colour
+        let (_, fg) = geom(1, 0, None, None);
+        let count = fg.iter().filter(|r| r.color == plus_col).count();
+        assert_eq!(count, 2, "plus button needs 2 fg rects (horizontal + vertical arm)");
     }
 }

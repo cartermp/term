@@ -1469,6 +1469,10 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
         .as_ref()
         .map(|d| d.join("tdiff"))
         .filter(|p| p.exists());
+    let tjson = exe_dir
+        .as_ref()
+        .map(|d| d.join("tjson"))
+        .filter(|p| p.exists());
 
     let zdotdir = std::env::temp_dir().join(format!("term_zsh_{}", std::process::id()));
     if std::fs::create_dir_all(&zdotdir).is_err() {
@@ -1490,6 +1494,13 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
     let diff_fn = match &tdiff {
         Some(p) => format!(
             "export GIT_PAGER='{}'\nexport GIT_COLOR_UI=never\n",
+            p.display()
+        ),
+        None => String::new(),
+    };
+    let json_fn = match &tjson {
+        Some(p) => format!(
+            "_TJSON='{}'\nfunction json() {{ \"$_TJSON\"; }}\n",
             p.display()
         ),
         None => String::new(),
@@ -1525,7 +1536,7 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
-         {cat_fn}{diff_fn}{zle_hooks}"
+         {cat_fn}{diff_fn}{json_fn}{zle_hooks}"
     );
     let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 
