@@ -54,9 +54,36 @@ fn write_span(out: &mut impl Write, style: Style, text: &str) -> io::Result<()> 
     reset(out)
 }
 
+// ── Path / range parsing ──────────────────────────────────────────────────────
+
+/// Split `"path/file.rs:40-70"` into `("path/file.rs", Some((40, 70)))`.
+/// Also accepts `"file.rs:40"` as a single-line range `Some((40, 40))`.
+/// Returns `(arg, None)` unchanged if no valid range suffix is found.
+fn parse_path_range(arg: &str) -> (&str, Option<(usize, usize)>) {
+    if let Some(colon) = arg.rfind(':') {
+        let range_str = &arg[colon + 1..];
+        let path = &arg[..colon];
+        if let Some(dash) = range_str.find('-') {
+            let (s, e) = (&range_str[..dash], &range_str[dash + 1..]);
+            if let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) {
+                return (path, Some((start, end)));
+            }
+        }
+        if let Ok(line) = range_str.parse::<usize>() {
+            return (path, Some((line, line)));
+        }
+    }
+    (arg, None)
+}
+
 // ── Header ────────────────────────────────────────────────────────────────────
 
-fn print_header(out: &mut impl Write, path: &str, lang: &str) -> io::Result<()> {
+fn print_header(
+    out: &mut impl Write,
+    path: &str,
+    lang: &str,
+    range: Option<(usize, usize)>,
+) -> io::Result<()> {
     // Extract just the filename for display
     let name = std::path::Path::new(path)
         .file_name()
@@ -82,6 +109,17 @@ fn print_header(out: &mut impl Write, path: &str, lang: &str) -> io::Result<()> 
     fg(out, lr, lg, lb)?;
     write!(out, "{name}")?;
     reset(out)?;
+
+    // Line range suffix, e.g. ":40–70"
+    if let Some((start, end)) = range {
+        fg(out, or_, og, ob)?;
+        if start == end {
+            write!(out, ":{start}")?;
+        } else {
+            write!(out, ":{start}–{end}")?;
+        }
+        reset(out)?;
+    }
 
     if !lang.is_empty() && lang != "Plain Text" {
         // separator dots
@@ -135,13 +173,19 @@ fn print_footer(out: &mut impl Write) -> io::Result<()> {
 
 // ── Core highlight ────────────────────────────────────────────────────────────
 
-fn highlight_file(path: &str, ps: &SyntaxSet, ts: &ThemeSet) -> io::Result<()> {
+fn highlight_file(
+    path: &str,
+    range: Option<(usize, usize)>,
+    ps: &SyntaxSet,
+    ts: &ThemeSet,
+) -> io::Result<()> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
 
     let syntax = ps
         .find_syntax_for_file(path)
-        .unwrap_or(None)
+        .ok()
+        .flatten()
         .unwrap_or_else(|| ps.find_syntax_plain_text());
 
     let lang = syntax.name.as_str();
@@ -158,15 +202,28 @@ fn highlight_file(path: &str, ps: &SyntaxSet, ts: &ThemeSet) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
-    print_header(&mut out, path, lang)?;
+    print_header(&mut out, path, lang, range)?;
 
-    let total_lines = content.lines().count();
-    let gutter_width = total_lines.to_string().len().max(2);
+    let total_lines = LinesWithEndings::from(&content).count();
+    // Gutter width based on the last visible line number.
+    let last_visible = range.map(|(_, e)| e.min(total_lines)).unwrap_or(total_lines);
+    let gutter_width = last_visible.to_string().len().max(2);
     let (or_, og, ob) = OVERLAY0;
     let (sfr, sfg, sfb) = SURFACE1;
 
     for (i, line) in LinesWithEndings::from(&content).enumerate() {
         let lineno = i + 1;
+
+        if let Some((start, end)) = range {
+            if lineno < start {
+                // Still must feed lines to the highlighter to maintain parser state.
+                let _ = h.highlight_line(line, ps);
+                continue;
+            }
+            if lineno > end {
+                break;
+            }
+        }
 
         // Gutter: "  N │ "
         out.write_all(b"  ")?;
@@ -182,12 +239,10 @@ fn highlight_file(path: &str, ps: &SyntaxSet, ts: &ThemeSet) -> io::Result<()> {
         // Highlighted content
         let ranges = h.highlight_line(line, ps).unwrap_or_default();
         for (style, text) in &ranges {
-            // Strip trailing newline from the last span so reset doesn't leave colour on blank line
-            let t = if let Some(stripped) = text.strip_suffix('\n') {
-                stripped
-            } else {
-                text
-            };
+            // Strip trailing line ending (\n or \r\n) so reset doesn't leave
+            // colour on the blank line, and \r doesn't overwrite the gutter.
+            let t = text.strip_suffix('\n').unwrap_or(text);
+            let t = t.strip_suffix('\r').unwrap_or(t);
             if !t.is_empty() {
                 write_span(&mut out, *style, t)?;
             }
@@ -207,8 +262,14 @@ fn main() {
     if args.is_empty() {
         // stdin passthrough
         let mut buf = Vec::new();
-        let _ = io::stdin().read_to_end(&mut buf);
-        let _ = io::stdout().write_all(&buf);
+        if let Err(e) = io::stdin().read_to_end(&mut buf) {
+            eprintln!("tcat: stdin: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) = io::stdout().write_all(&buf) {
+            eprintln!("tcat: stdout: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -223,11 +284,226 @@ fn main() {
     let ts = ThemeSet::load_defaults();
 
     let mut exit_code = 0i32;
-    for file in &args {
-        if let Err(e) = highlight_file(file, &ps, &ts) {
-            eprintln!("cat: {e}");
+    for arg in &args {
+        let (path, range) = parse_path_range(arg);
+        if let Err(e) = highlight_file(path, range, &ps, &ts) {
+            eprintln!("tcat: {e}");
             exit_code = 1;
         }
     }
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syntect::highlighting::{Color, FontStyle, Style};
+
+    fn color(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 255 }
+    }
+
+    fn plain_style(r: u8, g: u8, b: u8) -> Style {
+        Style {
+            foreground: color(r, g, b),
+            background: color(0, 0, 0),
+            font_style: FontStyle::empty(),
+        }
+    }
+
+    fn capture(f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    // ── ANSI helpers ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fg_sequence() {
+        let out = capture(|b| fg(b, 255, 128, 0));
+        assert_eq!(out, "\x1b[38;2;255;128;0m");
+    }
+
+    #[test]
+    fn test_reset_sequence() {
+        let out = capture(|b| reset(b));
+        assert_eq!(out, "\x1b[0m");
+    }
+
+    #[test]
+    fn test_bold_sequence() {
+        let out = capture(|b| bold(b));
+        assert_eq!(out, "\x1b[1m");
+    }
+
+    // ── write_span ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_span_plain() {
+        let style = plain_style(100, 200, 50);
+        let out = capture(|b| write_span(b, style, "hello"));
+        // fg + text + reset
+        assert!(out.starts_with("\x1b[38;2;100;200;50m"), "missing fg: {out:?}");
+        assert!(out.contains("hello"), "missing text: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "missing reset: {out:?}");
+    }
+
+    #[test]
+    fn test_write_span_bold() {
+        let style = Style {
+            foreground: color(1, 2, 3),
+            background: color(0, 0, 0),
+            font_style: FontStyle::BOLD,
+        };
+        let out = capture(|b| write_span(b, style, "x"));
+        assert!(out.contains("\x1b[1m"), "missing bold: {out:?}");
+    }
+
+    #[test]
+    fn test_write_span_italic() {
+        let style = Style {
+            foreground: color(1, 2, 3),
+            background: color(0, 0, 0),
+            font_style: FontStyle::ITALIC,
+        };
+        let out = capture(|b| write_span(b, style, "x"));
+        assert!(out.contains("\x1b[3m"), "missing italic: {out:?}");
+    }
+
+    #[test]
+    fn test_write_span_underline() {
+        let style = Style {
+            foreground: color(1, 2, 3),
+            background: color(0, 0, 0),
+            font_style: FontStyle::UNDERLINE,
+        };
+        let out = capture(|b| write_span(b, style, "x"));
+        assert!(out.contains("\x1b[4m"), "missing underline: {out:?}");
+    }
+
+    #[test]
+    fn test_write_span_empty_text() {
+        // empty span should still emit fg + reset (caller skips via the !t.is_empty() guard,
+        // but write_span itself must not panic)
+        let style = plain_style(10, 20, 30);
+        capture(|b| write_span(b, style, ""));
+    }
+
+    // ── Header / footer ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_print_header_contains_filename() {
+        let out = capture(|b| print_header(b, "src/main.rs", "Rust", None));
+        assert!(out.contains("main.rs"), "filename not found: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_contains_lang() {
+        let out = capture(|b| print_header(b, "foo.rs", "Rust", None));
+        assert!(out.contains("Rust"), "lang not found: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_plain_text_lang_hidden() {
+        let out = capture(|b| print_header(b, "notes.txt", "Plain Text", None));
+        assert!(!out.contains("Plain Text"), "plain text lang leaked: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_empty_lang_hidden() {
+        let out = capture(|b| print_header(b, "notes", "", None));
+        assert!(!out.contains("·"), "separator shown for empty lang: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_with_directory() {
+        let out = capture(|b| print_header(b, "src/foo.rs", "Rust", None));
+        assert!(out.contains("src/"), "directory not shown: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_no_directory_for_bare_filename() {
+        let out = capture(|b| print_header(b, "foo.rs", "Rust", None));
+        assert!(!out.contains("//"), "double slash: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_range_shown() {
+        let out = capture(|b| print_header(b, "foo.rs", "Rust", Some((10, 30))));
+        assert!(out.contains("10"), "start line missing: {out:?}");
+        assert!(out.contains("30"), "end line missing: {out:?}");
+    }
+
+    #[test]
+    fn test_print_header_single_line_range() {
+        let out = capture(|b| print_header(b, "foo.rs", "Rust", Some((42, 42))));
+        assert!(out.contains(":42"), "single line ref missing: {out:?}");
+    }
+
+    // ── parse_path_range ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_range_start_end() {
+        assert_eq!(parse_path_range("foo.rs:10-50"), ("foo.rs", Some((10, 50))));
+    }
+
+    #[test]
+    fn test_parse_range_single_line() {
+        assert_eq!(parse_path_range("src/main.rs:42"), ("src/main.rs", Some((42, 42))));
+    }
+
+    #[test]
+    fn test_parse_range_none_for_plain_path() {
+        assert_eq!(parse_path_range("src/main.rs"), ("src/main.rs", None));
+    }
+
+    #[test]
+    fn test_parse_range_none_for_non_numeric_suffix() {
+        // "foo.rs:bar" has a colon but no valid number — fall through unchanged
+        assert_eq!(parse_path_range("foo.rs:bar"), ("foo.rs:bar", None));
+    }
+
+    #[test]
+    fn test_parse_range_uses_last_colon() {
+        // Path with multiple colons: only the last is treated as range separator
+        assert_eq!(
+            parse_path_range("a:b/foo.rs:5-10"),
+            ("a:b/foo.rs", Some((5, 10)))
+        );
+    }
+
+    #[test]
+    fn test_print_footer_contains_corner() {
+        let out = capture(|b| print_footer(b));
+        assert!(out.contains("╰─"), "footer corner missing: {out:?}");
+    }
+
+    // ── CRLF handling ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_crlf_stripping_leaves_no_cr() {
+        // Simulate what the render loop does for a CRLF span.
+        let text = "hello\r\n";
+        let t = text.strip_suffix('\n').unwrap_or(text);
+        let t = t.strip_suffix('\r').unwrap_or(t);
+        assert_eq!(t, "hello", "CR not stripped: {t:?}");
+    }
+
+    #[test]
+    fn test_lf_only_stripping() {
+        let text = "hello\n";
+        let t = text.strip_suffix('\n').unwrap_or(text);
+        let t = t.strip_suffix('\r').unwrap_or(t);
+        assert_eq!(t, "hello");
+    }
+
+    #[test]
+    fn test_no_newline_span_unchanged() {
+        // Last span on a line might have no newline at all
+        let text = "world";
+        let t = text.strip_suffix('\n').unwrap_or(text);
+        let t = t.strip_suffix('\r').unwrap_or(t);
+        assert_eq!(t, "world");
+    }
 }

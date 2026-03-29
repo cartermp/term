@@ -1516,6 +1516,9 @@ precmd_functions+=( _term_title_precmd )
 chpwd_functions+=( _term_chpwd )
 _term_chpwd
 _term_title_precmd
+# Case-insensitive tab completion (e.g. c<TAB> completes Cargo.toml)
+autoload -Uz compinit && compinit -C
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 "#;
 
     let zshrc = format!(
