@@ -147,5 +147,6 @@ Edit `FONT_SIZE_PT` in `src/config.rs`. The renderer scales by the window's DPI 
 - **DPI**: `Renderer` stores physical-pixel sizes. Window resize events from winit give physical pixels. `LogicalSize` is only used for the initial window creation.
 - **PTY slave lifetime**: drop `pair.slave` after `spawn_command` — keeping it open prevents the reader thread from ever seeing EOF when the shell exits.
 - **Alternate screen**: `alt_grid` and `alt_saved_cursor` are separate from the normal grid. Operations on the live grid (scrollback push, viewport snap) must check `alt_screen` and skip when true.
+- **tjson cwd**: `CommandBuilder::new()` defaults to the process's home directory, not `current_dir()`. Always call `cmd.cwd(std::env::current_dir()?)` so the spawned command runs in the same directory as the shell invoking `tjson`.
 - **UTF-8 in tjson**: `BufReader::lines()` requires valid UTF-8. If the PTY output contains raw C1 bytes (0x80–0x9F) that aren't part of a multi-byte sequence, `lines()` will error and the loop will break. Be aware of this if expanding `run_pty`.
 - **GPU buffer growth**: `rect_buf` and `glyph_buf` are grown on demand by reallocating. The capacity is tracked in `rect_buf_cap` / `glyph_buf_cap`. Don't assume a fixed size.

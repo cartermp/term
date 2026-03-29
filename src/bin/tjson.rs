@@ -14,7 +14,7 @@
 //!   pnpm dev | tjson
 //!   json pnpm dev            # via the shell alias (preferred — preserves TTY)
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use syntect::easy::HighlightLines;
@@ -140,29 +140,62 @@ fn run_pty(
     for arg in &args[1..] {
         cmd.arg(arg);
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    // Force UTF-8 locale so multi-byte characters aren't re-encoded via Mac Roman.
+    cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("LC_ALL", "en_US.UTF-8");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn failed");
     drop(pair.slave); // child owns the slave end
 
     // PTY master gives us combined stdout+stderr from the child.
-    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
 
     let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = stdout.lock();
     let mut drain = false;
 
-    for line in BufReader::new(reader).lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    // Read raw bytes to avoid String round-trips that can corrupt multi-byte
+    // sequences when the locale isn't UTF-8.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
         };
-        if drain { continue; }
-        // PTY line endings are \r\n; BufRead::lines strips \n but leaves \r.
-        let line = line.strip_suffix('\r').unwrap_or(&line).to_owned();
-        process_line(&line, &mut out, ps, syntax, theme, &mut drain);
+        buf.extend_from_slice(&chunk[..n]);
+
+        // Process all complete lines (ending with \n) in the buffer.
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let mut line_bytes = buf.drain(..=pos).collect::<Vec<u8>>();
+            // Strip trailing \n and \r\n.
+            if line_bytes.last() == Some(&b'\n') { line_bytes.pop(); }
+            if line_bytes.last() == Some(&b'\r') { line_bytes.pop(); }
+
+            if drain { continue; }
+
+            // Try to interpret as UTF-8 for JSON detection; fall back to raw write.
+            match std::str::from_utf8(&line_bytes) {
+                Ok(line) => process_line(line, &mut out, ps, syntax, theme, &mut drain),
+                Err(_) => {
+                    // Not valid UTF-8 — write raw bytes unchanged.
+                    let _ = out.write_all(&line_bytes);
+                    let _ = out.write_all(b"\n");
+                }
+            }
+        }
     }
 
-    let _ = out.flush();
+    // Flush any remaining bytes that had no trailing newline.
+    if !buf.is_empty() && !drain {
+        match std::str::from_utf8(&buf) {
+            Ok(line) => process_line(line, &mut out, ps, syntax, theme, &mut drain),
+            Err(_) => { let _ = out.write_all(&buf); }
+        }
+    }
 
     let exit_code = match child.wait() {
         Ok(status) => if status.success() { 0 } else { 1 },
