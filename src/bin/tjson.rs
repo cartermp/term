@@ -75,11 +75,18 @@ fn main() {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
+    // When stdout breaks we switch to drain mode: keep reading stdin until EOF
+    // so the upstream process never sees a broken pipe (EPIPE). Node.js in
+    // particular crashes with an uncaughtException on unhandled EPIPE.
+    let mut drain = false;
+
     for line in io::stdin().lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(e) => { eprintln!("tjson: read error: {e}"); break; }
+            Err(_) => break,
         };
+
+        if drain { continue; }
 
         let trimmed = line.trim();
 
@@ -87,17 +94,17 @@ fn main() {
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                    if print_highlighted(&mut out, &pretty, &ps, syntax, theme).is_ok() {
-                        continue;
+                    match print_highlighted(&mut out, &pretty, &ps, syntax, theme) {
+                        Ok(()) => continue,
+                        Err(_) => { drain = true; continue; }
                     }
                 }
             }
         }
 
         // Non-JSON or failed parse: pass through unchanged.
-        if let Err(e) = writeln!(out, "{line}") {
-            eprintln!("tjson: write error: {e}");
-            break;
+        if writeln!(out, "{line}").is_err() {
+            drain = true;
         }
     }
 
