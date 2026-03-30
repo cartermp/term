@@ -2,6 +2,7 @@ use crate::config::*;
 use crate::terminal::TerminalState;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── tcat gutter detection ─────────────────────────────────────────────────────
 
@@ -89,10 +90,10 @@ struct Out {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct RectInst {
-    pos:   [f32; 2],
-    sz:    [f32; 2],
-    color: [f32; 4],
+pub struct RectInst {
+    pub pos:   [f32; 2],
+    pub sz:    [f32; 2],
+    pub color: [f32; 4],
 }
 
 impl RectInst {
@@ -194,23 +195,38 @@ fn c2fa(c: Color, a: f32) -> [f32; 4] {
     [c.r as f32 / 255., c.g as f32 / 255., c.b as f32 / 255., a]
 }
 
-fn rgb_f(r: u8, g: u8, b: u8) -> [f32; 4] {
+pub fn rgb_f(r: u8, g: u8, b: u8) -> [f32; 4] {
     [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.]
 }
 
 // ── Instance list helpers ─────────────────────────────────────────────────────
 
-fn push_rect(v: &mut Vec<RectInst>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
+pub fn push_rect(v: &mut Vec<RectInst>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
     if w > 0. && h > 0. {
         v.push(RectInst { pos: [x, y], sz: [w, h], color });
     }
 }
 
+// ── PaneView ─────────────────────────────────────────────────────────────────
+
+/// A single terminal pane to be drawn within the surface.
+pub struct PaneView<'a> {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub state: &'a crate::terminal::TerminalState,
+    pub show_cursor: bool,
+    pub ghost: Option<&'a str>,
+    pub selection: Option<(usize, usize, usize, usize)>,
+    pub url_underlines: &'a [(usize, usize, usize)],
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    pub device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
 
     rect_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
@@ -238,15 +254,14 @@ pub struct Renderer {
     pub cell_width: usize,
     pub cell_height: usize,
     pub baseline: i32,
-    pub tab_bar_height: usize,
     font_size: f32,
-    surface_format: wgpu::TextureFormat,
+    pub surface_format: wgpu::TextureFormat,
 }
 
 impl Renderer {
     pub fn new(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
         scale_factor: f64,
     ) -> Self {
@@ -271,7 +286,6 @@ impl Renderer {
         let gap = lm.line_gap.ceil() as i32;
         let cell_height =
             (ascent + descent + gap).max(font_size as i32 + 4) as usize;
-        let tab_bar_height = cell_height + 16;
 
         // ── Uniform buffer (resolution) ───────────────────────────────────────
         let uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -419,7 +433,6 @@ impl Renderer {
             cell_width,
             cell_height,
             baseline: ascent,
-            tab_bar_height,
             font_size,
             surface_format,
         }
@@ -752,399 +765,154 @@ impl Renderer {
         }
     }
 
-    // ── Tab bar builder ───────────────────────────────────────────────────────
-
-} // end impl Renderer (temporarily close so tab_bar_rects can be a free fn)
-
-/// Pure rect geometry for the tab bar — no GPU, no glyph cache, fully testable.
-///
-/// Returns `(bg_rects, fg_rects)`.  **bg_rects must be submitted to the GPU
-/// before the glyph pass** so that tab titles are drawn on top of the pill
-/// backgrounds.  fg_rects (separators, drag overlays, + button) go after.
-fn tab_bar_rects(
-    tby: f32,
-    bw: f32,
-    n_tabs: usize,
-    active: usize,
-    hover: Option<usize>,
-    drag: Option<(usize, usize, f64)>,
-) -> (Vec<RectInst>, Vec<RectInst>) {
-    let mut bg: Vec<RectInst> = Vec::new();
-    let mut fg: Vec<RectInst> = Vec::new();
-
-    let bar_bg   = rgb_f(0x14, 0x14, 0x14);
-    let outline  = rgb_f(0x58, 0x58, 0x58);
-    let hover_bg = rgb_f(0x26, 0x26, 0x26);
-    let sep_col  = rgb_f(0x2e, 0x2e, 0x2e);
-    let bottom   = rgb_f(0x2e, 0x2e, 0x2e);
-
-    // Bar background + bottom border
-    push_rect(&mut bg, 0., 0., bw, tby, bar_bg);
-    push_rect(&mut bg, 0., tby - 1., bw, 1., bottom);
-
-    let plus_area = tby;
-    let tabs_w    = bw - plus_area;
-    let n         = n_tabs.max(1);
-    let tab_w     = tabs_w / n as f32;
-    let pad_v     = 4.;
-    let pill_h    = tby - pad_v * 2.;
-
-    let visual_order: Vec<usize> = if let Some((from, to, _)) = drag {
-        let mut order: Vec<usize> = (0..n_tabs).collect();
-        if from < order.len() {
-            let item = order.remove(from);
-            order.insert(to.min(order.len()), item);
-        }
-        order
-    } else {
-        (0..n_tabs).collect()
-    };
-    let visual_active = visual_order.iter().position(|&i| i == active).unwrap_or(active);
-    let drag_orig = drag.map(|(from, _, _)| from);
-
-    for (vi, &orig_idx) in visual_order.iter().enumerate() {
-        let is_active   = orig_idx == active;
-        let is_dragging = drag_orig == Some(orig_idx);
-        let is_hover    = drag.is_none() && hover == Some(vi) && !is_active;
-
-        let tx = vi as f32 * tab_w;
-        if tx >= tabs_w { break; }
-        let tw    = if vi + 1 == n { tabs_w - tx } else { tab_w };
-        let pill_x = tx + 4.;
-        let pill_w = tw - 8.;
-
-        if is_dragging {
-            if vi > 0 && vi != visual_active && vi != visual_active + 1 {
-                push_rect(&mut fg, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
-            }
-            let ghost = rgb_f(0x38, 0x38, 0x38);
-            if pill_w > 2. && pill_h > 2. {
-                push_rect(&mut fg, pill_x, pad_v, pill_w, pill_h, ghost);
-                push_rect(&mut fg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
-            }
-            continue;
-        }
-
-        // Active pill and hover fill go in bg_rects so glyphs render on top.
-        if is_hover {
-            push_rect(&mut bg, pill_x, pad_v, pill_w, pill_h, hover_bg);
-        }
-        if is_active && pill_w > 2. && pill_h > 2. {
-            push_rect(&mut bg, pill_x, pad_v, pill_w, pill_h, outline);
-            push_rect(&mut bg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., bar_bg);
-        }
-
-        // Separator
-        if vi > 0 && vi != visual_active && vi != visual_active + 1 {
-            push_rect(&mut fg, tx, pad_v + 4., 1., tby - (pad_v + 4.) * 2., sep_col);
-        }
-    }
-
-    // Floating dragged tab pill
-    if let Some((_, _, cursor_x)) = drag {
-        let half       = tab_w / 2.;
-        let float_left = (cursor_x as f32 - half).max(0.).min(tabs_w - tab_w);
-        let pill_x     = float_left + 4.;
-        let pill_w     = tab_w - 8.;
-        let lifted_outline = rgb_f(0xa0, 0xa0, 0xa0);
-        let lifted_bg      = rgb_f(0x20, 0x20, 0x20);
-        if pill_w > 2. && pill_h > 2. {
-            push_rect(&mut fg, pill_x, pad_v, pill_w, pill_h, lifted_outline);
-            push_rect(&mut fg, pill_x + 1., pad_v + 1., pill_w - 2., pill_h - 2., lifted_bg);
-        }
-    }
-
-    // + button (two thin rects forming a cross)
-    let plus_hover = hover == Some(n_tabs);
-    let plus_col   = if plus_hover { rgb_f(0x88, 0x88, 0x88) } else { rgb_f(0x44, 0x44, 0x44) };
-    let plus_cx    = bw - plus_area / 2.;
-    let plus_cy    = tby / 2.;
-    let arm        = 5.;
-    push_rect(&mut fg, plus_cx - arm, plus_cy - 1., arm * 2., 2., plus_col);
-    push_rect(&mut fg, plus_cx - 1., plus_cy - arm, 2., arm * 2., plus_col);
-
-    (bg, fg)
-}
-
-impl Renderer { // re-open impl
-
-    fn build_tab_bar(
-        &mut self,
-        bg_rects: &mut Vec<RectInst>,
-        fg_rects: &mut Vec<RectInst>,
-        glyphs: &mut Vec<GlyphInst>,
-        bw: f32,
-        tabs: &[String],
-        active: usize,
-        hover: Option<usize>,
-        drag: Option<(usize, usize, f64)>,
-    ) {
-        let tby = self.tab_bar_height as f32;
-        let cw = self.cell_width as f32;
-        let ch = self.cell_height as f32;
-
-        // All rect geometry delegated to the pure helper (testable without GPU).
-        let (new_bg, new_fg) = tab_bar_rects(tby, bw, tabs.len(), active, hover, drag);
-        bg_rects.extend(new_bg);
-        fg_rects.extend(new_fg);
-
-        // ── Glyph rendering ───────────────────────────────────────────────────
-        let fg_act   = c2f(DEFAULT_FG);
-        let fg_inact = rgb_f(0x66, 0x66, 0x66);
-        let fg_sc    = rgb_f(0x3a, 0x3a, 0x3a);
-
-        let plus_area = tby;
-        let tabs_w    = bw - plus_area;
-        let n         = tabs.len().max(1);
-        let tab_w     = tabs_w / n as f32;
-        let text_y    = (tby - ch) / 2.;
-        let shortcut_w = 3. * cw;
-
-        let visual_order: Vec<usize> = if let Some((from, to, _)) = drag {
-            let mut order: Vec<usize> = (0..tabs.len()).collect();
-            if from < order.len() {
-                let item = order.remove(from);
-                order.insert(to.min(order.len()), item);
-            }
-            order
-        } else {
-            (0..tabs.len()).collect()
-        };
-        let drag_orig = drag.map(|(from, _, _)| from);
-
-        for (vi, &orig_idx) in visual_order.iter().enumerate() {
-            let title = &tabs[orig_idx];
-            let is_active  = orig_idx == active;
-            let is_dragging = drag_orig == Some(orig_idx);
-
-            let tx = vi as f32 * tab_w;
-            if tx >= tabs_w { break; }
-            let tw = if vi + 1 == n { tabs_w - tx } else { tab_w };
-
-            if is_dragging { continue; }
-
-            // ⌘N shortcut
-            let shortcut = format!("\u{2318}{}", orig_idx + 1);
-            let sc_x = tx + tw - shortcut_w;
-            let mut col_x = sc_x;
-            for c in shortcut.chars() {
-                if col_x + cw > tx + tw { break; }
-                self.emit_char(glyphs, c, col_x, text_y, fg_sc);
-                col_x += cw;
-            }
-
-            // Title
-            let fg = if is_active { fg_act } else { fg_inact };
-            let left_pad  = tx + cw;
-            let right_edge = tx + tw - shortcut_w - cw;
-            let max_cols  = ((right_edge - left_pad) / cw).max(0.) as usize;
-            let chars: Vec<char> = title.chars().collect();
-            let show_n    = chars.len().min(max_cols);
-            let truncated = show_n < chars.len();
-            for (ci, &c) in chars[..show_n].iter().enumerate() {
-                let cpx    = left_pad + ci as f32 * cw;
-                let draw_c = if truncated && ci + 1 == show_n { '\u{2026}' } else { c };
-                self.emit_char(glyphs, draw_c, cpx, text_y, fg);
-            }
-        }
-
-        // Floating dragged tab title
-        if let Some((from_orig, _, cursor_x)) = drag {
-            let title     = &tabs[from_orig];
-            let is_active = from_orig == active;
-            let half      = tab_w / 2.;
-            let float_left = (cursor_x as f32 - half).max(0.).min(tabs_w - tab_w);
-            let left_pad  = float_left + cw;
-            let right_edge = float_left + tab_w - shortcut_w - cw;
-            let max_cols  = ((right_edge - left_pad) / cw).max(0.) as usize;
-            let chars: Vec<char> = title.chars().collect();
-            let show_n    = chars.len().min(max_cols);
-            let truncated = show_n < chars.len();
-            let fg = if is_active { fg_act } else { rgb_f(0xcc, 0xcc, 0xcc) };
-            for (ci, &c) in chars[..show_n].iter().enumerate() {
-                let cpx    = left_pad + ci as f32 * cw;
-                let draw_c = if truncated && ci + 1 == show_n { '\u{2026}' } else { c };
-                self.emit_char(glyphs, draw_c, cpx, text_y, fg);
-            }
-        }
-    }
-
     // ── Public render ─────────────────────────────────────────────────────────
 
+    /// Render all `panes` into `view`.  `dividers` are solid rectangles
+    /// (x, y, w, h) drawn between panes — typically 2 px wide/tall separator lines.
     pub fn render(
         &mut self,
         view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        state: &TerminalState,
-        show_cursor: bool,
-        ghost: Option<&str>,
-        tabs: &[String],
-        active_tab: usize,
-        hover: Option<usize>,
-        selection: Option<(usize, usize, usize, usize)>,
-        drag: Option<(usize, usize, f64)>,
-        url_underlines: &[(usize, usize, usize)],
+        surface_w: u32,
+        surface_h: u32,
+        panes: &[PaneView<'_>],
+        dividers: &[(f32, f32, f32, f32)],
     ) {
-        let bw = width as f32;
-        let bh = height as f32;
-        let tby = self.tab_bar_height as f32;
+        let bw = surface_w as f32;
+        let bh = surface_h as f32;
         let cw = self.cell_width as f32;
         let ch = self.cell_height as f32;
 
-        // Update resolution uniform
         let res: [f32; 4] = [bw, bh, 0., 0.];
         self.queue.write_buffer(&self.uni_buf, 0, bytemuck::cast_slice(&res));
 
-        let mut bg_rects: Vec<RectInst> = Vec::with_capacity(4096);
+        let mut bg_rects: Vec<RectInst>    = Vec::with_capacity(4096);
         let mut block_rects: Vec<RectInst> = Vec::new();
-        let mut glyphs: Vec<GlyphInst> = Vec::with_capacity(4096);
-        let mut fg_rects: Vec<RectInst> = Vec::new();
+        let mut glyphs: Vec<GlyphInst>     = Vec::with_capacity(4096);
+        let mut fg_rects: Vec<RectInst>    = Vec::new();
 
-        // ── Tab bar ───────────────────────────────────────────────────────────
-        self.build_tab_bar(
-            &mut bg_rects,
-            &mut fg_rects,
-            &mut glyphs,
-            bw,
-            tabs,
-            active_tab,
-            hover,
-            drag,
-        );
-
-        // ── Terminal grid ─────────────────────────────────────────────────────
-        let term_h = bh - tby;
-        let vis_rows = ((term_h / ch) as usize).min(state.rows);
-        let vis_cols = ((bw / cw) as usize).min(state.cols);
         let sel_bg = c2fa(Color::new(0x26, 0x4a, 0x7a), 1.0);
 
-        for row in 0..vis_rows {
-            let gutter = if selection.is_some() {
-                tcat_gutter_end(state, row, vis_cols)
-            } else {
-                0
-            };
+        for pane in panes {
+            let ox = pane.x;
+            let oy = pane.y;
+            let vis_rows = ((pane.height / ch) as usize).min(pane.state.rows);
+            let vis_cols = ((pane.width  / cw) as usize).min(pane.state.cols);
 
-            for col in 0..vis_cols {
-                let cell = state.visual_cell(row, col);
-                let mut fg_color = cell.attrs.fg;
-                let mut bg_color = cell.attrs.bg;
-                if cell.attrs.inverse {
-                    std::mem::swap(&mut fg_color, &mut bg_color);
-                }
-
-                let selected = if let Some((r0, c0, r1, c1)) = selection {
-                    row >= r0
-                        && row <= r1
-                        && !(row == r0 && col < c0)
-                        && !(row == r1 && col > c1)
-                        && col >= gutter
+            // ── Cell grid ─────────────────────────────────────────────────────────
+            for row in 0..vis_rows {
+                let gutter = if pane.selection.is_some() {
+                    tcat_gutter_end(pane.state, row, vis_cols)
                 } else {
-                    false
+                    0
                 };
 
-                let px = col as f32 * cw;
-                let py = tby + row as f32 * ch;
+                for col in 0..vis_cols {
+                    let cell = pane.state.visual_cell(row, col);
+                    let mut fg_color = cell.attrs.fg;
+                    let mut bg_color = cell.attrs.bg;
+                    if cell.attrs.inverse {
+                        std::mem::swap(&mut fg_color, &mut bg_color);
+                    }
 
-                let bg = if selected {
-                    sel_bg
-                } else {
-                    let a = if bg_color == DEFAULT_BG {
-                        BG_ALPHA as f32 / 255.
+                    let selected = if let Some((r0, c0, r1, c1)) = pane.selection {
+                        row >= r0
+                            && row <= r1
+                            && !(row == r0 && col < c0)
+                            && !(row == r1 && col > c1)
+                            && col >= gutter
                     } else {
-                        1.
+                        false
                     };
-                    c2fa(bg_color, a)
-                };
-                push_rect(&mut bg_rects, px, py, cw, ch, bg);
 
-                let c = cell.c;
-                if c != ' ' && c != '\0' {
-                    let fg = c2f(fg_color);
-                    if !Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg) {
-                        self.emit_char(&mut glyphs, c, px, py, fg);
-                        // Render combining / extending codepoints at the same
-                        // cell position (overlaid on the base glyph).
-                        for &combining in cell.combining_chars() {
-                            self.emit_char(&mut glyphs, combining, px, py, fg);
+                    let px = ox + col as f32 * cw;
+                    let py = oy + row as f32 * ch;
+
+                    let bg = if selected {
+                        sel_bg
+                    } else {
+                        let a = if bg_color == DEFAULT_BG { BG_ALPHA as f32 / 255. } else { 1. };
+                        c2fa(bg_color, a)
+                    };
+                    push_rect(&mut bg_rects, px, py, cw, ch, bg);
+
+                    let c = cell.c;
+                    if c != ' ' && c != '\0' {
+                        let fg = c2f(fg_color);
+                        if !Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg) {
+                            self.emit_char(&mut glyphs, c, px, py, fg);
+                            for &combining in cell.combining_chars() {
+                                self.emit_char(&mut glyphs, combining, px, py, fg);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // ── URL underlines ────────────────────────────────────────────────────
-        if !url_underlines.is_empty() {
-            let u_col = rgb_f(0x58, 0x9a, 0xdd);
-            for &(row, c0, c1) in url_underlines {
-                if row >= vis_rows { continue; }
-                let uy = tby + row as f32 * ch + ch - 2.;
-                let x0 = c0 as f32 * cw;
-                let x1 = c1.min(vis_cols) as f32 * cw;
-                push_rect(&mut fg_rects, x0, uy, x1 - x0, 2., u_col);
-            }
-        }
-
-        // ── Ghost text ────────────────────────────────────────────────────────
-        if !state.is_scrolled_back() {
-            if let Some(g) = ghost {
-                let py = tby + state.cursor_row as f32 * ch;
-                for (i, c) in g.chars().enumerate() {
-                    let col = state.cursor_col + i;
-                    if col >= vis_cols { break; }
-                    self.emit_char(&mut glyphs, c, col as f32 * cw, py, c2f(GHOST_COLOR));
+            // ── URL underlines ────────────────────────────────────────────────────
+            if !pane.url_underlines.is_empty() {
+                let u_col = rgb_f(0x58, 0x9a, 0xdd);
+                for &(row, c0, c1) in pane.url_underlines {
+                    if row >= vis_rows { continue; }
+                    let uy = oy + row as f32 * ch + ch - 2.;
+                    let x0 = ox + c0 as f32 * cw;
+                    let x1 = ox + c1.min(vis_cols) as f32 * cw;
+                    push_rect(&mut fg_rects, x0, uy, x1 - x0, 2., u_col);
                 }
             }
+
+            // ── Ghost text ────────────────────────────────────────────────────────
+            if !pane.state.is_scrolled_back() {
+                if let Some(g) = pane.ghost {
+                    let py = oy + pane.state.cursor_row as f32 * ch;
+                    for (i, c) in g.chars().enumerate() {
+                        let col = pane.state.cursor_col + i;
+                        if col >= vis_cols { break; }
+                        self.emit_char(&mut glyphs, c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
+                    }
+                }
+            }
+
+            // ── Cursor ────────────────────────────────────────────────────────────
+            if !pane.state.is_scrolled_back()
+                && pane.show_cursor
+                && pane.state.cursor_row < vis_rows
+                && pane.state.cursor_col < vis_cols
+            {
+                let px = ox + pane.state.cursor_col as f32 * cw;
+                let py = oy + pane.state.cursor_row as f32 * ch;
+                push_rect(&mut fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+            }
+
+            // ── Scrollbar ─────────────────────────────────────────────────────────
+            let sb_total = pane.state.scrollback.len();
+            if sb_total > 0 {
+                let total    = sb_total + pane.state.rows;
+                let ph_u     = pane.height as usize;
+                let thumb_h  = ((ph_u * vis_rows) / total).max(8).min(ph_u);
+                let view_top = sb_total.saturating_sub(pane.state.viewport_offset);
+                let thumb_y  = oy + (view_top * (ph_u - thumb_h)) as f32 / total.max(1) as f32;
+                let bar_x    = ox + pane.width - 3.;
+                let track    = rgb_f(0x2a, 0x2a, 0x2a);
+                let thumb    = if pane.state.is_scrolled_back() {
+                    rgb_f(0x66, 0x66, 0x66)
+                } else {
+                    rgb_f(0x44, 0x44, 0x44)
+                };
+                push_rect(&mut fg_rects, bar_x, oy, 2., pane.height, track);
+                push_rect(&mut fg_rects, bar_x, thumb_y, 2., thumb_h as f32, thumb);
+            }
         }
 
-        // ── Cursor (2px vertical bar) ─────────────────────────────────────────
-        if !state.is_scrolled_back()
-            && show_cursor
-            && state.cursor_row < vis_rows
-            && state.cursor_col < vis_cols
-        {
-            let px = state.cursor_col as f32 * cw;
-            let py = tby + state.cursor_row as f32 * ch;
-            push_rect(&mut fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+        // ── Split dividers ────────────────────────────────────────────────────────
+        let div_col = rgb_f(0x3a, 0x3a, 0x3a);
+        for &(x, y, w, h) in dividers {
+            push_rect(&mut fg_rects, x, y, w, h, div_col);
         }
 
-        // ── Scrollbar ─────────────────────────────────────────────────────────
-        let sb_total = state.scrollback.len();
-        if sb_total > 0 {
-            let total = sb_total + state.rows;
-            let term_h_u = term_h as usize;
-            let vis_rows_u = vis_rows;
-            let thumb_h = ((term_h_u * vis_rows_u) / total).max(8).min(term_h_u);
-            let view_top = sb_total.saturating_sub(state.viewport_offset);
-            let thumb_y = tby + (view_top * (term_h_u - thumb_h)) as f32 / total.max(1) as f32;
-
-            let bar_x = bw - 3.;
-            let track_col = rgb_f(0x2a, 0x2a, 0x2a);
-            let thumb_col = if state.is_scrolled_back() {
-                rgb_f(0x66, 0x66, 0x66)
-            } else {
-                rgb_f(0x44, 0x44, 0x44)
-            };
-            // Track
-            push_rect(&mut fg_rects, bar_x, tby, 2., bh - tby, track_col);
-            // Thumb
-            push_rect(
-                &mut fg_rects,
-                bar_x,
-                thumb_y,
-                2.,
-                thumb_h as f32,
-                thumb_col,
-            );
-        }
-
-        // ── Upload instance data ──────────────────────────────────────────────
-
-        // Pack all rects: [bg_rects | block_rects | fg_rects] into rect_buf
-        let bg_count = bg_rects.len();
+        // ── Upload ────────────────────────────────────────────────────────────────
+        let bg_count    = bg_rects.len();
         let block_count = block_rects.len();
-        let fg_count = fg_rects.len();
+        let fg_count    = fg_rects.len();
         let total_rects = bg_count + block_count + fg_count;
 
         self.ensure_rect_buf(total_rects.max(1));
@@ -1155,11 +923,7 @@ impl Renderer { // re-open impl
         let gi_size = std::mem::size_of::<GlyphInst>();
 
         if !bg_rects.is_empty() {
-            self.queue.write_buffer(
-                &self.rect_buf,
-                0,
-                bytemuck::cast_slice(&bg_rects),
-            );
+            self.queue.write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&bg_rects));
         }
         if !block_rects.is_empty() {
             self.queue.write_buffer(
@@ -1176,18 +940,13 @@ impl Renderer { // re-open impl
             );
         }
         if !glyphs.is_empty() {
-            self.queue.write_buffer(
-                &self.glyph_buf,
-                0,
-                bytemuck::cast_slice(&glyphs),
-            );
+            self.queue.write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&glyphs));
         }
 
-        // ── Record render pass ────────────────────────────────────────────────
-
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("frame") },
-        );
+        // ── Render pass ───────────────────────────────────────────────────────────
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("term_pass"),
@@ -1212,45 +971,31 @@ impl Renderer { // re-open impl
             pass.set_bind_group(0, &self.uni_bg, &[]);
             pass.set_pipeline(&self.rect_pipeline);
 
-            // Draw call 1: background rects (cell BGs + tab bar)
             if bg_count > 0 {
-                pass.set_vertex_buffer(
-                    0,
-                    self.rect_buf.slice(..(bg_count * ri_size) as u64),
-                );
+                pass.set_vertex_buffer(0, self.rect_buf.slice(..(bg_count * ri_size) as u64));
                 pass.draw(0..4, 0..bg_count as u32);
             }
-
-            // Draw call 2: block character fills (on top of BG)
             if block_count > 0 {
                 let start = (bg_count * ri_size) as u64;
-                let end = start + (block_count * ri_size) as u64;
+                let end   = start + (block_count * ri_size) as u64;
                 pass.set_vertex_buffer(0, self.rect_buf.slice(start..end));
                 pass.draw(0..4, 0..block_count as u32);
             }
-
-            // Draw call 3: glyphs (alpha-blended over backgrounds)
             if glyph_count > 0 {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(1, &self.atlas_bg, &[]);
-                pass.set_vertex_buffer(
-                    0,
-                    self.glyph_buf.slice(..(glyph_count * gi_size) as u64),
-                );
+                pass.set_vertex_buffer(0, self.glyph_buf.slice(..(glyph_count * gi_size) as u64));
                 pass.draw(0..4, 0..glyph_count as u32);
             }
-
-            // Draw call 4: foreground overlays (cursor, underlines, scrollbar, tab UI)
             if fg_count > 0 {
                 pass.set_pipeline(&self.rect_pipeline);
                 pass.set_bind_group(0, &self.uni_bg, &[]);
                 let start = ((bg_count + block_count) * ri_size) as u64;
-                let end = start + (fg_count * ri_size) as u64;
+                let end   = start + (fg_count * ri_size) as u64;
                 pass.set_vertex_buffer(0, self.rect_buf.slice(start..end));
                 pass.draw(0..4, 0..fg_count as u32);
             }
         }
-
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 }
@@ -1259,92 +1004,13 @@ impl Renderer { // re-open impl
 mod tests {
     use super::*;
 
-    /// Convenience: call tab_bar_rects with typical screen dimensions.
-    fn geom(
-        n_tabs: usize,
-        active: usize,
-        hover: Option<usize>,
-        drag: Option<(usize, usize, f64)>,
-    ) -> (Vec<RectInst>, Vec<RectInst>) {
-        tab_bar_rects(
-            36.,   // tby — typical tab bar height
-            800.,  // bw  — typical window width
-            n_tabs,
-            active,
-            hover,
-            drag,
-        )
-    }
-
-    // ── Regression: active tab pill must not overwrite tab title text ─────────
-    //
-    // Draw order: bg_rects (pass 1) → glyphs (pass 3) → fg_rects (pass 4).
-    // If the active pill lands in fg_rects it is drawn AFTER the glyphs and
-    // paints over the title, making it invisible.
-
     #[test]
-    fn active_pill_outline_in_bg_not_fg() {
-        let outline = rgb_f(0x58, 0x58, 0x58);
-        let (bg, fg) = geom(2, 0, None, None);
-        assert!(
-            bg.iter().any(|r| r.color == outline),
-            "active tab outline must be in bg_rects so glyphs render on top"
-        );
-        assert!(
-            !fg.iter().any(|r| r.color == outline),
-            "active tab outline in fg_rects — it would be drawn after glyphs and cover the title"
-        );
-    }
-
-    #[test]
-    fn active_pill_only_one_outline_rect() {
-        // Exactly one outline rect regardless of how many tabs exist.
-        let outline = rgb_f(0x58, 0x58, 0x58);
-        for n in 1..=5 {
-            let (bg, _) = geom(n, 0, None, None);
-            let count = bg.iter().filter(|r| r.color == outline).count();
-            assert_eq!(count, 1, "expected exactly 1 outline rect with {n} tabs");
-        }
-    }
-
-    #[test]
-    fn hover_bg_in_bg_not_fg() {
-        let hover_bg = rgb_f(0x26, 0x26, 0x26);
-        // Hover over tab 1 while tab 0 is active.
-        let (bg, fg) = geom(3, 0, Some(1), None);
-        assert!(
-            bg.iter().any(|r| r.color == hover_bg),
-            "hover background must be in bg_rects"
-        );
-        assert!(
-            !fg.iter().any(|r| r.color == hover_bg),
-            "hover background in fg_rects — it would cover the tab title"
-        );
-    }
-
-    #[test]
-    fn inactive_tab_gets_no_outline() {
-        // Only the active tab should have an outline rect.
-        let outline = rgb_f(0x58, 0x58, 0x58);
-        let (bg, _) = geom(3, 1, None, None); // active = 1
-        let count = bg.iter().filter(|r| r.color == outline).count();
-        assert_eq!(count, 1, "inactive tabs must not get an outline pill");
-    }
-
-    #[test]
-    fn bar_background_is_first_bg_rect() {
-        let bar_bg = rgb_f(0x14, 0x14, 0x14);
-        let (bg, _) = geom(1, 0, None, None);
-        assert!(!bg.is_empty());
-        assert_eq!(bg[0].color, bar_bg, "first bg rect must be the bar background fill");
-    }
-
-    #[test]
-    fn plus_button_rects_are_in_fg() {
-        // The + button is always in fg_rects (it's an overlay, not a background).
-        let plus_col = rgb_f(0x44, 0x44, 0x44); // non-hover colour
-        let (_, fg) = geom(1, 0, None, None);
-        let count = fg.iter().filter(|r| r.color == plus_col).count();
-        assert_eq!(count, 2, "plus button needs 2 fg rects (horizontal + vertical arm)");
+    fn divider_rect_is_pushed_into_fg_rects() {
+        // Smoke test: push_rect with a divider coordinate should not panic.
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 400., 0., 2., 600., rgb_f(0x3a, 0x3a, 0x3a));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].pos, [400., 0.]);
+        assert_eq!(v[0].sz,  [2., 600.]);
     }
 }

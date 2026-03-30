@@ -4,6 +4,7 @@ mod platform;
 mod renderer;
 mod terminal;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,26 +14,26 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{CursorIcon, Window, WindowAttributes};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use completion::Engine;
 use config::{WINDOW_HEIGHT, WINDOW_WIDTH};
-use renderer::Renderer;
+use renderer::{PaneView, Renderer};
 use terminal::Terminal;
 
 #[derive(Debug)]
 enum AppEvent {
-    PtyData { tab_id: usize, data: Vec<u8> },
-    PtyExit { tab_id: usize },
+    PtyData { pane_id: u64, data: Vec<u8> },
+    PtyExit { pane_id: u64 },
+    NewTab,
 }
 
-// ── Tab drag ──────────────────────────────────────────────────────────────────
+// ── Split direction ───────────────────────────────────────────────────────────
 
-struct TabDrag {
-    from_idx: usize,
-    start_x: f64,
-    current_x: f64,
-    active: bool, // threshold exceeded → real drag, not a click
+#[derive(Clone, Copy, PartialEq)]
+enum SplitDir {
+    Vertical,
+    Horizontal,
 }
 
 // ── Selection ─────────────────────────────────────────────────────────────────
@@ -71,17 +72,19 @@ impl Selection {
     }
 }
 
-// ── Tab ───────────────────────────────────────────────────────────────────────
+// ── Pane ──────────────────────────────────────────────────────────────────────
 
-struct Tab {
-    id: usize,
+struct Pane {
+    id: u64,
     terminal: Terminal,
     pty_master: Box<dyn MasterPty>,
     pty_writer: Box<dyn Write + Send>,
     ghost_text: Option<String>,
+    engine: Engine,
+    selection: Option<Selection>,
 }
 
-impl Tab {
+impl Pane {
     fn write(&mut self, data: &[u8]) {
         let _ = self.pty_writer.write_all(data);
         let _ = self.pty_writer.flush();
@@ -90,11 +93,9 @@ impl Tab {
     fn title(&self) -> &str {
         let t = self.terminal.state.title.as_str();
         if t.is_empty() || t == "term" {
-            // Fall back to shortened CWD
             let cwd = self.terminal.state.current_dir.as_str();
             let home = std::env::var("HOME").unwrap_or_default();
             if !cwd.is_empty() {
-                // We return a &str into state, so store nothing — just use cwd directly
                 return cwd
                     .strip_prefix(&home)
                     .map(|s| if s.is_empty() { "~" } else { s })
@@ -109,8 +110,6 @@ impl Tab {
 
 // ── URL detection ─────────────────────────────────────────────────────────────
 
-/// Scan the visible rows of `state` for http(s):// URLs.
-/// Returns `(row, col_start, col_end_exclusive, url_string)` for each span found.
 /// Map a physical key code to its base ASCII byte (unshifted, no modifiers).
 /// Used to recover the intended letter when Alt/Option produces a Unicode character (macOS).
 fn physical_key_to_ascii(kc: KeyCode) -> Option<u8> {
@@ -186,75 +185,113 @@ fn find_urls(
     out
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
+// ── ns_view helper ────────────────────────────────────────────────────────────
 
-struct App {
-    // Window / rendering
-    window: Option<Arc<Window>>,
-    wgpu_surface: Option<wgpu::Surface<'static>>,
-    wgpu_config: Option<wgpu::SurfaceConfiguration>,
-    renderer: Option<Renderer>,
+#[cfg(target_os = "macos")]
+fn ns_view_ptr(window: &winit::window::Window) -> Option<*mut std::ffi::c_void> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr() as *mut std::ffi::c_void),
+        _ => None,
+    }
+}
 
-    // Tabs
-    tabs: Vec<Tab>,
-    active_tab: usize,
-    next_id: usize,
-    proxy: EventLoopProxy<AppEvent>,
+// ── WgpuShared ────────────────────────────────────────────────────────────────
 
-    // Input
+struct WgpuShared {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    surface_format: wgpu::TextureFormat,
+}
+
+// ── TerminalWindow ────────────────────────────────────────────────────────────
+
+struct TerminalWindow {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    renderer: Renderer,
+
+    panes: Vec<Pane>,
+    active_pane: usize,
+    split: Option<SplitDir>,
+
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
 
-    // Tab drag
-    tab_drag: Option<TabDrag>,
-
-    // Selection
-    sel_anchor: Option<(i64, usize)>, // grid_row coords, stable across scroll
-    selection: Option<Selection>,
+    // Selection drag state (mirrors old App fields, now per-window)
+    sel_anchor: Option<(i64, usize)>,
     selecting: bool,
-    sel_scroll: i32, // non-zero while dragging outside terminal bounds (auto-scroll)
+    sel_scroll: i32,
 
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
-
-    // Ghost text engine (shared across tabs)
-    engine: Engine,
 }
 
-impl App {
-    fn new(first_tab: Tab, proxy: EventLoopProxy<AppEvent>) -> Self {
-        Self {
-            window: None,
-            wgpu_surface: None,
-            wgpu_config: None,
-            renderer: None,
-            tabs: vec![first_tab],
-            active_tab: 0,
-            next_id: 1,
-            proxy,
-            modifiers: ModifiersState::empty(),
-            cursor_pos: (-1.0, -1.0),
-            tab_drag: None,
-            sel_anchor: None,
-            selection: None,
-            selecting: false,
-            sel_scroll: 0,
-            cursor_visible: true,
-            last_blink: Instant::now(),
-            engine: Engine::new(),
+impl TerminalWindow {
+    fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let sz = self.window.inner_size();
+        let w = sz.width  as f32;
+        let h = sz.height as f32;
+        match (self.panes.len(), &self.split) {
+            (2, Some(SplitDir::Vertical)) => {
+                let half = (w / 2.).floor();
+                vec![(0., 0., half - 1., h), (half + 1., 0., w - half - 1., h)]
+            }
+            (2, Some(SplitDir::Horizontal)) => {
+                let half = (h / 2.).floor();
+                vec![(0., 0., w, half - 1.), (0., half + 1., w, h - half - 1.)]
+            }
+            _ => vec![(0., 0., w, h)],
         }
     }
 
-    fn active(&self) -> &Tab {
-        &self.tabs[self.active_tab]
+    fn divider_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let sz = self.window.inner_size();
+        let w = sz.width  as f32;
+        let h = sz.height as f32;
+        match (self.panes.len(), &self.split) {
+            (2, Some(SplitDir::Vertical))   => {
+                let half = (w / 2.).floor();
+                vec![(half - 1., 0., 2., h)]
+            }
+            (2, Some(SplitDir::Horizontal)) => {
+                let half = (h / 2.).floor();
+                vec![(0., half - 1., w, 2.)]
+            }
+            _ => vec![],
+        }
     }
-    fn active_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
+
+    fn term_size_for_pane(&self, idx: usize) -> (usize, usize) {
+        let rects = self.pane_rects();
+        let cw = self.renderer.cell_width;
+        let ch = self.renderer.cell_height;
+        if let Some(&(_, _, pw, ph)) = rects.get(idx) {
+            let cols = (pw as usize / cw).max(1);
+            let rows = (ph as usize / ch).max(1);
+            (cols, rows)
+        } else {
+            let sz = self.window.inner_size();
+            let cols = (sz.width as usize / cw).max(1);
+            let rows = (sz.height as usize / ch).max(1);
+            (cols, rows)
+        }
+    }
+
+    fn active(&self) -> &Pane {
+        &self.panes[self.active_pane]
+    }
+
+    fn active_mut(&mut self) -> &mut Pane {
+        &mut self.panes[self.active_pane]
     }
 
     fn pty_write(&mut self, data: &[u8]) {
-        self.active_mut().write(data);
+        self.panes[self.active_pane].write(data);
     }
 
     fn reset_blink(&mut self) {
@@ -262,180 +299,34 @@ impl App {
         self.last_blink = Instant::now();
     }
 
-    fn term_size(&self) -> (usize, usize) {
-        if let (Some(w), Some(r)) = (&self.window, &self.renderer) {
-            let sz = w.inner_size();
-            let cols = (sz.width as usize / r.cell_width).max(1);
-            let rows =
-                ((sz.height as usize).saturating_sub(r.tab_bar_height) / r.cell_height).max(1);
-            (cols, rows)
-        } else {
-            (80, 24)
+    fn update_ghost(&mut self) {
+        let buf = self.active().terminal.state.input_buffer.clone();
+        let cur = self.active().terminal.state.input_cursor;
+        let ghost = self.panes[self.active_pane]
+            .engine
+            .ghost(&buf, cur >= buf.len())
+            .map(|s| s.to_string());
+        self.panes[self.active_pane].ghost_text = ghost;
+    }
+
+    fn sync_title(&self) {
+        self.window.set_title(self.active().title());
+    }
+
+    fn accept_ghost(&mut self) {
+        let g = self.panes[self.active_pane].ghost_text.take();
+        if let Some(g) = g {
+            self.panes[self.active_pane].write(g.as_bytes());
         }
     }
 
-    // ── Tab lifecycle ─────────────────────────────────────────────────────────
-
-    fn open_tab(&mut self) {
-        let (cols, rows) = self.term_size();
-        let tab_id = self.next_id;
-        self.next_id += 1;
-
-        let pty_system = native_pty_system();
-        let pair = match pty_system.openpty(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("openpty: {e}");
-                return;
-            }
-        };
-
-        let mut cmd = CommandBuilder::new("zsh");
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        setup_shell_env(&mut cmd);
-
-        let _ = pair.slave.spawn_command(cmd);
-        drop(pair.slave);
-
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let writer = pair.master.take_writer().expect("take writer");
-
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        let _ = proxy.send_event(AppEvent::PtyExit { tab_id });
-                        break;
-                    }
-                    Ok(n) => {
-                        let _ = proxy.send_event(AppEvent::PtyData {
-                            tab_id,
-                            data: buf[..n].to_vec(),
-                        });
-                    }
-                }
-            }
-        });
-
-        self.tabs.push(Tab {
-            id: tab_id,
-            terminal: Terminal::new(cols, rows),
-            pty_master: pair.master,
-            pty_writer: writer,
-            ghost_text: None,
-        });
-        self.active_tab = self.tabs.len() - 1;
-    }
-
-    fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
-        if self.tabs.len() <= 1 {
-            event_loop.exit();
-            return;
-        }
-        self.tabs.remove(self.active_tab);
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-    }
-
-    fn switch_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.active_tab = idx;
-            self.selection = None;
-        }
-    }
-
-    /// Which tab slot does pixel x land in (clamped to 0..tabs.len()-1).
-    fn drag_target_idx(&self, mx: f64) -> usize {
-        let r = match self.renderer.as_ref() {
-            Some(r) => r,
-            None => return 0,
-        };
-        let bw = self
-            .window
-            .as_ref()
-            .map(|w| w.inner_size().width as usize)
-            .unwrap_or(0);
-        let tabs_w = bw.saturating_sub(r.tab_bar_height);
-        let n = self.tabs.len().max(1);
-        let tab_w = tabs_w / n;
-        let mx = mx.clamp(0.0, tabs_w.saturating_sub(1) as f64) as usize;
-        (mx / tab_w).min(n - 1)
-    }
-
-    fn reorder_tab(&mut self, from: usize, to: usize) {
-        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
-            return;
-        }
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active_tab = if self.active_tab == from {
-            to
-        } else if from < self.active_tab && to >= self.active_tab {
-            self.active_tab - 1
-        } else if from > self.active_tab && to <= self.active_tab {
-            self.active_tab + 1
-        } else {
-            self.active_tab
-        };
-    }
-
-    /// Convert a pixel coordinate to a terminal (row, col), or None if in the tab bar.
-    fn pixel_to_cell(&self, mx: f64, my: f64) -> Option<(usize, usize)> {
-        let r = self.renderer.as_ref()?;
-        let tby = r.tab_bar_height;
-        if mx < 0.0 || my < tby as f64 {
-            return None;
-        }
-        let (cols, rows) = self.term_size();
-        let row = ((my as usize).saturating_sub(tby)) / r.cell_height;
-        let col = mx as usize / r.cell_width;
-        Some((row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))))
-    }
-
-    /// Like `pixel_to_cell` but returns grid-relative row coordinates stable across scrolling.
-    /// `grid_row = visual_row - viewport_offset`; negative values are scrollback rows.
-    fn pixel_to_grid_cell(&self, mx: f64, my: f64) -> Option<(i64, usize)> {
-        let (vrow, col) = self.pixel_to_cell(mx, my)?;
-        let vo = self.active().terminal.state.viewport_offset as i64;
-        Some((vrow as i64 - vo, col))
-    }
-
-    /// Set the cursor icon based on whether Cmd is held and a URL is under the pointer.
-    fn update_cursor_icon(&self) {
-        let icon = if self.modifiers.super_key() {
-            let is_url = self
-                .pixel_to_cell(self.cursor_pos.0, self.cursor_pos.1)
-                .map(|(row, col)| {
-                    let (vis_cols, vis_rows) = self.term_size();
-                    find_urls(&self.active().terminal.state, vis_rows, vis_cols)
-                        .iter()
-                        .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
-                })
-                .unwrap_or(false);
-            if is_url { CursorIcon::Pointer } else { CursorIcon::Default }
-        } else {
-            CursorIcon::Default
-        };
-        if let Some(w) = &self.window {
-            w.set_cursor(icon);
-        }
-    }
-
-    /// Extract the text covered by the current selection.
     fn selection_text(&self) -> String {
-        let sel = match self.selection {
+        let pane = &self.panes[self.active_pane];
+        let sel = match pane.selection {
             Some(s) => s,
             None => return String::new(),
         };
-        let state = &self.active().terminal.state;
-        // Convert from grid-relative to viewport-relative rows for visual_cell().
+        let state = &pane.terminal.state;
         let (r0, c0, r1, c1) = sel.to_viewport(state.viewport_offset);
         let mut result = String::new();
         for row in r0..=r1 {
@@ -461,12 +352,60 @@ impl App {
         result
     }
 
-    /// Handle Cmd+V: paste text (with bracketed-paste wrapping if enabled),
-    /// or save a clipboard image to a temp file and write the path.
+    /// Convert pixel coordinate to (pane_idx, row, col). Returns None if out of bounds.
+    fn pixel_to_pane_cell(&self, mx: f64, my: f64) -> Option<(usize, usize, usize)> {
+        let rects = self.pane_rects();
+        let cw = self.renderer.cell_width as f64;
+        let ch = self.renderer.cell_height as f64;
+        for (i, &(ox, oy, pw, ph)) in rects.iter().enumerate() {
+            if mx >= ox as f64 && mx < (ox + pw) as f64
+                && my >= oy as f64 && my < (oy + ph) as f64
+            {
+                let col = ((mx - ox as f64) / cw) as usize;
+                let row = ((my - oy as f64) / ch) as usize;
+                let cols = (pw as usize / self.renderer.cell_width).max(1);
+                let rows = (ph as usize / self.renderer.cell_height).max(1);
+                return Some((i, row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))));
+            }
+        }
+        None
+    }
+
+    fn pane_at_pixel(&self, mx: f64, my: f64) -> Option<usize> {
+        self.pixel_to_pane_cell(mx, my).map(|(i, _, _)| i)
+    }
+
+    /// Convert pixel to grid-relative (pane_idx, grid_row, col).
+    fn pixel_to_grid_cell(&self, mx: f64, my: f64) -> Option<(usize, i64, usize)> {
+        let (pi, vrow, col) = self.pixel_to_pane_cell(mx, my)?;
+        let vo = self.panes[pi].terminal.state.viewport_offset as i64;
+        Some((pi, vrow as i64 - vo, col))
+    }
+
+    fn update_cursor_icon(&self) {
+        let icon = if self.modifiers.super_key() {
+            let is_url = self.pixel_to_pane_cell(self.cursor_pos.0, self.cursor_pos.1)
+                .map(|(pi, row, col)| {
+                    let pane = &self.panes[pi];
+                    let rects = self.pane_rects();
+                    let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
+                    let vis_cols = (pw as usize / self.renderer.cell_width).max(1);
+                    let vis_rows = (ph as usize / self.renderer.cell_height).max(1);
+                    find_urls(&pane.terminal.state, vis_rows, vis_cols)
+                        .iter()
+                        .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+                })
+                .unwrap_or(false);
+            if is_url { CursorIcon::Pointer } else { CursorIcon::Default }
+        } else {
+            CursorIcon::Default
+        };
+        self.window.set_cursor(icon);
+    }
+
     fn do_paste(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            // Image takes priority: save PNG to a temp file, write path to PTY.
             if let Some(png) = platform::clipboard_png() {
                 let path = std::env::temp_dir().join(format!(
                     "term_paste_{}.png",
@@ -476,28 +415,20 @@ impl App {
                         .unwrap_or(0)
                 ));
                 if std::fs::write(&path, &png).is_ok() {
-                    let path_str = path.to_string_lossy();
+                    let path_str = path.to_string_lossy().to_string();
                     let bracketed = self.active().terminal.state.bracketed_paste;
-                    if bracketed {
-                        self.pty_write(b"\x1b[200~");
-                    }
+                    if bracketed { self.pty_write(b"\x1b[200~"); }
                     self.pty_write(path_str.as_bytes());
-                    if bracketed {
-                        self.pty_write(b"\x1b[201~");
-                    }
+                    if bracketed { self.pty_write(b"\x1b[201~"); }
                 }
                 return;
             }
             if let Some(text) = platform::clipboard_text() {
                 if !text.is_empty() {
                     let bracketed = self.active().terminal.state.bracketed_paste;
-                    if bracketed {
-                        self.pty_write(b"\x1b[200~");
-                    }
+                    if bracketed { self.pty_write(b"\x1b[200~"); }
                     self.pty_write(text.as_bytes());
-                    if bracketed {
-                        self.pty_write(b"\x1b[201~");
-                    }
+                    if bracketed { self.pty_write(b"\x1b[201~"); }
                 }
                 return;
             }
@@ -507,59 +438,103 @@ impl App {
             let text = paste_from_clipboard();
             if !text.is_empty() {
                 let bracketed = self.active().terminal.state.bracketed_paste;
-                if bracketed {
-                    self.pty_write(b"\x1b[200~");
-                }
+                if bracketed { self.pty_write(b"\x1b[200~"); }
                 self.pty_write(text.as_bytes());
-                if bracketed {
-                    self.pty_write(b"\x1b[201~");
-                }
+                if bracketed { self.pty_write(b"\x1b[201~"); }
             }
         }
     }
 
-    fn prev_tab(&mut self) {
-        self.active_tab = if self.active_tab == 0 {
-            self.tabs.len() - 1
-        } else {
-            self.active_tab - 1
+    fn redraw(&mut self) {
+        let window = self.window.clone();
+        let sz = window.inner_size();
+        let (w, h) = (sz.width, sz.height);
+        if w == 0 || h == 0 { return; }
+
+        let rects    = self.pane_rects();
+        let dividers = self.divider_rects();
+        let cw = self.renderer.cell_width;
+        let ch = self.renderer.cell_height;
+        let mods_super = self.modifiers.super_key();
+
+        // Build URL underlines per pane
+        let url_ulines: Vec<Vec<(usize, usize, usize)>> = (0..self.panes.len())
+            .map(|i| {
+                if i < rects.len() && mods_super {
+                    let (_, _, pw, ph) = rects[i];
+                    let vis_rows = (ph as usize / ch).max(1);
+                    let vis_cols = (pw as usize / cw).max(1);
+                    find_urls(&self.panes[i].terminal.state, vis_rows, vis_cols)
+                        .into_iter()
+                        .map(|(r, c0, c1, _)| (r, c0, c1))
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        // Build PaneView slice
+        let mut pane_views: Vec<PaneView<'_>> = Vec::new();
+        for (i, pane) in self.panes.iter().enumerate() {
+            if i >= rects.len() { break; }
+            let (ox, oy, pw, ph) = rects[i];
+            let sel = pane.selection.map(|s| s.to_viewport(pane.terminal.state.viewport_offset));
+            pane_views.push(PaneView {
+                x: ox, y: oy,
+                width: pw, height: ph,
+                state: &pane.terminal.state,
+                show_cursor: (i == self.active_pane) && self.cursor_visible,
+                ghost: pane.ghost_text.as_deref(),
+                selection: sel,
+                url_underlines: &url_ulines[i],
+            });
+        }
+
+        let output = match self.surface.get_current_texture() {
+            Ok(o) => o,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.renderer.device, &self.surface_config);
+                return;
+            }
+            Err(e) => { eprintln!("surface error: {e}"); return; }
         };
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render(&view, w, h, &pane_views, &dividers);
+        output.present();
     }
 
-    fn next_tab(&mut self) {
-        self.active_tab = (self.active_tab + 1) % self.tabs.len();
-    }
+    fn on_resize(&mut self, width: u32, height: u32) {
+        self.surface_config.width  = width.max(1);
+        self.surface_config.height = height.max(1);
+        self.surface.configure(&self.renderer.device, &self.surface_config);
 
-    // ── Ghost text ────────────────────────────────────────────────────────────
-
-    fn update_ghost(&mut self) {
-        let buf = self.active().terminal.state.input_buffer.clone();
-        let cur = self.active().terminal.state.input_cursor;
-        let ghost = self
-            .engine
-            .ghost(&buf, cur >= buf.len())
-            .map(|s| s.to_string());
-        self.active_mut().ghost_text = ghost;
-    }
-
-    fn sync_window_title(&self) {
-        if let Some(w) = &self.window {
-            w.set_title(self.active().title());
+        let rects = self.pane_rects();
+        let cw = self.renderer.cell_width;
+        let ch = self.renderer.cell_height;
+        for (i, pane) in self.panes.iter_mut().enumerate() {
+            let (_, _, pw, ph) = if i < rects.len() { rects[i] } else { (0., 0., width as f32, height as f32) };
+            let cols = (pw as usize / cw).max(1);
+            let rows = (ph as usize / ch).max(1);
+            pane.terminal.resize(cols, rows);
+            let _ = pane.pty_master.resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: width as u16,
+                pixel_height: height as u16,
+            });
         }
     }
 
-    fn accept_ghost(&mut self) {
-        let g = self.active_mut().ghost_text.take();
-        if let Some(g) = g {
-            self.active_mut().write(g.as_bytes());
-        }
-    }
-
-    // ── Key handling ──────────────────────────────────────────────────────────
-
-    fn handle_key(&mut self, event: winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+    /// Returns true if the key event was consumed at the window level (tab navigation etc.)
+    /// Returns false if the key should be forwarded to PTY.
+    fn handle_key(
+        &mut self,
+        event: winit::event::KeyEvent,
+        // Actions that need App-level handling are returned as strings
+    ) -> KeyAction {
         if event.state != ElementState::Pressed {
-            return;
+            return KeyAction::None;
         }
         self.reset_blink();
 
@@ -568,9 +543,7 @@ impl App {
         let sup = self.modifiers.super_key();
         let shift = self.modifiers.shift_key();
 
-        // Clear selection on any keypress, except Cmd+C (which copies it) and
-        // bare modifier key presses (Cmd/Shift/Alt/Ctrl alone must not clear the
-        // selection before the chord is complete).
+        // Clear selection on any keypress (except Cmd+C and bare modifiers)
         let is_cmd_c = sup
             && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "c");
         let is_modifier_only = matches!(
@@ -585,10 +558,10 @@ impl App {
                     | NamedKey::CapsLock
             )
         );
-        if !is_cmd_c && !is_modifier_only && self.selection.is_some() {
-            self.selection = None;
-            if let Some(w) = &self.window {
-                w.request_redraw();
+        if !is_cmd_c && !is_modifier_only {
+            if self.panes[self.active_pane].selection.is_some() {
+                self.panes[self.active_pane].selection = None;
+                self.window.request_redraw();
             }
         }
 
@@ -596,81 +569,108 @@ impl App {
         if sup {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowLeft) => {
+                    if alt {
+                        // Cmd+Opt+Left: previous pane
+                        if self.panes.len() > 1 {
+                            self.active_pane = self.active_pane.saturating_sub(1);
+                        }
+                        return KeyAction::None;
+                    }
                     self.pty_write(b"\x01");
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::ArrowRight) => {
+                    if alt {
+                        // Cmd+Opt+Right: next pane
+                        if self.panes.len() > 1 {
+                            self.active_pane = (self.active_pane + 1).min(self.panes.len() - 1);
+                        }
+                        return KeyAction::None;
+                    }
                     self.pty_write(b"\x05");
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     let n = self.active().terminal.state.rows as i32;
                     self.active_mut().terminal.state.scroll_viewport(n);
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::ArrowDown) => {
                     let n = self.active().terminal.state.rows as i32;
                     self.active_mut().terminal.state.scroll_viewport(-n);
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::Home) => {
                     self.active_mut().terminal.state.scroll_viewport(i32::MAX);
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::End) => {
                     self.active_mut().terminal.state.snap_to_bottom();
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
                     self.pty_write(b"\x15");
+                    return KeyAction::None;
                 }
                 Key::Character(c) => match c.as_str() {
                     "c" => {
-                        // Copy selection if active; otherwise do nothing.
-                        if self.selection.is_some() {
+                        if self.panes[self.active_pane].selection.is_some() {
                             let raw = self.selection_text();
                             if !raw.is_empty() {
                                 copy_to_clipboard(&strip_tcat_gutter(&raw));
                             }
-                            self.selection = None;
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.panes[self.active_pane].selection = None;
+                            self.window.request_redraw();
                         }
+                        return KeyAction::None;
                     }
                     "v" => {
                         self.do_paste();
+                        return KeyAction::None;
                     }
                     "t" => {
-                        self.open_tab();
-                        self.sync_window_title();
+                        return KeyAction::OpenTab;
                     }
                     "w" => {
-                        self.close_active_tab(event_loop);
-                        self.sync_window_title();
+                        return KeyAction::ClosePaneOrWindow;
                     }
                     "[" => {
-                        self.prev_tab();
-                        self.sync_window_title();
+                        return KeyAction::PrevTab;
                     }
                     "]" => {
-                        self.next_tab();
-                        self.sync_window_title();
+                        return KeyAction::NextTab;
+                    }
+                    "d" => {
+                        if shift {
+                            return KeyAction::SplitHorizontal;
+                        } else {
+                            return KeyAction::SplitVertical;
+                        }
                     }
                     "k" => {
                         self.pty_write(b"\x0b");
+                        return KeyAction::None;
                     }
                     "a" => {
                         self.pty_write(b"\x01");
+                        return KeyAction::None;
                     }
                     "e" => {
                         self.pty_write(b"\x05");
+                        return KeyAction::None;
                     }
                     s => {
                         if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
-                            && d >= 1 {
-                                self.switch_tab(d as usize - 1);
-                                self.sync_window_title();
-                            }
+                            && d >= 1
+                        {
+                            // Cmd+1..9: no-op (native tab bar handles it)
+                            let _ = d;
+                        }
+                        return KeyAction::None;
                     }
                 },
-                _ => {}
+                _ => return KeyAction::None,
             }
-            return;
         }
 
         // ── Alt+named keys ────────────────────────────────────────────────────
@@ -678,34 +678,34 @@ impl App {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowLeft) => {
                     self.pty_write(b"\x1bb");
-                    return;
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::ArrowRight) => {
                     self.pty_write(b"\x1bf");
-                    return;
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::Backspace) => {
                     self.pty_write(b"\x1b\x7f");
-                    return;
+                    return KeyAction::None;
                 }
                 Key::Named(NamedKey::Delete) => {
                     self.pty_write(b"\x1bd");
-                    return;
+                    return KeyAction::None;
                 }
                 _ => {}
             }
         }
 
-        // Shift+Enter → kitty Shift+Enter (must come before text path, which would send \r)
+        // Shift+Enter → kitty Shift+Enter
         if shift && !ctrl && !alt && matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
             self.active_mut().ghost_text = None;
             self.pty_write(b"\x1b[13;2u");
-            return;
+            return KeyAction::None;
         }
         // Shift+Tab → reverse tab
         if shift && !ctrl && !alt && matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
             self.pty_write(b"\x1b[Z");
-            return;
+            return KeyAction::None;
         }
 
         // ── Printable text ────────────────────────────────────────────────────
@@ -714,7 +714,7 @@ impl App {
                 self.active_mut().ghost_text = None;
                 let bytes = text.as_str().as_bytes().to_vec();
                 self.active_mut().write(&bytes);
-                return;
+                return KeyAction::None;
             }
 
         match &event.logical_key {
@@ -761,7 +761,6 @@ impl App {
             Key::Character(c) if ctrl => {
                 if let Some(ch) = c.chars().next() {
                     let byte = match ch {
-                        // ctrl+shift+- on US keyboard produces '_'; readline uses \x1f for undo
                         '_' => 0x1f_u8,
                         ch => (ch.to_ascii_lowercase() as u8)
                             .wrapping_sub(b'a')
@@ -774,8 +773,6 @@ impl App {
                 }
             }
             Key::Character(_) if alt => {
-                // On macOS, Option+letter produces a Unicode char (e.g. Option+P → "π").
-                // Use physical key to recover the base ASCII letter for ESC+letter encoding.
                 if let PhysicalKey::Code(kc) = event.physical_key {
                     if let Some(ascii) = physical_key_to_ascii(kc) {
                         self.pty_write(&[0x1b, ascii]);
@@ -784,148 +781,329 @@ impl App {
             }
             _ => {}
         }
+
+        KeyAction::None
+    }
+}
+
+// ── KeyAction ─────────────────────────────────────────────────────────────────
+
+enum KeyAction {
+    None,
+    OpenTab,
+    ClosePaneOrWindow,
+    PrevTab,
+    NextTab,
+    SplitVertical,
+    SplitHorizontal,
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
+struct App {
+    wgpu: Option<WgpuShared>,
+    windows: HashMap<WindowId, TerminalWindow>,
+    pane_to_window: HashMap<u64, WindowId>,
+    next_pane_id: u64,
+    proxy: EventLoopProxy<AppEvent>,
+    tabbing_id: String,
+}
+
+impl App {
+    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+        Self {
+            wgpu: None,
+            windows: HashMap::new(),
+            pane_to_window: HashMap::new(),
+            next_pane_id: 0,
+            proxy,
+            tabbing_id: format!("term-{}", std::process::id()),
+        }
     }
 
-    // ── Rendering ─────────────────────────────────────────────────────────────
-
-    fn redraw(&mut self) {
-        let window = match &self.window {
-            Some(w) => w.clone(),
-            None => return,
-        };
-        let size = window.inner_size();
-        let (w, h) = (size.width as usize, size.height as usize);
-        if w == 0 || h == 0 {
-            return;
-        }
-
-        // Compute hover up-front: only needs cursor_pos + renderer.tab_bar_height + window width
-        let hover = {
-            let (mx, my) = self.cursor_pos;
-            match &self.renderer {
-                Some(r) if my >= 0.0 && my < r.tab_bar_height as f64 => {
-                    let tabs_w = w.saturating_sub(r.tab_bar_height);
-                    let n = self.tabs.len().max(1);
-                    let tab_w = tabs_w / n;
-                    if mx as usize >= tabs_w {
-                        Some(self.tabs.len())
-                    } else {
-                        let idx = (mx as usize) / tab_w;
-                        if idx < self.tabs.len() {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            }
-        };
-
-        let ai = self.active_tab;
-        let tab_titles: Vec<String> = self.tabs.iter().map(|t| t.title().to_string()).collect();
-        // Capture borrows into self.tabs before taking &mut self.renderer / &mut self.surface.
-        // SAFETY: renderer and surface are disjoint from tabs in memory.
-        let state_ptr: *const _ = &self.tabs[ai].terminal.state;
-        let ghost_owned: Option<String> = self.tabs[ai].ghost_text.clone();
-        let show_cur = self.cursor_visible;
-        let sel = self.selection.map(|s| {
-            s.to_viewport(self.tabs[ai].terminal.state.viewport_offset)
-        });
-        // Compute URL underlines (only when Cmd is held so they don't render every frame)
-        let url_underlines: Vec<(usize, usize, usize)> = if self.modifiers.super_key() {
-            let (vis_cols, vis_rows) = self.term_size();
-            find_urls(&self.tabs[ai].terminal.state, vis_rows, vis_cols)
-                .into_iter()
-                .map(|(r, c0, c1, _)| (r, c0, c1))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Extract drag state as owned values before any &mut borrows.
-        let drag_vals = self.tab_drag.as_ref().map(|d| (d.active, d.from_idx, d.current_x));
-        let drag_preview = drag_vals.and_then(|(active, from, cx)| {
-            if active {
-                Some((from, self.drag_target_idx(cx), cx))
-            } else {
-                None
-            }
-        });
-
-        let wgpu_surface = match &self.wgpu_surface {
-            Some(s) => s,
-            None => return,
-        };
-        let renderer = match &mut self.renderer {
-            Some(r) => r,
-            None => return,
-        };
-
-        let output = match wgpu_surface.get_current_texture() {
-            Ok(o) => o,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                if let Some(cfg) = &self.wgpu_config {
-                    wgpu_surface.configure(&renderer.device, cfg);
-                }
-                return;
-            }
-            Err(e) => {
-                eprintln!("surface error: {e}");
-                return;
-            }
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let state = unsafe { &*state_ptr };
-        renderer.render(
-            &view,
-            w as u32,
-            h as u32,
-            state,
-            show_cur,
-            ghost_owned.as_deref(),
-            &tab_titles,
-            ai,
-            hover,
-            sel,
-            drag_preview,
-            &url_underlines,
-        );
-
-        output.present();
+    fn alloc_pane_id(&mut self) -> u64 {
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        id
     }
 
-    fn on_resize(&mut self, width: u32, height: u32) {
-        // Reconfigure the wgpu swap chain
-        if let (Some(surface), Some(cfg), Some(renderer)) = (
-            &self.wgpu_surface,
-            &mut self.wgpu_config,
-            &self.renderer,
-        ) {
-            cfg.width = width.max(1);
-            cfg.height = height.max(1);
-            surface.configure(&renderer.device, cfg);
-        }
+    fn create_pane(
+        &mut self,
+        window_id: WindowId,
+        proxy: &EventLoopProxy<AppEvent>,
+        cols: usize,
+        rows: usize,
+    ) -> Option<Pane> {
+        let pane_id = self.alloc_pane_id();
+        self.pane_to_window.insert(pane_id, window_id);
 
-        let (Some(renderer), _) = (&self.renderer, ()) else {
-            return;
-        };
-        let cw = renderer.cell_width;
-        let ch = renderer.cell_height;
-        let tby = renderer.tab_bar_height;
-        let cols = (width as usize / cw).max(1);
-        let rows = ((height as usize).saturating_sub(tby) / ch).max(1);
-        let pty_size = PtySize {
+        let pty_system = native_pty_system();
+        let pair = match pty_system.openpty(PtySize {
             rows: rows as u16,
             cols: cols as u16,
-            pixel_width: width as u16,
-            pixel_height: height as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("openpty: {e}");
+                return None;
+            }
         };
-        for tab in &mut self.tabs {
-            tab.terminal.resize(cols, rows);
-            let _ = tab.pty_master.resize(pty_size);
+
+        let mut cmd = CommandBuilder::new("zsh");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        setup_shell_env(&mut cmd);
+
+        let _ = pair.slave.spawn_command(cmd);
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        let writer = pair.master.take_writer().expect("take writer");
+
+        let proxy_clone = proxy.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = proxy_clone.send_event(AppEvent::PtyExit { pane_id });
+                        break;
+                    }
+                    Ok(n) => {
+                        let _ = proxy_clone.send_event(AppEvent::PtyData {
+                            pane_id,
+                            data: buf[..n].to_vec(),
+                        });
+                    }
+                }
+            }
+        });
+
+        Some(Pane {
+            id: pane_id,
+            terminal: Terminal::new(cols, rows),
+            pty_master: pair.master,
+            pty_writer: writer,
+            ghost_text: None,
+            engine: Engine::new(),
+            selection: None,
+        })
+    }
+
+    fn open_tab(&mut self, event_loop: &ActiveEventLoop) {
+        let wgpu = match &self.wgpu {
+            Some(w) => w,
+            None => return,
+        };
+
+        // Find an existing window to group with
+        let existing_ns_view: Option<*mut std::ffi::c_void> = {
+            #[cfg(target_os = "macos")]
+            {
+                self.windows.values().next().and_then(|tw| ns_view_ptr(&tw.window))
+            }
+            #[cfg(not(target_os = "macos"))]
+            { None }
+        };
+
+        let mut attrs = WindowAttributes::default()
+            .with_title("term")
+            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_tabbing_identifier(&self.tabbing_id);
+        }
+
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        let window_id = window.id();
+
+        // Set NSWindowTabbingModePreferred so tab bar always shows
+        #[cfg(target_os = "macos")]
+        if let Some(ns_view) = ns_view_ptr(&window) {
+            use objc2::{msg_send, runtime::AnyObject};
+            unsafe {
+                let view = ns_view as *mut AnyObject;
+                let win: *mut AnyObject = msg_send![view, window];
+                if !win.is_null() {
+                    let _: () = msg_send![win, setTabbingMode: 1i64];
+                }
+            }
+        }
+
+        // Add as native tab to existing window group
+        #[cfg(target_os = "macos")]
+        if let (Some(existing), Some(ns_view)) = (existing_ns_view, ns_view_ptr(&window)) {
+            platform::add_window_as_tab(existing, ns_view);
+        }
+
+        // Create wgpu surface
+        let surface: wgpu::Surface<'static> = wgpu.instance
+            .create_surface(window.clone())
+            .expect("create surface");
+
+        let caps = surface.get_capabilities(&wgpu.adapter);
+        let surface_format = wgpu.surface_format;
+        let size = window.inner_size();
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&wgpu.device, &surface_config);
+
+        let scale = window.scale_factor();
+        let renderer = Renderer::new(wgpu.device.clone(), wgpu.queue.clone(), surface_format, scale);
+
+        let (cols, rows) = {
+            let cw = renderer.cell_width;
+            let ch = renderer.cell_height;
+            (
+                (size.width as usize / cw).max(1),
+                (size.height as usize / ch).max(1),
+            )
+        };
+
+        let proxy = self.proxy.clone();
+        let first_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tw = TerminalWindow {
+            window,
+            surface,
+            surface_config,
+            renderer,
+            panes: vec![first_pane],
+            active_pane: 0,
+            split: None,
+            modifiers: ModifiersState::empty(),
+            cursor_pos: (-1., -1.),
+            sel_anchor: None,
+            selecting: false,
+            sel_scroll: 0,
+            cursor_visible: true,
+            last_blink: Instant::now(),
+        };
+        tw.sync_title();
+        self.windows.insert(window_id, tw);
+
+        // Wire the "+" button after the window is fully set up.
+        #[cfg(target_os = "macos")]
+        if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
+            platform::setup_add_tab_button(ns_view);
+        }
+    }
+
+    fn add_split(&mut self, window_id: WindowId, dir: SplitDir) {
+        let tw = match self.windows.get_mut(&window_id) {
+            Some(w) => w,
+            None => return,
+        };
+        if tw.panes.len() >= 2 {
+            return; // already split
+        }
+        let idx = tw.panes.len(); // will be 1
+        tw.split = Some(dir);
+
+        // Temporarily compute size; we need renderer + window size
+        let sz = tw.window.inner_size();
+        let cw = tw.renderer.cell_width;
+        let ch = tw.renderer.cell_height;
+        let (cols, rows) = match dir {
+            SplitDir::Vertical => {
+                let half = (sz.width as f32 / 2.).floor() as usize;
+                let cols = (half / cw).max(1);
+                let rows = (sz.height as usize / ch).max(1);
+                (cols, rows)
+            }
+            SplitDir::Horizontal => {
+                let half = (sz.height as f32 / 2.).floor() as usize;
+                let cols = (sz.width as usize / cw).max(1);
+                let rows = (half / ch).max(1);
+                (cols, rows)
+            }
+        };
+
+        let proxy = self.proxy.clone();
+        let new_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+            Some(p) => p,
+            None => return,
+        };
+        let tw = self.windows.get_mut(&window_id).unwrap();
+        tw.panes.push(new_pane);
+        tw.active_pane = idx;
+
+        // Also resize the first pane to its new half
+        let rects = tw.pane_rects();
+        for (i, pane) in tw.panes.iter_mut().enumerate() {
+            if let Some(&(_, _, pw, ph)) = rects.get(i) {
+                let cols = (pw as usize / cw).max(1);
+                let rows = (ph as usize / ch).max(1);
+                pane.terminal.resize(cols, rows);
+                let _ = pane.pty_master.resize(PtySize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    pixel_width: sz.width as u16,
+                    pixel_height: sz.height as u16,
+                });
+            }
+        }
+    }
+
+    fn close_pane_or_window(&mut self, window_id: WindowId, event_loop: &ActiveEventLoop) {
+        let tw = match self.windows.get_mut(&window_id) {
+            Some(w) => w,
+            None => return,
+        };
+        if tw.panes.len() <= 1 {
+            // Close the window
+            self.close_window(window_id, event_loop);
+        } else {
+            // Remove the active pane
+            let ai = tw.active_pane;
+            let removed_id = tw.panes[ai].id;
+            tw.panes.remove(ai);
+            tw.active_pane = tw.active_pane.min(tw.panes.len() - 1);
+            tw.split = None;
+            self.pane_to_window.remove(&removed_id);
+
+            // Resize the remaining pane to fill the window
+            let tw = self.windows.get_mut(&window_id).unwrap();
+            let sz = tw.window.inner_size();
+            let cw = tw.renderer.cell_width;
+            let ch = tw.renderer.cell_height;
+            let cols = (sz.width as usize / cw).max(1);
+            let rows = (sz.height as usize / ch).max(1);
+            if let Some(pane) = tw.panes.get_mut(0) {
+                pane.terminal.resize(cols, rows);
+                let _ = pane.pty_master.resize(PtySize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    pixel_width: sz.width as u16,
+                    pixel_height: sz.height as u16,
+                });
+            }
+        }
+    }
+
+    fn close_window(&mut self, window_id: WindowId, event_loop: &ActiveEventLoop) {
+        if let Some(tw) = self.windows.remove(&window_id) {
+            for pane in &tw.panes {
+                self.pane_to_window.remove(&pane.id);
+            }
+        }
+        if self.windows.is_empty() {
+            event_loop.exit();
         }
     }
 }
@@ -934,19 +1112,26 @@ impl App {
 
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = WindowAttributes::default()
-            .with_title("term")
-            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-
-        // ── wgpu initialisation ───────────────────────────────────────────────
+        // Init wgpu
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
-        // Surface must be created before adapter so we can pass compatible_surface.
-        // Arc<Window> satisfies the 'static bound required for Surface<'static>.
+        let mut attrs = WindowAttributes::default()
+            .with_title("term")
+            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            let tid = self.tabbing_id.clone();
+            attrs = attrs.with_tabbing_identifier(&tid);
+        }
+
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        let window_id = window.id();
+
         let surface: wgpu::Surface<'static> = instance
             .create_surface(window.clone())
             .expect("create wgpu surface");
@@ -970,169 +1155,257 @@ impl ApplicationHandler<AppEvent> for App {
         ))
         .expect("request_device");
 
+        let device = Arc::new(device);
+        let queue  = Arc::new(queue);
+
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        // Prefer non-sRGB to match existing colour values (raw u8 → float passthrough)
         let surface_format = caps
             .formats
             .iter()
             .copied()
             .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
+            .unwrap_or_else(|| caps.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
+        let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        surface.configure(&device, &surface_config);
 
-        // ── Build renderer ────────────────────────────────────────────────────
+        // Set NSWindowTabbingModePreferred
+        #[cfg(target_os = "macos")]
+        if let Some(ns_view) = ns_view_ptr(&window) {
+            use objc2::{msg_send, runtime::AnyObject};
+            unsafe {
+                let view = ns_view as *mut AnyObject;
+                let win: *mut AnyObject = msg_send![view, window];
+                if !win.is_null() {
+                    let _: () = msg_send![win, setTabbingMode: 1i64];
+                }
+            }
+        }
+
+        // Register the new-tab callback (only fires once since OnceLock).
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = self.proxy.clone();
+            platform::set_new_tab_callback(move || {
+                let _ = proxy.send_event(AppEvent::NewTab);
+            });
+        }
+
         let scale = window.scale_factor();
-        let renderer = Renderer::new(device, queue, surface_format, scale);
+        let renderer = Renderer::new(device.clone(), queue.clone(), surface_format, scale);
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
             let ch = renderer.cell_height;
-            let tby = renderer.tab_bar_height;
             (
                 (size.width as usize / cw).max(1),
-                ((size.height as usize).saturating_sub(tby) / ch).max(1),
+                (size.height as usize / ch).max(1),
             )
         };
-        let pty_size = PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: size.width as u16,
-            pixel_height: size.height as u16,
-        };
-        for tab in &mut self.tabs {
-            tab.terminal.resize(cols, rows);
-            let _ = tab.pty_master.resize(pty_size);
-        }
 
-        self.wgpu_surface = Some(surface);
-        self.wgpu_config = Some(config);
-        self.renderer = Some(renderer);
-        self.window = Some(window);
+        self.wgpu = Some(WgpuShared {
+            instance,
+            adapter,
+            device,
+            queue,
+            surface_format,
+        });
+
+        let proxy = self.proxy.clone();
+        let first_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tw = TerminalWindow {
+            window,
+            surface,
+            surface_config,
+            renderer,
+            panes: vec![first_pane],
+            active_pane: 0,
+            split: None,
+            modifiers: ModifiersState::empty(),
+            cursor_pos: (-1., -1.),
+            sel_anchor: None,
+            selecting: false,
+            sel_scroll: 0,
+            cursor_visible: true,
+            last_blink: Instant::now(),
+        };
+        tw.sync_title();
+        self.windows.insert(window_id, tw);
+
+        // Wire the "+" button after the window is fully set up.
+        #[cfg(target_os = "macos")]
+        if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
+            platform::setup_add_tab_button(ns_view);
+        }
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: winit::window::WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.close_window(window_id, event_loop);
+            }
 
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.redraw();
+                }
+            }
 
             WindowEvent::Resized(s) => {
-                self.on_resize(s.width, s.height);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.on_resize(s.width, s.height);
+                    tw.window.request_redraw();
                 }
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(r) = self.renderer.take() {
-                    self.renderer = Some(r.rescale(scale_factor));
+                if let Some(queue) = self.wgpu.as_ref().map(|w| w.queue.clone()) {
+                    if let Some(tw) = self.windows.get_mut(&window_id) {
+                        let fmt = tw.renderer.surface_format;
+                        let device = tw.renderer.device.clone();
+                        tw.renderer = Renderer::new(device, queue, fmt, scale_factor);
+                    }
                 }
             }
 
             WindowEvent::ModifiersChanged(state) => {
-                self.modifiers = state.state();
-                self.update_cursor_icon();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.modifiers = state.state();
+                    tw.update_cursor_icon();
+                    tw.window.request_redraw();
                 }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                self.handle_key(event, event_loop);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                let action = if let Some(tw) = self.windows.get_mut(&window_id) {
+                    let a = tw.handle_key(event);
+                    tw.window.request_redraw();
+                    a
+                } else {
+                    KeyAction::None
+                };
+
+                match action {
+                    KeyAction::None => {}
+                    KeyAction::OpenTab => {
+                        self.open_tab(event_loop);
+                    }
+                    KeyAction::ClosePaneOrWindow => {
+                        self.close_pane_or_window(window_id, event_loop);
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            tw.sync_title();
+                            tw.window.request_redraw();
+                        }
+                    }
+                    KeyAction::PrevTab => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
+                                platform::select_prev_tab(ns_view);
+                            }
+                        }
+                    }
+                    KeyAction::NextTab => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
+                                platform::select_next_tab(ns_view);
+                            }
+                        }
+                    }
+                    KeyAction::SplitVertical => {
+                        self.add_split(window_id, SplitDir::Vertical);
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            tw.window.request_redraw();
+                        }
+                    }
+                    KeyAction::SplitHorizontal => {
+                        self.add_split(window_id, SplitDir::Horizontal);
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            tw.window.request_redraw();
+                        }
+                    }
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = (position.x, position.y);
-                self.update_cursor_icon();
-                let in_bar = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| position.y < r.tab_bar_height as f64)
-                    .unwrap_or(false);
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.cursor_pos = (position.x, position.y);
+                    tw.update_cursor_icon();
 
-                // Update tab drag
-                if let Some(ref mut drag) = self.tab_drag {
-                    drag.current_x = position.x;
-                    if !drag.active && (position.x - drag.start_x).abs() > 8.0 {
-                        drag.active = true;
-                    }
-                }
-                let drag_active = self.tab_drag.as_ref().map(|d| d.active).unwrap_or(false);
-
-                if self.selecting {
-                    if let Some(anchor) = self.sel_anchor {
-                        // pixel_to_grid_cell returns None outside the terminal area;
-                        // clamp to the nearest edge row so the selection can extend
-                        // past the top/bottom while the user drags.
-                        let cell = self.pixel_to_grid_cell(position.x, position.y)
-                            .or_else(|| {
-                                let r = self.renderer.as_ref()?;
-                                let (vis_cols, vis_rows) = self.term_size();
-                                let vo = self.active().terminal.state.viewport_offset as i64;
-                                let col = (position.x.max(0.0) as usize / r.cell_width)
-                                    .min(vis_cols.saturating_sub(1));
-                                if position.y < r.tab_bar_height as f64 {
-                                    Some((-vo, col)) // visual row 0
+                    if tw.selecting {
+                        if let Some(anchor) = tw.sel_anchor {
+                            let cell = tw.pixel_to_grid_cell(position.x, position.y)
+                                .or_else(|| {
+                                    // Clamp to nearest edge
+                                    let rects = tw.pane_rects();
+                                    let ai = tw.active_pane;
+                                    let (ox, oy, pw, ph) = rects.get(ai).copied().unwrap_or((0., 0., tw.window.inner_size().width as f32, tw.window.inner_size().height as f32));
+                                    let cw = tw.renderer.cell_width as f64;
+                                    let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
+                                    let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
+                                    let vo = tw.panes[ai].terminal.state.viewport_offset as i64;
+                                    let col = ((position.x - ox as f64).max(0.) / cw as f64) as usize;
+                                    let col = col.min(vis_cols.saturating_sub(1));
+                                    if position.y < oy as f64 {
+                                        Some((ai, -vo, col))
+                                    } else {
+                                        Some((ai, vis_rows as i64 - 1 - vo, col))
+                                    }
+                                });
+                            if let Some((_pi, grid_row, col)) = cell {
+                                let c = (grid_row, col);
+                                tw.panes[tw.active_pane].selection = if c != anchor {
+                                    Some(Selection { start: anchor, end: c })
                                 } else {
-                                    Some((vis_rows as i64 - 1 - vo, col)) // last visible row
-                                }
-                            });
-                        if let Some(c) = cell {
-                            self.selection = if c != anchor {
-                                Some(Selection { start: anchor, end: c })
+                                    None
+                                };
+                            }
+
+                            // Auto-scroll detection
+                            let ai = tw.active_pane;
+                            let rects = tw.pane_rects();
+                            let (_ox, oy, _pw, ph) = rects.get(ai).copied().unwrap_or((0., 0., 0., 0.));
+                            let ch = tw.renderer.cell_height as f64;
+                            let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
+                            let term_bottom = oy as f64 + vis_rows as f64 * ch;
+                            tw.sel_scroll = if position.y < oy as f64 {
+                                1
+                            } else if position.y >= term_bottom {
+                                -1
                             } else {
-                                None
+                                0
                             };
+                            tw.window.request_redraw();
                         }
-                    }
-                    // Auto-scroll when the cursor is dragged outside the terminal area.
-                    let tby = self.renderer.as_ref().map(|r| r.tab_bar_height as f64).unwrap_or(0.0);
-                    let (_, vis_rows) = self.term_size();
-                    let ch = self.renderer.as_ref().map(|r| r.cell_height as f64).unwrap_or(1.0);
-                    let term_bottom = tby + vis_rows as f64 * ch;
-                    // Positive sel_scroll → scroll_viewport(positive) → viewport_offset
-                    // increases → older content revealed at top (scroll up).
-                    // Negative → scroll down (toward live output).
-                    self.sel_scroll = if position.y < tby {
-                        1  // cursor above terminal: scroll up toward older content
-                    } else if position.y >= term_bottom {
-                        -1 // cursor below terminal: scroll down toward live output
                     } else {
-                        0
-                    };
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                } else if drag_active || in_bar {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
+                        tw.window.request_redraw();
                     }
                 }
             }
 
             WindowEvent::CursorLeft { .. } => {
-                self.cursor_pos = (-1.0, -1.0);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.cursor_pos = (-1., -1.);
+                    tw.window.request_redraw();
                 }
             }
 
@@ -1141,51 +1414,18 @@ impl ApplicationHandler<AppEvent> for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                let (mx, my) = self.cursor_pos;
-                let in_bar = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| my >= 0.0 && my < r.tab_bar_height as f64)
-                    .unwrap_or(false);
-                if in_bar {
-                    let bw = self
-                        .window
-                        .as_ref()
-                        .map(|w| w.inner_size().width as usize)
-                        .unwrap_or(0);
-                    let tab_bar_h =
-                        self.renderer.as_ref().map(|r| r.tab_bar_height).unwrap_or(0);
-                    let tabs_w = bw.saturating_sub(tab_bar_h);
-                    let n = self.tabs.len().max(1);
-                    let tab_w = tabs_w / n;
-                    if mx as usize >= tabs_w {
-                        self.open_tab();
-                        self.sync_window_title();
-                    } else {
-                        let idx = (mx as usize) / tab_w;
-                        if idx < self.tabs.len() {
-                            self.switch_tab(idx);
-                            self.sync_window_title();
-                            // Arm drag detection — activates once the mouse moves far enough
-                            self.tab_drag = Some(TabDrag {
-                                from_idx: idx,
-                                start_x: mx,
-                                current_x: mx,
-                                active: false,
-                            });
-                        }
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                } else {
-                    // Terminal area: Cmd+click opens URL if one is under the cursor
-                    let sup = self.modifiers.super_key();
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    let (mx, my) = tw.cursor_pos;
+                    let sup = tw.modifiers.super_key();
+
+                    // Cmd+click: open URL
                     let opened = if sup {
-                        let clicked = self.pixel_to_cell(mx, my);
-                        if let Some((row, col)) = clicked {
-                            let (vis_cols, vis_rows) = self.term_size();
-                            let url = find_urls(&self.active().terminal.state, vis_rows, vis_cols)
+                        if let Some((pi, row, col)) = tw.pixel_to_pane_cell(mx, my) {
+                            let rects = tw.pane_rects();
+                            let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
+                            let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
+                            let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
+                            let url = find_urls(&tw.panes[pi].terminal.state, vis_rows, vis_cols)
                                 .into_iter()
                                 .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                                 .map(|(_, _, _, u)| u);
@@ -1201,15 +1441,22 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         false
                     };
+
                     if !opened {
-                        self.tab_drag = None;
-                        self.selection = None;
-                        self.sel_anchor = self.pixel_to_grid_cell(mx, my);
-                        self.selecting = true;
+                        // Activate pane under cursor
+                        if let Some(pi) = tw.pane_at_pixel(mx, my) {
+                            tw.active_pane = pi;
+                        }
+                        // Start selection
+                        tw.panes[tw.active_pane].selection = None;
+                        if let Some((_pi, grid_row, col)) = tw.pixel_to_grid_cell(mx, my) {
+                            tw.sel_anchor = Some((grid_row, col));
+                        } else {
+                            tw.sel_anchor = None;
+                        }
+                        tw.selecting = true;
                     }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    tw.window.request_redraw();
                 }
             }
 
@@ -1218,38 +1465,27 @@ impl ApplicationHandler<AppEvent> for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                // Finalize tab drag
-                if let Some(drag) = self.tab_drag.take() {
-                    if drag.active {
-                        let to = self.drag_target_idx(drag.current_x);
-                        self.reorder_tab(drag.from_idx, to);
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    tw.selecting = false;
+                    tw.sel_scroll = 0;
+                    if tw.panes[tw.active_pane].selection.is_none() {
+                        tw.sel_anchor = None;
                     }
-                }
-                self.selecting = false;
-                self.sel_scroll = 0;
-                if self.selection.is_none() {
-                    self.sel_anchor = None;
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                    tw.window.request_redraw();
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 4.5) as i32,
-                    MouseScrollDelta::PixelDelta(pos) => {
-                        let ch = self
-                            .renderer
-                            .as_ref()
-                            .map(|r| r.cell_height as f64)
-                            .unwrap_or(20.0);
-                        (pos.y / ch * 2.25) as i32
-                    }
-                };
-                self.active_mut().terminal.state.scroll_viewport(lines);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 4.5) as i32,
+                        MouseScrollDelta::PixelDelta(pos) => {
+                            let ch = tw.renderer.cell_height as f64;
+                            (pos.y / ch * 2.25) as i32
+                        }
+                    };
+                    tw.active_mut().terminal.state.scroll_viewport(lines);
+                    tw.window.request_redraw();
                 }
             }
 
@@ -1262,97 +1498,119 @@ impl ApplicationHandler<AppEvent> for App {
         const SCROLL_PERIOD: Duration = Duration::from_millis(50);
         let now = Instant::now();
 
-        // Cursor blink
-        if now.duration_since(self.last_blink) >= BLINK_PERIOD {
-            self.cursor_visible = !self.cursor_visible;
-            self.last_blink = now;
-            if let Some(w) = &self.window {
-                w.request_redraw();
+        let mut earliest_deadline = now + BLINK_PERIOD;
+
+        for tw in self.windows.values_mut() {
+            // Cursor blink
+            if now.duration_since(tw.last_blink) >= BLINK_PERIOD {
+                tw.cursor_visible = !tw.cursor_visible;
+                tw.last_blink = now;
+                tw.window.request_redraw();
             }
+
+            // Auto-scroll while selection drag extends beyond terminal area
+            if tw.selecting && tw.sel_scroll != 0 {
+                let dir = tw.sel_scroll;
+                tw.panes[tw.active_pane].terminal.state.scroll_viewport(dir);
+                if let Some(anchor) = tw.sel_anchor {
+                    let rects = tw.pane_rects();
+                    let ai = tw.active_pane;
+                    let (_, _, pw, ph) = rects.get(ai).copied().unwrap_or((0., 0., 0., 0.));
+                    let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
+                    let vo = tw.panes[ai].terminal.state.viewport_offset as i64;
+                    let (mx, _) = tw.cursor_pos;
+                    let cw = tw.renderer.cell_width as f64;
+                    let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
+                    let col = ((mx.max(0.0)) / cw) as usize;
+                    let col = col.min(vis_cols.saturating_sub(1));
+                    let edge_row = if dir > 0 { -vo } else { vis_rows as i64 - 1 - vo };
+                    let c = (edge_row, col);
+                    tw.panes[ai].selection = if c != anchor {
+                        Some(Selection { start: anchor, end: c })
+                    } else {
+                        None
+                    };
+                }
+                tw.window.request_redraw();
+                earliest_deadline = earliest_deadline.min(now + SCROLL_PERIOD);
+            }
+
+            let next_blink = tw.last_blink + BLINK_PERIOD;
+            earliest_deadline = earliest_deadline.min(next_blink);
         }
 
-        // Auto-scroll while selection drag extends beyond the terminal area
-        if self.selecting && self.sel_scroll != 0 {
-            let dir = self.sel_scroll;
-            self.active_mut().terminal.state.scroll_viewport(dir);
-            // Extend selection endpoint to the edge row that's now scrolled into view
-            if let Some(anchor) = self.sel_anchor {
-                let (_, vis_rows) = self.term_size();
-                let vo = self.active().terminal.state.viewport_offset as i64;
-                let (mx, _) = self.cursor_pos;
-                let col = self.renderer.as_ref()
-                    .map(|r| (mx.max(0.0) as usize / r.cell_width)
-                        .min(self.active().terminal.state.cols.saturating_sub(1)))
-                    .unwrap_or(0);
-                // dir > 0 = scrolled up (older content) → endpoint at top of viewport
-                // dir < 0 = scrolled down (newer content) → endpoint at bottom
-                let edge_row = if dir > 0 { -vo } else { vis_rows as i64 - 1 - vo };
-                let c = (edge_row, col);
-                self.selection = if c != anchor {
-                    Some(Selection { start: anchor, end: c })
-                } else {
-                    None
-                };
-            }
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        }
-
-        let next_blink = self.last_blink + BLINK_PERIOD;
-        let deadline = if self.selecting && self.sel_scroll != 0 {
-            now + SCROLL_PERIOD
-        } else {
-            next_blink
-        };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.min(next_blink)));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(earliest_deadline));
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::PtyData { tab_id, data } => {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                    if !tab.terminal.state.is_scrolled_back() {
-                        tab.terminal.state.snap_to_bottom();
+            AppEvent::PtyData { pane_id, data } => {
+                let window_id = match self.pane_to_window.get(&pane_id).copied() {
+                    Some(w) => w,
+                    None => return,
+                };
+                let tw = match self.windows.get_mut(&window_id) {
+                    Some(w) => w,
+                    None => return,
+                };
+                if let Some(pane) = tw.panes.iter_mut().find(|p| p.id == pane_id) {
+                    if !pane.terminal.state.is_scrolled_back() {
+                        pane.terminal.state.snap_to_bottom();
                     }
-                    tab.terminal.process(&data);
+                    pane.terminal.process(&data);
                     let responses: Vec<Vec<u8>> =
-                        tab.terminal.state.pending_responses.drain(..).collect();
+                        pane.terminal.state.pending_responses.drain(..).collect();
                     for r in responses {
-                        let _ = tab.pty_writer.write_all(&r);
-                        let _ = tab.pty_writer.flush();
+                        let _ = pane.pty_writer.write_all(&r);
+                        let _ = pane.pty_writer.flush();
                     }
-                    // OSC 52 clipboard query: respond with clipboard content.
-                    if tab.terminal.state.osc_52_query {
-                        tab.terminal.state.osc_52_query = false;
+                    if pane.terminal.state.osc_52_query {
+                        pane.terminal.state.osc_52_query = false;
                         let payload = osc52_clipboard_payload();
                         let response = format!("\x1b]52;c;{payload}\x07");
-                        let _ = tab.pty_writer.write_all(response.as_bytes());
-                        let _ = tab.pty_writer.flush();
+                        let _ = pane.pty_writer.write_all(response.as_bytes());
+                        let _ = pane.pty_writer.flush();
                     }
                 }
-                // Update ghost text only for the active tab
-                if self.tabs.get(self.active_tab).map(|t| t.id) == Some(tab_id) {
-                    self.update_ghost();
-                    self.sync_window_title();
+                // Update ghost text for active pane
+                if tw.panes.get(tw.active_pane).map(|p| p.id) == Some(pane_id) {
+                    tw.update_ghost();
+                    tw.sync_title();
                 }
-                self.reset_blink();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                tw.reset_blink();
+                tw.window.request_redraw();
+            }
+            AppEvent::PtyExit { pane_id } => {
+                let window_id = match self.pane_to_window.get(&pane_id).copied() {
+                    Some(w) => w,
+                    None => return,
+                };
+                self.pane_to_window.remove(&pane_id);
+                let should_close_window = {
+                    let tw = match self.windows.get_mut(&window_id) {
+                        Some(w) => w,
+                        None => return,
+                    };
+                    if let Some(pos) = tw.panes.iter().position(|p| p.id == pane_id) {
+                        if tw.panes.len() == 1 {
+                            true
+                        } else {
+                            tw.panes.remove(pos);
+                            tw.active_pane = tw.active_pane.min(tw.panes.len() - 1);
+                            tw.split = None;
+                            tw.window.request_redraw();
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if should_close_window {
+                    self.close_window(window_id, event_loop);
                 }
             }
-            AppEvent::PtyExit { tab_id } => {
-                if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
-                    if self.tabs.len() == 1 {
-                        event_loop.exit();
-                    } else {
-                        self.tabs.remove(pos);
-                        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
-                }
+            AppEvent::NewTab => {
+                self.open_tab(event_loop);
             }
         }
     }
@@ -1360,8 +1618,6 @@ impl ApplicationHandler<AppEvent> for App {
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
-/// Return the base64-encoded clipboard payload for an OSC 52 response.
-/// Prefers image (PNG) over text; returns empty string if clipboard is empty.
 fn osc52_clipboard_payload() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -1425,25 +1681,19 @@ fn copy_to_clipboard(text: &str) {
 }
 
 /// Strip tcat's line-number gutter from copied text.
-/// tcat renders each line as "  {N} │ {content}".  We find the U+2502
-/// separator flanked by spaces, verify the prefix is digits+spaces, and
-/// return only the content.
 fn strip_tcat_gutter(text: &str) -> String {
     const SEP: char = '\u{2502}'; // │
     text.lines()
         .map(|line| {
-            // Find │ with a space on each side
             let chars: Vec<char> = line.chars().collect();
             for i in 1..chars.len().saturating_sub(1) {
                 if chars[i] != SEP || chars[i - 1] != ' ' || chars[i + 1] != ' ' {
                     continue;
                 }
-                // Prefix (0..i-1) must be spaces/digits with at least one digit
                 let prefix = &chars[..i - 1];
                 if prefix.iter().all(|&c| c == ' ' || c == '\0' || c.is_ascii_digit())
                     && prefix.iter().any(|c| c.is_ascii_digit())
                 {
-                    // Content starts at i+2 (after │ and trailing space)
                     return chars[i + 2..].iter().collect::<String>();
                 }
             }
@@ -1554,8 +1804,6 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 
     cmd.env("ZDOTDIR", &zdotdir);
     cmd.env("TERM_PROGRAM", "ghostty");
-    // Ensure UTF-8 locale so multi-byte characters aren't re-encoded via Mac Roman.
-    // Only set if not already present — respect the user's explicit locale choice.
     if std::env::var("LANG").is_err() {
         cmd.env("LANG", "en_US.UTF-8");
     }
@@ -1573,57 +1821,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // Create first tab
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty failed");
-
-    let mut cmd = CommandBuilder::new("zsh");
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    setup_shell_env(&mut cmd);
-
-    let _child = pair.slave.spawn_command(cmd).expect("spawn zsh failed");
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let writer = pair.master.take_writer().expect("take writer");
-
-    let proxy_reader = proxy.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    let _ = proxy_reader.send_event(AppEvent::PtyExit { tab_id: 0 });
-                    break;
-                }
-                Ok(n) => {
-                    let _ = proxy_reader.send_event(AppEvent::PtyData {
-                        tab_id: 0,
-                        data: buf[..n].to_vec(),
-                    });
-                }
-            }
-        }
-    });
-
-    let first_tab = Tab {
-        id: 0,
-        terminal: Terminal::new(80, 24),
-        pty_master: pair.master,
-        pty_writer: writer,
-        ghost_text: None,
-    };
-
-    let mut app = App::new(first_tab, proxy);
-    app.next_id = 1;
+    let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
 }
 
