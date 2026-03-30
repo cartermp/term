@@ -1064,6 +1064,11 @@ impl Renderer { // re-open impl
                     let fg = c2f(fg_color);
                     if !Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg) {
                         self.emit_char(&mut glyphs, c, px, py, fg);
+                        // Render combining / extending codepoints at the same
+                        // cell position (overlaid on the base glyph).
+                        for &combining in cell.combining_chars() {
+                            self.emit_char(&mut glyphs, combining, px, py, fg);
+                        }
                     }
                 }
             }

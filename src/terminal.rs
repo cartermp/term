@@ -30,6 +30,11 @@ impl Default for Attrs {
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub c: char,
+    /// Combining / extending codepoints that form the rest of this grapheme
+    /// cluster (e.g. skin-tone modifiers, variation selectors, diacritics).
+    /// Zero-initialised; only the first `combining_len` slots are valid.
+    combining: [char; 3],
+    combining_len: u8,
     pub attrs: Attrs,
 }
 
@@ -37,8 +42,25 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             c: ' ',
+            combining: ['\0'; 3],
+            combining_len: 0,
             attrs: Attrs::default(),
         }
+    }
+}
+
+impl Cell {
+    /// Append a combining codepoint to this grapheme cluster (noop when full).
+    pub fn push_combining(&mut self, c: char) {
+        if (self.combining_len as usize) < self.combining.len() {
+            self.combining[self.combining_len as usize] = c;
+            self.combining_len += 1;
+        }
+    }
+
+    /// The combining / extending codepoints that follow the base character.
+    pub fn combining_chars(&self) -> &[char] {
+        &self.combining[..self.combining_len as usize]
     }
 }
 
@@ -68,6 +90,11 @@ pub struct TerminalState {
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
     wrap_next: bool,
+    /// Grid coordinates of the most recently printed cell (for combining-char attachment).
+    last_placed: (usize, usize),
+    /// True immediately after placing a regional-indicator codepoint (U+1F1E6–U+1F1FF),
+    /// so the next regional indicator can be folded into the same cell as a flag emoji.
+    last_was_regional_indicator: bool,
     // Alternate screen buffer (?1049h / ?47h)
     alt_screen: bool,
     alt_grid: Vec<Vec<Cell>>,
@@ -103,6 +130,8 @@ impl TerminalState {
             saved_cursor: (0, 0),
             saved_attrs: Attrs::default(),
             wrap_next: false,
+            last_placed: (0, 0),
+            last_was_regional_indicator: false,
             alt_screen: false,
             alt_grid: vec![vec![Cell::default(); cols]; rows],
             alt_saved_cursor: (0, 0),
@@ -245,8 +274,11 @@ impl TerminalState {
             self.do_newline();
         }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
+            self.last_placed = (self.cursor_row, self.cursor_col);
             self.grid[self.cursor_row][self.cursor_col] = Cell {
                 c,
+                combining: ['\0'; 3],
+                combining_len: 0,
                 attrs: self.attrs,
             };
             if self.cursor_col + 1 >= self.cols {
@@ -254,6 +286,15 @@ impl TerminalState {
             } else {
                 self.cursor_col += 1;
             }
+        }
+    }
+
+    /// Attach a combining codepoint to the most recently placed cell without
+    /// advancing the cursor.
+    fn extend_last_cluster(&mut self, c: char) {
+        let (row, col) = self.last_placed;
+        if row < self.rows && col < self.cols {
+            self.grid[row][col].push_combining(c);
         }
     }
 
@@ -268,6 +309,8 @@ impl TerminalState {
     fn blank_cell(&self) -> Cell {
         Cell {
             c: ' ',
+            combining: ['\0'; 3],
+            combining_len: 0,
             attrs: Attrs {
                 fg: DEFAULT_FG,
                 bg: self.attrs.bg,
@@ -380,13 +423,70 @@ impl TerminalState {
     }
 }
 
+// ── Grapheme cluster helpers ──────────────────────────────────────────────────
+
+/// Returns `true` for codepoints that extend a grapheme cluster without
+/// advancing the cursor: combining diacritical marks, variation selectors,
+/// ZWJ, emoji skin-tone modifiers, flag tag characters, etc.
+fn is_grapheme_extend(c: char) -> bool {
+    matches!(c,
+        // Combining Diacritical Marks (Latin, Greek, Cyrillic…)
+        '\u{0300}'..='\u{036F}' |
+        // Hebrew combining marks (niqqud, cantillation signs)
+        '\u{0591}'..='\u{05BD}' | '\u{05BF}' |
+        '\u{05C1}'..='\u{05C2}' | '\u{05C4}'..='\u{05C5}' | '\u{05C7}' |
+        // Arabic combining marks (harakat, shadda, etc.)
+        '\u{0610}'..='\u{061A}' | '\u{064B}'..='\u{065F}' | '\u{0670}' |
+        '\u{06D6}'..='\u{06DC}' | '\u{06DF}'..='\u{06E4}' |
+        '\u{06E7}'..='\u{06E8}' | '\u{06EA}'..='\u{06ED}' |
+        // Combining Diacritical Marks Extended
+        '\u{1AB0}'..='\u{1AFF}' |
+        // Combining Diacritical Marks Supplement
+        '\u{1DC0}'..='\u{1DFF}' |
+        // Combining Diacritical Marks for Symbols
+        '\u{20D0}'..='\u{20FF}' |
+        // Zero Width Non-Joiner / Zero Width Joiner
+        '\u{200C}'..='\u{200D}' |
+        // Variation Selectors (text vs. emoji presentation)
+        '\u{FE00}'..='\u{FE0F}' |
+        // Combining Half Marks
+        '\u{FE20}'..='\u{FE2F}' |
+        // Emoji skin-tone modifiers (Fitzpatrick scale 1–5)
+        '\u{1F3FB}'..='\u{1F3FF}' |
+        // Tags used in subdivision flags (England 🏴󠁧󠁢󠁥󠁮󠁧󠁿, Scotland, Wales)
+        '\u{E0020}'..='\u{E007F}' |
+        // Variation Selectors Supplement
+        '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Returns `true` for Unicode Regional Indicator letters (🇦–🇿, U+1F1E6–U+1F1FF).
+/// Two consecutive regional indicators form a country flag emoji and should
+/// share a single cell.
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
-        self.put_char(c);
+        if is_grapheme_extend(c) {
+            // Zero-width combiner: attach to the previous cell, do not advance cursor.
+            self.extend_last_cluster(c);
+        } else if is_regional_indicator(c) && self.last_was_regional_indicator {
+            // Second regional indicator completes a country flag — fold into same cell.
+            self.extend_last_cluster(c);
+            self.last_was_regional_indicator = false;
+        } else {
+            self.put_char(c);
+            self.last_was_regional_indicator = is_regional_indicator(c);
+        }
     }
 
     fn execute(&mut self, byte: u8) {
         self.wrap_next = false;
+        self.last_was_regional_indicator = false;
         match byte {
             0x08 => {
                 if self.cursor_col > 0 {
@@ -679,6 +779,437 @@ mod tests {
         t.process(b"AB");
         assert_eq!(ch(&t, 0, 0), 'A');
         assert_eq!(ch(&t, 0, 1), 'B');
+    }
+
+    // ── Grapheme clustering ───────────────────────────────────────────────────
+
+    #[test]
+    fn combining_diacritic_does_not_advance_cursor() {
+        // 'e' followed by combining acute (U+0301) should stay in column 0.
+        let mut t = t(80, 24);
+        t.process("e\u{0301}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), 'e');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0301}']);
+        assert_eq!(t.state.cursor_col, 1, "cursor must not advance for combiner");
+    }
+
+    #[test]
+    fn variation_selector_attached_to_base() {
+        // Emoji variation selector (U+FE0F) must not occupy a separate cell.
+        let mut t = t(80, 24);
+        t.process("\u{2764}\u{FE0F}".as_bytes()); // ❤️
+        assert_eq!(ch(&t, 0, 0), '\u{2764}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{FE0F}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn skin_tone_modifier_attached_to_base() {
+        // Wave hand + medium-dark skin tone (U+1F3FE).
+        let mut t = t(80, 24);
+        t.process("\u{1F44B}\u{1F3FE}".as_bytes()); // 👋🏾
+        assert_eq!(ch(&t, 0, 0), '\u{1F44B}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F3FE}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn flag_emoji_two_regional_indicators_share_one_cell() {
+        // 🇺🇸 = U+1F1FA U+1F1F8 (two regional indicators).
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}\u{1F1F8}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{1F1FA}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F1F8}']);
+        assert_eq!(t.state.cursor_col, 1, "flag counts as one cell");
+    }
+
+    #[test]
+    fn third_regional_indicator_starts_new_cell() {
+        // Three regional indicators → first flag + one lone RI.
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}\u{1F1F8}\u{1F1E9}".as_bytes()); // 🇺🇸🇩
+        assert_eq!(ch(&t, 0, 0), '\u{1F1FA}'); // first RI
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F1F8}']); // second RI combined
+        assert_eq!(ch(&t, 0, 1), '\u{1F1E9}'); // third RI in new cell
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn hebrew_niqqud_does_not_advance_cursor() {
+        // Alef (U+05D0) + dagesh (U+05BC) must share a cell.
+        let mut t = t(80, 24);
+        t.process("\u{05D0}\u{05BC}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{05D0}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{05BC}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn zwj_does_not_advance_cursor() {
+        // ZWJ (U+200D) is zero-width and must not create a new cell.
+        let mut t = t(80, 24);
+        t.process("\u{1F468}\u{200D}".as_bytes()); // man + ZWJ
+        assert_eq!(ch(&t, 0, 0), '\u{1F468}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{200D}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn newline_resets_regional_indicator_state() {
+        // A lone regional indicator followed by \r\n should not combine with
+        // the next regional indicator on the following line.
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}\r\n\u{1F1F8}".as_bytes());
+        // First RI is alone on row 0
+        assert_eq!(ch(&t, 0, 0), '\u{1F1FA}');
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
+        // Second RI starts a new cell on row 1
+        assert_eq!(ch(&t, 1, 0), '\u{1F1F8}');
+    }
+
+    // ── Grapheme clustering — exhaustive ─────────────────────────────────────
+
+    // --- Combining diacritical marks -----------------------------------------
+
+    #[test]
+    fn multiple_combiners_on_one_base() {
+        // 'a' + combining ring below (U+0325) + combining tilde above (U+0303).
+        // Both combiners must land in the same cell; cursor must sit at col 1.
+        let mut t = t(80, 24);
+        t.process("a\u{0325}\u{0303}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), 'a');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0325}', '\u{0303}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn combiner_overflow_is_silent() {
+        // Cell holds at most 3 combiners; a 4th is silently dropped rather than
+        // panicking or corrupting neighbouring cells.
+        let mut t = t(80, 24);
+        // U+0300–U+0303 = four combining graves/accents
+        t.process("e\u{0300}\u{0301}\u{0302}\u{0303}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), 'e');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0300}', '\u{0301}', '\u{0302}']);
+        // 4th combiner dropped; cursor still at 1
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn combiner_at_start_of_line_no_panic() {
+        // A combining character with no preceding base in the grid should not
+        // panic; it is attached to cell (0,0) whose base is still a space.
+        let mut t = t(80, 24);
+        t.process("\u{0301}".as_bytes()); // lone combining acute
+        // Should not panic; cursor must not have moved.
+        assert_eq!(t.state.cursor_col, 0);
+    }
+
+    #[test]
+    fn combiner_after_line_wrap_attaches_to_last_cell_of_previous_row() {
+        // Fill a 4-wide terminal so the last char lands at col 3 with wrap_next set,
+        // then send a combining mark.  It must attach to col 3, not the next row.
+        let mut t = t(4, 4);
+        t.process("ABCD\u{0301}".as_bytes()); // 4 ASCII chars fill row 0; combiner follows
+        assert_eq!(ch(&t, 0, 3), 'D');
+        assert_eq!(t.state.grid[0][3].combining_chars(), &['\u{0301}']);
+        assert_eq!(t.state.cursor_row, 0, "wrap must not have fired for the combiner");
+    }
+
+    #[test]
+    fn two_independent_clusters_on_same_line() {
+        // 'a' + acute, then 'b' + grave — two separate base+combiner pairs.
+        let mut t = t(80, 24);
+        t.process("a\u{0301}b\u{0300}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), 'a');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0301}']);
+        assert_eq!(ch(&t, 0, 1), 'b');
+        assert_eq!(t.state.grid[0][1].combining_chars(), &['\u{0300}']);
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    // --- Variation selectors -------------------------------------------------
+
+    #[test]
+    fn text_variation_selector_vs15_attached() {
+        // U+FE0E (VS-15) selects text presentation; must not advance cursor.
+        let mut t = t(80, 24);
+        t.process("\u{2603}\u{FE0E}".as_bytes()); // ☃︎ (snowman, text form)
+        assert_eq!(ch(&t, 0, 0), '\u{2603}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{FE0E}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn emoji_variation_selector_vs16_attached() {
+        // U+FE0F (VS-16) selects emoji presentation; must not advance cursor.
+        let mut t = t(80, 24);
+        t.process("\u{2603}\u{FE0F}".as_bytes()); // ☃️ (snowman, emoji form)
+        assert_eq!(ch(&t, 0, 0), '\u{2603}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{FE0F}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn variation_selector_supplement_attached() {
+        // U+E0100 is the first Variation Selector Supplement codepoint.
+        let mut t = t(80, 24);
+        t.process("\u{845B}\u{E0100}".as_bytes()); // 葛󠄀 (Unified CJK + IVS)
+        assert_eq!(ch(&t, 0, 0), '\u{845B}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{E0100}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Zero Width Joiner ---------------------------------------------------
+
+    #[test]
+    fn zwj_sequence_three_parts_share_cell() {
+        // Man (U+1F468) + ZWJ (U+200D) + laptop (U+1F4BB) — a "man technologist"
+        // ZWJ sequence.  ZWJ and the second emoji are both grapheme extenders
+        // here because ZWJ is zero-width; the second emoji after ZWJ is a
+        // regular (non-zero-width) codepoint so it gets its own cell.
+        // What we test: ZWJ itself does NOT advance the cursor.
+        let mut t = t(80, 24);
+        t.process("\u{1F468}\u{200D}\u{1F4BB}".as_bytes());
+        // man emoji in col 0, ZWJ stored as combiner
+        assert_eq!(ch(&t, 0, 0), '\u{1F468}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{200D}']);
+        // laptop emoji in col 1 (non-zero-width codepoint after ZWJ)
+        assert_eq!(ch(&t, 0, 1), '\u{1F4BB}');
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn zero_width_non_joiner_attached() {
+        // U+200C (ZWNJ) is zero-width and must not occupy a separate cell.
+        let mut t = t(80, 24);
+        t.process("\u{0627}\u{200C}".as_bytes()); // Arabic alef + ZWNJ
+        assert_eq!(ch(&t, 0, 0), '\u{0627}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{200C}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Emoji skin-tone modifiers -------------------------------------------
+
+    #[test]
+    fn all_five_skin_tones_attached() {
+        // Five separate base+modifier pairs on the same row.
+        let bases  = ['\u{1F44B}'; 5]; // 👋
+        let tones  = ['\u{1F3FB}', '\u{1F3FC}', '\u{1F3FD}', '\u{1F3FE}', '\u{1F3FF}'];
+        let mut t = t(80, 24);
+        for (col, (&base, &tone)) in bases.iter().zip(tones.iter()).enumerate() {
+            let s = format!("{base}{tone}");
+            t.process(s.as_bytes());
+            assert_eq!(ch(&t, 0, col), base, "col {col} base");
+            assert_eq!(t.state.grid[0][col].combining_chars(), &[tone], "col {col} tone");
+        }
+        assert_eq!(t.state.cursor_col, 5);
+    }
+
+    #[test]
+    fn skin_tone_without_base_emoji_attaches_to_previous_cell() {
+        // A skin-tone modifier sent without a valid preceding emoji still must
+        // not advance the cursor — it attaches to whatever cell is at last_placed.
+        let mut t = t(80, 24);
+        t.process("A\u{1F3FB}".as_bytes()); // ASCII 'A' + skin tone
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F3FB}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Flag emoji (regional indicators) ------------------------------------
+
+    #[test]
+    fn multiple_flags_in_sequence() {
+        // 🇺🇸🇩🇪 — two flags side by side.
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}\u{1F1F8}\u{1F1E9}\u{1F1EA}".as_bytes());
+        // First flag in col 0
+        assert_eq!(ch(&t, 0, 0), '\u{1F1FA}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F1F8}']);
+        // Second flag in col 1
+        assert_eq!(ch(&t, 0, 1), '\u{1F1E9}');
+        assert_eq!(t.state.grid[0][1].combining_chars(), &['\u{1F1EA}']);
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn lone_regional_indicator_occupies_one_cell() {
+        // A single RI not followed by another RI must still advance the cursor once.
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}A".as_bytes()); // RI then regular char
+        assert_eq!(ch(&t, 0, 0), '\u{1F1FA}');
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
+        assert_eq!(ch(&t, 0, 1), 'A');
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn carriage_return_resets_regional_indicator_state() {
+        // CR between two RIs must prevent them from combining into a flag.
+        // Sequence: 🇺 CR 🇸
+        //   - 🇺 (U+1F1FA) lands at col 0, cursor advances to col 1
+        //   - CR resets cursor to col 0 and clears last_was_regional_indicator
+        //   - 🇸 (U+1F1F8) overwrites col 0 as a new, independent cell
+        let mut t = t(80, 24);
+        t.process("\u{1F1FA}\r\u{1F1F8}".as_bytes());
+        // Second RI sits alone at col 0 — no combiner from the first RI.
+        assert_eq!(ch(&t, 0, 0), '\u{1F1F8}');
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
+    }
+
+    // --- Subdivision / tag flags ---------------------------------------------
+
+    #[test]
+    fn subdivision_flag_tags_attached() {
+        // England flag: black flag (U+1F3F4) + tag sequence + cancel tag (U+E007F).
+        // All tag characters (U+E0020–U+E007F) are grapheme extenders.
+        // Black flag base = '\u{1F3F4}', followed by: g=E0067 b=E0062 e=E0065 n=E006E g=E0067 + cancel=E007F
+        let flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        let mut t = t(80, 24);
+        t.process(flag.as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{1F3F4}');
+        // First three tag chars stored (cell holds max 3 combiners)
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 3);
+        assert_eq!(t.state.grid[0][0].combining_chars()[0], '\u{E0067}');
+        // All tag chars are combiners → cursor at col 1
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Hebrew --------------------------------------------------------------
+
+    #[test]
+    fn hebrew_multiple_niqqud_on_one_letter() {
+        // Shin (U+05E9) + shin dot (U+05C1) + dagesh (U+05BC).
+        let mut t = t(80, 24);
+        t.process("\u{05E9}\u{05C1}\u{05BC}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{05E9}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{05C1}', '\u{05BC}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn hebrew_cantillation_sign_attached() {
+        // Alef (U+05D0) + etnahta (U+0591, a cantillation mark).
+        let mut t = t(80, 24);
+        t.process("\u{05D0}\u{0591}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{05D0}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0591}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn hebrew_word_with_niqqud_cursor_positions() {
+        // Spell שָׁלוֹם (shalom) with niqqud: shin+shin-dot+qamats, lamed, vav+holam, mem.
+        // Cursor must advance by 4 (one per base letter), not more.
+        let word = "\u{05E9}\u{05C1}\u{05B8}\u{05DC}\u{05D5}\u{05B9}\u{05DD}";
+        let mut t = t(80, 24);
+        t.process(word.as_bytes());
+        // col 0: shin with two niqqud
+        assert_eq!(ch(&t, 0, 0), '\u{05E9}');
+        // col 1: lamed (no niqqud)
+        assert_eq!(ch(&t, 0, 1), '\u{05DC}');
+        // col 2: vav with holam
+        assert_eq!(ch(&t, 0, 2), '\u{05D5}');
+        // col 3: mem
+        assert_eq!(ch(&t, 0, 3), '\u{05DD}');
+        assert_eq!(t.state.cursor_col, 4);
+    }
+
+    // --- Arabic --------------------------------------------------------------
+
+    #[test]
+    fn arabic_harakat_attached() {
+        // Arabic letter ba (U+0628) + fathah (U+064E, a haraka vowel mark).
+        let mut t = t(80, 24);
+        t.process("\u{0628}\u{064E}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{0628}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{064E}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn arabic_shadda_plus_kasra_attached() {
+        // Shadda (U+0651) + kasra (U+0650) stacked on one base letter.
+        let mut t = t(80, 24);
+        t.process("\u{0628}\u{0651}\u{0650}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{0628}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0651}', '\u{0650}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn arabic_word_with_tashkeel_cursor_positions() {
+        // كِتَابٌ (kitabun) — 5 base letters with harakat;
+        // cursor must advance by 5 base letters only.
+        // k=0643 i=0650 t=062A a=064E A=0627 b=0628 un=064C
+        let word = "\u{0643}\u{0650}\u{062A}\u{064E}\u{0627}\u{0628}\u{064C}";
+        let mut t = t(80, 24);
+        t.process(word.as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{0643}');  // kaf
+        assert_eq!(ch(&t, 0, 1), '\u{062A}');  // ta
+        assert_eq!(ch(&t, 0, 2), '\u{0627}');  // alef
+        assert_eq!(ch(&t, 0, 3), '\u{0628}');  // ba
+        assert_eq!(t.state.cursor_col, 4);
+    }
+
+    #[test]
+    fn arabic_extended_combining_above_attached() {
+        // U+0610 (Arabic sign sallallahou alayhe wassallam) is in the Arabic
+        // extended combining range U+0610–U+061A.
+        let mut t = t(80, 24);
+        t.process("\u{0645}\u{0610}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '\u{0645}');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0610}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Combining Diacritical Marks for Symbols / Half Marks ----------------
+
+    #[test]
+    fn combining_half_mark_attached() {
+        // U+FE20 (combining ligature left half) is in the Combining Half Marks block.
+        let mut t = t(80, 24);
+        t.process("f\u{FE20}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), 'f');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{FE20}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn combining_enclosing_mark_attached() {
+        // U+20DD (combining enclosing circle) is a Combining Diacritical Mark
+        // for Symbols (U+20D0–U+20FF).
+        let mut t = t(80, 24);
+        t.process("1\u{20DD}".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '1');
+        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{20DD}']);
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    // --- Non-combining chars still start new cells ---------------------------
+
+    #[test]
+    fn regular_ascii_never_combines() {
+        // Sanity: plain ASCII letters must never fold into a previous cell.
+        let mut t = t(80, 24);
+        t.process(b"XYZ");
+        assert_eq!(ch(&t, 0, 0), 'X');
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
+        assert_eq!(ch(&t, 0, 1), 'Y');
+        assert_eq!(ch(&t, 0, 2), 'Z');
+        assert_eq!(t.state.cursor_col, 3);
+    }
+
+    #[test]
+    fn non_modifier_emoji_does_not_combine() {
+        // Two unrelated emoji (pizza + rocket) must each occupy their own cell.
+        let mut t = t(80, 24);
+        t.process("\u{1F355}\u{1F680}".as_bytes()); // 🍕🚀
+        assert_eq!(ch(&t, 0, 0), '\u{1F355}');
+        assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
+        assert_eq!(ch(&t, 0, 1), '\u{1F680}');
+        assert_eq!(t.state.cursor_col, 2);
     }
 
     #[test]

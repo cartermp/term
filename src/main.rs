@@ -444,7 +444,14 @@ impl App {
             let mut line = String::new();
             for col in col_start..col_end.min(state.cols) {
                 let cell = state.visual_cell(row, col);
-                line.push(if cell.c == '\0' { ' ' } else { cell.c });
+                if cell.c == '\0' {
+                    line.push(' ');
+                } else {
+                    line.push(cell.c);
+                    for &combining in cell.combining_chars() {
+                        line.push(combining);
+                    }
+                }
             }
             if row > r0 {
                 result.push('\n');
