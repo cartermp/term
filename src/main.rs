@@ -1404,7 +1404,12 @@ fn base64_encode(data: &[u8]) -> String {
 fn copy_to_clipboard(text: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+    if let Ok(mut child) = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .spawn()
+    {
         if let Some(stdin) = child.stdin.as_mut() {
             let _ = stdin.write_all(text.as_bytes());
         }
