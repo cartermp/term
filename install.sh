@@ -35,7 +35,7 @@ if [ -f "$ICON_SVG" ]; then
     local size=$1 out=$2
     local tmp
     tmp=$(mktemp /tmp/term_icon_XXXXXX.tiff)
-    osascript - "$ICON_SVG" "$tmp" "$size" <<'APPLESCRIPT'
+    osascript - "$ICON_SVG" "$tmp" "$size" <<'APPLESCRIPT' >/dev/null
 use framework "AppKit"
 use framework "Foundation"
 use scripting additions

@@ -10,10 +10,12 @@ impl Color {
         Self { r, g, b }
     }
 
+    #[allow(dead_code)]
     pub fn to_u32(self) -> u32 {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
 
+    #[allow(dead_code)]
     pub fn blend(self, fg: Color, alpha: u8) -> Color {
         let a = alpha as u32;
         let ia = 255 - a;
