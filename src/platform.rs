@@ -214,3 +214,25 @@ pub fn select_prev_tab(ns_view: *mut std::ffi::c_void) {
         }
     }
 }
+
+/// Update the native macOS tab label for this window.
+/// `NSWindowTab.title` is separate from `NSWindow.title` and doesn't
+/// automatically follow it after the window is added to a tab group.
+#[cfg(target_os = "macos")]
+pub fn set_tab_title(ns_view: *mut std::ffi::c_void, title: &str) {
+    use objc2::{msg_send, runtime::AnyObject};
+    use std::os::raw::c_char;
+    unsafe {
+        let view: *mut AnyObject = ns_view as *mut AnyObject;
+        let win:  *mut AnyObject = msg_send![view, window];
+        if win.is_null() { return; }
+        let tab: *mut AnyObject = msg_send![win, tab];
+        if tab.is_null() { return; }
+        let ns_str: *mut AnyObject = msg_send![
+            objc2::class!(NSString),
+            stringWithUTF8String: title.as_ptr() as *const c_char
+        ];
+        if ns_str.is_null() { return; }
+        let _: () = msg_send![tab, setTitle: ns_str];
+    }
+}

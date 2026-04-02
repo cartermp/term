@@ -310,7 +310,12 @@ impl TerminalWindow {
     }
 
     fn sync_title(&self) {
-        self.window.set_title(self.active().title());
+        let title = self.active().title();
+        self.window.set_title(title);
+        #[cfg(target_os = "macos")]
+        if let Some(ns_view) = ns_view_ptr(&self.window) {
+            platform::set_tab_title(ns_view, title);
+        }
     }
 
     fn accept_ghost(&mut self) {
