@@ -438,12 +438,6 @@ impl Renderer {
         }
     }
 
-    /// Rebuild the renderer for a new DPI scale, reusing the existing GPU device/queue.
-    pub fn rescale(self, scale_factor: f64) -> Self {
-        let fmt = self.surface_format;
-        Self::new(self.device, self.queue, fmt, scale_factor)
-    }
-
     // ── Pipeline constructors ─────────────────────────────────────────────────
 
     fn make_rect_pipeline(

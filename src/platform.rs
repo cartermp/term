@@ -29,7 +29,7 @@ fn tab_target_class() -> Option<&'static objc2::runtime::AnyClass> {
     static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
     *CLASS.get_or_init(|| {
         // Subclass NSResponder so we can be inserted into the responder chain.
-        let superclass = unsafe { objc2::class!(NSResponder) };
+        let superclass = objc2::class!(NSResponder);
         match ClassBuilder::new("TermTabTarget", superclass) {
             Some(mut builder) => {
                 unsafe {
@@ -41,7 +41,7 @@ fn tab_target_class() -> Option<&'static objc2::runtime::AnyClass> {
                 }
                 Some(builder.register())
             }
-            None => unsafe { AnyClass::get("TermTabTarget") },
+            None => AnyClass::get("TermTabTarget"),
         }
     })
 }

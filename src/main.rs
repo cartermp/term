@@ -266,22 +266,6 @@ impl TerminalWindow {
         }
     }
 
-    fn term_size_for_pane(&self, idx: usize) -> (usize, usize) {
-        let rects = self.pane_rects();
-        let cw = self.renderer.cell_width;
-        let ch = self.renderer.cell_height;
-        if let Some(&(_, _, pw, ph)) = rects.get(idx) {
-            let cols = (pw as usize / cw).max(1);
-            let rows = (ph as usize / ch).max(1);
-            (cols, rows)
-        } else {
-            let sz = self.window.inner_size();
-            let cols = (sz.width as usize / cw).max(1);
-            let rows = (sz.height as usize / ch).max(1);
-            (cols, rows)
-        }
-    }
-
     fn active(&self) -> &Pane {
         &self.panes[self.active_pane]
     }
