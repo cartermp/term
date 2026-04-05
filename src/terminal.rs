@@ -87,6 +87,9 @@ pub struct TerminalState {
     pub osc_52_query: bool,
     /// Whether the app has enabled bracketed paste mode (?2004h).
     pub bracketed_paste: bool,
+    /// Whether cursor key application mode is active (?1h = DECCKM).
+    /// When true, arrow keys send \x1bO[ABCD] instead of \x1b[[ABCD].
+    pub cursor_keys_app_mode: bool,
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
     wrap_next: bool,
@@ -137,6 +140,7 @@ impl TerminalState {
             alt_saved_cursor: (0, 0),
             osc_52_query: false,
             bracketed_paste: false,
+            cursor_keys_app_mode: false,
         }
     }
 
@@ -639,6 +643,7 @@ impl Perform for TerminalState {
             (b'?', 'h') => {
                 for &param in &p {
                     match param {
+                        1 => self.cursor_keys_app_mode = true,
                         47 | 1047 => self.enter_alt_screen(false),
                         1049 => self.enter_alt_screen(true),
                         2004 => self.bracketed_paste = true,
@@ -649,6 +654,7 @@ impl Perform for TerminalState {
             (b'?', 'l') => {
                 for &param in &p {
                     match param {
+                        1 => self.cursor_keys_app_mode = false,
                         47 | 1047 => self.leave_alt_screen(false),
                         1049 => self.leave_alt_screen(true),
                         2004 => self.bracketed_paste = false,

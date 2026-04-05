@@ -727,20 +727,24 @@ impl TerminalWindow {
                 if self.active().ghost_text.is_some() {
                     self.accept_ghost();
                 } else {
-                    self.pty_write(b"\x1b[C");
+                    let app = self.active().terminal.state.cursor_keys_app_mode;
+                    self.pty_write(if app { b"\x1bOC" } else { b"\x1b[C" });
                 }
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.active_mut().ghost_text = None;
-                self.pty_write(b"\x1b[A");
+                let app = self.active().terminal.state.cursor_keys_app_mode;
+                self.pty_write(if app { b"\x1bOA" } else { b"\x1b[A" });
             }
             Key::Named(NamedKey::ArrowDown) => {
                 self.active_mut().ghost_text = None;
-                self.pty_write(b"\x1b[B");
+                let app = self.active().terminal.state.cursor_keys_app_mode;
+                self.pty_write(if app { b"\x1bOB" } else { b"\x1b[B" });
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 self.active_mut().ghost_text = None;
-                self.pty_write(b"\x1b[D");
+                let app = self.active().terminal.state.cursor_keys_app_mode;
+                self.pty_write(if app { b"\x1bOD" } else { b"\x1b[D" });
             }
             Key::Named(NamedKey::Home) => self.pty_write(b"\x1b[H"),
             Key::Named(NamedKey::End) => self.pty_write(b"\x1b[F"),

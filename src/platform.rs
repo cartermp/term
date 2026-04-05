@@ -221,7 +221,8 @@ pub fn select_prev_tab(ns_view: *mut std::ffi::c_void) {
 #[cfg(target_os = "macos")]
 pub fn set_tab_title(ns_view: *mut std::ffi::c_void, title: &str) {
     use objc2::{msg_send, runtime::AnyObject};
-    use std::os::raw::c_char;
+    use std::ffi::CString;
+    let Ok(c_title) = CString::new(title) else { return };
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
         let win:  *mut AnyObject = msg_send![view, window];
@@ -230,7 +231,7 @@ pub fn set_tab_title(ns_view: *mut std::ffi::c_void, title: &str) {
         if tab.is_null() { return; }
         let ns_str: *mut AnyObject = msg_send![
             objc2::class!(NSString),
-            stringWithUTF8String: title.as_ptr() as *const c_char
+            stringWithUTF8String: c_title.as_ptr()
         ];
         if ns_str.is_null() { return; }
         let _: () = msg_send![tab, setTitle: ns_str];
