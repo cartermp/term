@@ -226,6 +226,9 @@ struct TerminalWindow {
     selecting: bool,
     sel_scroll: i32,
 
+    // Accumulated sub-line scroll from smooth touchpad events
+    scroll_frac: f64,
+
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
@@ -984,6 +987,7 @@ impl App {
             sel_anchor: None,
             selecting: false,
             sel_scroll: 0,
+            scroll_frac: 0.0,
             cursor_visible: true,
             last_blink: Instant::now(),
         };
@@ -1232,6 +1236,7 @@ impl ApplicationHandler<AppEvent> for App {
             sel_anchor: None,
             selecting: false,
             sel_scroll: 0,
+            scroll_frac: 0.0,
             cursor_visible: true,
             last_blink: Instant::now(),
         };
@@ -1470,15 +1475,33 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(tw) = self.windows.get_mut(&window_id) {
+                    let state = &tw.panes[tw.active_pane].terminal.state;
+                    let app_scroll = state.is_alt_screen() || state.cursor_keys_app_mode;
                     let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => (y * 4.5) as i32,
+                        MouseScrollDelta::LineDelta(_, y) => {
+                            tw.scroll_frac = 0.0;
+                            (y * 4.5) as i32
+                        }
                         MouseScrollDelta::PixelDelta(pos) => {
                             let ch = tw.renderer.cell_height as f64;
-                            (pos.y / ch * 2.25) as i32
+                            tw.scroll_frac += pos.y / ch * 3.0;
+                            let whole = tw.scroll_frac.trunc() as i32;
+                            tw.scroll_frac -= whole as f64;
+                            whole
                         }
                     };
-                    tw.active_mut().terminal.state.scroll_viewport(lines);
-                    tw.window.request_redraw();
+                    if lines != 0 {
+                        if app_scroll {
+                            // Forward scroll to the PTY as arrow key presses
+                            let seq = if lines > 0 { b"\x1bOA".as_ref() } else { b"\x1bOB".as_ref() };
+                            for _ in 0..lines.unsigned_abs() {
+                                tw.panes[tw.active_pane].write(seq);
+                            }
+                        } else {
+                            tw.active_mut().terminal.state.scroll_viewport(lines);
+                            tw.window.request_redraw();
+                        }
+                    }
                 }
             }
 
