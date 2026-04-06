@@ -13,23 +13,19 @@ if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
   exit 1
 fi
 
-# ── Pre-flight checks ─────────────────────────────────────────────────────────
-
 cd "$(git rev-parse --show-toplevel)"
 
-BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
-if [ "$BRANCH" != "main" ]; then
-  echo "error: must be on main (currently on '${BRANCH:-detached HEAD}')" >&2
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+# Check for uncommitted changes in the working copy
+if [ -n "$(jj diff -r @)" ]; then
+  echo "error: working copy has uncommitted changes" >&2
   exit 1
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "error: working tree has uncommitted changes" >&2
-  exit 1
-fi
-
-git fetch --quiet origin
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+# Fetch and check main is in sync with origin
+jj git fetch --quiet
+if [ "$(git rev-parse main)" != "$(git rev-parse origin/main)" ]; then
   echo "error: main is not in sync with origin/main — push or pull first" >&2
   exit 1
 fi
@@ -54,8 +50,9 @@ VERSION="v${MAJOR}.${MINOR}.${PATCH}"
 
 # ── Tag & push ────────────────────────────────────────────────────────────────
 
+# Tag main explicitly — in jj, HEAD points to @ (the working copy), not main
 echo "→ Tagging $VERSION"
-git tag "$VERSION"
+git tag "$VERSION" "$(git rev-parse main)"
 
 echo "→ Pushing tag to origin"
 git push origin "$VERSION"
