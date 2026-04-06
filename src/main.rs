@@ -1848,12 +1848,23 @@ _term_title_precmd
 autoload -Uz compinit && compinit -C
 zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 "#;
+    // Prompt: ~/path [jj info] ❯  (Catppuccin Mocha blue dir, mauve chevron)
+    // \x1b embeds a literal ESC byte so zsh sees real ANSI sequences.
+    // %{...%} tells zsh these bytes are zero-width (for correct line-length math).
+    // _term_jj calls jj_prompt if the user defined it (e.g. in their .zshrc),
+    // and is a no-op otherwise. PROMPT_SUBST (set by zsh or user's .zshrc) makes
+    // $(...) re-evaluate on every prompt draw.
+    let prompt_setup = concat!(
+        "setopt PROMPT_SUBST\n",
+        "_term_jj() { (( ${+functions[jj_prompt]} )) && jj_prompt; }\n",
+        "PROMPT=\"%{\x1b[38;2;137;180;250m%}%~%{\x1b[0m%} $(_term_jj)%{\x1b[38;2;203;166;247m%}\u{276F}%{\x1b[0m%} \"\n",
+    );
 
     let zshrc = format!(
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
-         {cat_fn}{diff_fn}{json_fn}{zle_hooks}"
+         {cat_fn}{diff_fn}{json_fn}{zle_hooks}{prompt_setup}"
     );
     let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 
