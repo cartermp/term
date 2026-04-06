@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — build term and install it as a native macOS app
+# install.sh — build term from source and install it as a native macOS app
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"

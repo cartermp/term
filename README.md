@@ -4,6 +4,28 @@
 
 A personal Mac terminal emulator built for terminal-based AI work. Written in Rust, GPU-accelerated via Metal (wgpu), with just enough features to get the job done and nothing more.
 
+## Install
+
+### Pre-built (recommended)
+
+```sh
+curl -fsSL https://github.com/cartermp/term/releases/latest/download/install.sh | bash
+```
+
+Downloads the latest `Term.app` from GitHub Releases, installs it to `/Applications`, and symlinks `term`, `tcat`, `tdiff`, and `tjson` into `/usr/local/bin`. Pin a version with `TERM_VERSION=v1.0.0 curl ...`.
+
+### From source
+
+Requires Rust (install via [rustup](https://rustup.rs)):
+
+```sh
+git clone https://github.com/cartermp/term
+cd term
+./install.sh
+```
+
+Builds a release binary, assembles `Term.app` (including generating `AppIcon.icns` from `assets/icon.svg`), installs it to `/Applications`, and symlinks `term` into `/usr/local/bin`.
+
 ## Build
 
 ```sh

@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Install librsvg (for icon rendering)
+        run: brew install librsvg
+
+      - name: Bundle Term.app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="Term.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp target/release/term  "$APP/Contents/MacOS/term"
+          cp target/release/tcat  "$APP/Contents/MacOS/tcat"
+          cp target/release/tdiff "$APP/Contents/MacOS/tdiff"
+          cp target/release/tjson "$APP/Contents/MacOS/tjson"
+
+          # Generate AppIcon.icns from assets/icon.svg
+          ICONSET=$(mktemp -d)/AppIcon.iconset
+          mkdir -p "$ICONSET"
+          for size in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w "$size" -h "$size" assets/icon.svg \
+              -o "$ICONSET/icon_${size}x${size}.png"
+          done
+          cp "$ICONSET/icon_32x32.png"    "$ICONSET/icon_16x16@2x.png"
+          cp "$ICONSET/icon_64x64.png"    "$ICONSET/icon_32x32@2x.png"
+          cp "$ICONSET/icon_256x256.png"  "$ICONSET/icon_128x128@2x.png"
+          cp "$ICONSET/icon_512x512.png"  "$ICONSET/icon_256x256@2x.png"
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>                  <string>Term</string>
+            <key>CFBundleDisplayName</key>           <string>Term</string>
+            <key>CFBundleIdentifier</key>            <string>com.local.term</string>
+            <key>CFBundleShortVersionString</key>    <string>${VERSION}</string>
+            <key>CFBundleVersion</key>               <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>            <string>term</string>
+            <key>CFBundlePackageType</key>           <string>APPL</string>
+            <key>CFBundleIconFile</key>              <string>AppIcon</string>
+            <key>LSApplicationCategoryType</key>     <string>public.app-category.developer-tools</string>
+            <key>LSMinimumSystemVersion</key>        <string>13.0</string>
+            <key>NSHighResolutionCapable</key>       <true/>
+            <key>LSUIElement</key>                   <false/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Ad-hoc sign — prevents "damaged app" Gatekeeper error
+          codesign --sign - --deep --force "$APP"
+
+          zip -r --symlinks Term.app.zip "$APP"
+
+      - name: Zip dSYM
+        run: |
+          if [ -d "target/release/term.dSYM" ]; then
+            zip -r term.dSYM.zip target/release/term.dSYM
+          fi
+
+      - name: Prepare release assets
+        run: cp scripts/install-release.sh install.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            Term.app.zip
+            term.dSYM.zip
+            install.sh
