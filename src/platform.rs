@@ -215,6 +215,27 @@ pub fn select_prev_tab(ns_view: *mut std::ffi::c_void) {
     }
 }
 
+/// Ask macOS to select tab at 1-based index `n` in the window's tab group.
+/// If `n` is out of range, does nothing.
+#[cfg(target_os = "macos")]
+pub fn select_tab_at_index(ns_view: *mut std::ffi::c_void, n: usize) {
+    use objc2::{msg_send, runtime::AnyObject};
+    unsafe {
+        let view: *mut AnyObject = ns_view as *mut AnyObject;
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() { return; }
+        let tabs: *mut AnyObject = msg_send![win, tabbedWindows];
+        if tabs.is_null() { return; }
+        let count: usize = msg_send![tabs, count];
+        let idx = n.saturating_sub(1);
+        if idx >= count { return; }
+        let target: *mut AnyObject = msg_send![tabs, objectAtIndex: idx];
+        if !target.is_null() {
+            let _: () = msg_send![target, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
+
 /// Update the native macOS tab label for this window.
 /// `NSWindowTab.title` is separate from `NSWindow.title` and doesn't
 /// automatically follow it after the window is added to a tab group.

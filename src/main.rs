@@ -655,8 +655,7 @@ impl TerminalWindow {
                         if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
                             && d >= 1
                         {
-                            // Cmd+1..9: no-op (native tab bar handles it)
-                            let _ = d;
+                            return KeyAction::SelectTab(d as usize);
                         }
                         return KeyAction::None;
                     }
@@ -790,6 +789,7 @@ enum KeyAction {
     ClosePaneOrWindow,
     PrevTab,
     NextTab,
+    SelectTab(usize),
     SplitVertical,
     SplitHorizontal,
 }
@@ -1326,6 +1326,14 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(tw) = self.windows.get(&window_id) {
                             if let Some(ns_view) = ns_view_ptr(&tw.window) {
                                 platform::select_next_tab(ns_view);
+                            }
+                        }
+                    }
+                    KeyAction::SelectTab(n) => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(tw) = self.windows.get(&window_id) {
+                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
+                                platform::select_tab_at_index(ns_view, n);
                             }
                         }
                     }
