@@ -174,6 +174,7 @@ pub fn clipboard_text() -> Option<String> {
 /// Add `new_win` as a tab in the same tabbed-window group as `existing_win`.
 /// Both pointers must be NSView* obtained from winit's raw window handle.
 /// Safe to call immediately after window creation.
+/// The new tab is always appended at the end of the tab bar.
 #[cfg(target_os = "macos")]
 pub fn add_window_as_tab(existing_ns_view: *mut std::ffi::c_void, new_ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
@@ -182,10 +183,24 @@ pub fn add_window_as_tab(existing_ns_view: *mut std::ffi::c_void, new_ns_view: *
         let nv = new_ns_view  as *mut AnyObject;
         let ew: *mut AnyObject = msg_send![ev, window];
         let nw: *mut AnyObject = msg_send![nv, window];
-        if !ew.is_null() && !nw.is_null() {
-            // NSWindowOrderingMode::NSWindowAbove = 1
-            let _: () = msg_send![ew, addTabbedWindow: nw ordered: 1i64];
-        }
+        if ew.is_null() || nw.is_null() { return; }
+
+        // Find the last window in the tab group so we append after it,
+        // rather than inserting after whichever window we happened to pick.
+        let tabs: *mut AnyObject = msg_send![ew, tabbedWindows];
+        let last_win: *mut AnyObject = if !tabs.is_null() {
+            let count: usize = msg_send![tabs, count];
+            if count > 0 {
+                msg_send![tabs, objectAtIndex: count - 1]
+            } else {
+                ew
+            }
+        } else {
+            ew
+        };
+
+        // NSWindowOrderingMode::NSWindowAbove = 1 → insert after `last_win`
+        let _: () = msg_send![last_win, addTabbedWindow: nw ordered: 1i64];
     }
 }
 
@@ -233,6 +248,30 @@ pub fn select_tab_at_index(ns_view: *mut std::ffi::c_void, n: usize) {
         if !target.is_null() {
             let _: () = msg_send![target, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         }
+    }
+}
+
+/// Return the 1-based index of this window in its tab group, plus the total
+/// number of tabs.  Returns `(1, 1)` when the window is not part of a group.
+#[cfg(target_os = "macos")]
+pub fn tab_index_and_count(ns_view: *mut std::ffi::c_void) -> (usize, usize) {
+    use objc2::{msg_send, runtime::AnyObject};
+    unsafe {
+        let view: *mut AnyObject = ns_view as *mut AnyObject;
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() { return (1, 1); }
+        let tabs: *mut AnyObject = msg_send![win, tabbedWindows];
+        if tabs.is_null() { return (1, 1); }
+        let count: usize = msg_send![tabs, count];
+        if count == 0 { return (1, 1); }
+        for i in 0..count {
+            let w: *mut AnyObject = msg_send![tabs, objectAtIndex: i];
+            // Compare by pointer identity (both are NSWindow*).
+            if std::ptr::eq(w, win) {
+                return (i + 1, count);
+            }
+        }
+        (1, count)
     }
 }
 

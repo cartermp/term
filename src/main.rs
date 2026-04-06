@@ -298,11 +298,19 @@ impl TerminalWindow {
 
     fn sync_title(&self) {
         let title = self.active().title();
-        self.window.set_title(title);
         #[cfg(target_os = "macos")]
         if let Some(ns_view) = ns_view_ptr(&self.window) {
-            platform::set_tab_title(ns_view, title);
+            let (idx, count) = platform::tab_index_and_count(ns_view);
+            let labeled = if count > 1 {
+                format!("{idx} · {title}")
+            } else {
+                title.to_string()
+            };
+            self.window.set_title(&labeled);
+            platform::set_tab_title(ns_view, &labeled);
+            return;
         }
+        self.window.set_title(title);
     }
 
     fn accept_ghost(&mut self) {
@@ -999,6 +1007,9 @@ impl App {
         if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
             platform::setup_add_tab_button(ns_view);
         }
+
+        // Re-number all tab labels now that a new tab has been added.
+        self.sync_all_titles();
     }
 
     fn add_split(&mut self, window_id: WindowId, dir: SplitDir) {
@@ -1101,6 +1112,16 @@ impl App {
         }
         if self.windows.is_empty() {
             event_loop.exit();
+        } else {
+            self.sync_all_titles();
+        }
+    }
+
+    /// Re-sync every window's tab label.  Call this whenever the tab count
+    /// changes so that all index prefixes stay accurate.
+    fn sync_all_titles(&self) {
+        for tw in self.windows.values() {
+            tw.sync_title();
         }
     }
 }
@@ -1248,6 +1269,9 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
             platform::setup_add_tab_button(ns_view);
         }
+
+        // Re-number all tab labels now that a new tab has been added.
+        self.sync_all_titles();
     }
 
     fn window_event(
@@ -1259,6 +1283,12 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.close_window(window_id, event_loop);
+            }
+
+            // Re-sync all tab numbers when a window gains focus — this fires
+            // after a drag-reorder because macOS activates the moved tab.
+            WindowEvent::Focused(true) => {
+                self.sync_all_titles();
             }
 
             WindowEvent::RedrawRequested => {
