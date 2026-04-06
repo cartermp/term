@@ -23,7 +23,7 @@ path = "src/bin/tjson.rs"
 
 [dependencies]
 winit = "0.30"
-wgpu = "0.20"
+wgpu = { version = "0.20", default-features = false, features = ["metal", "wgsl"] }
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 
@@ -37,5 +37,7 @@ serde_json = "1"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+strip = true
+panic = "abort"
