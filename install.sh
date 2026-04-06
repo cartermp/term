@@ -93,6 +93,7 @@ PLIST
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_BUNDLE" 2>/dev/null || true
 
 echo "→ Symlinking 'term' into /usr/local/bin (for CLI use)"
+sudo mkdir -p /usr/local/bin
 sudo ln -sf "$APP_BUNDLE/Contents/MacOS/term" /usr/local/bin/term
 
 echo ""

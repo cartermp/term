@@ -856,6 +856,7 @@ impl App {
         };
 
         let mut cmd = CommandBuilder::new("zsh");
+        cmd.arg("-l");
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         setup_shell_env(&mut cmd);
