@@ -32,7 +32,7 @@ fi
 
 # ── Compute next version ──────────────────────────────────────────────────────
 
-LATEST=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+LATEST=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1) || true
 
 if [ -z "$LATEST" ]; then
   MAJOR=0; MINOR=0; PATCH=0
