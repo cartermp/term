@@ -372,4 +372,80 @@ mod tests {
         // The raw leading spaces must NOT appear in prettified output.
         assert!(!out.starts_with("   {"), "leading spaces must be stripped from prettified output");
     }
+
+    // ── Additional process_line / process_output tests ────────────────────────
+
+    #[test]
+    fn test_empty_line_passes_through() {
+        let out = process_output("");
+        // An empty line is not JSON — it must be echoed (as a bare newline).
+        assert_eq!(out, "\n", "empty line must be passed through as a newline");
+    }
+
+    #[test]
+    fn test_whitespace_only_line_passes_through() {
+        let out = process_output("   ");
+        // Whitespace-only lines cannot start with '{' or '[' after trimming.
+        assert!(out.contains("   "), "whitespace-only line must pass through unchanged");
+    }
+
+    #[test]
+    fn test_unicode_json_object_prettified() {
+        let out = process_output(r#"{"emoji":"🦀","name":"裁"}"#);
+        assert!(out.contains("\x1b["), "unicode JSON must be prettified");
+        assert!(out.contains("emoji"), "key must appear in output");
+    }
+
+    #[test]
+    fn test_deeply_nested_json_prettified() {
+        let out = process_output(r#"{"a":{"b":{"c":{"d":42}}}}"#);
+        assert!(out.contains("\x1b["), "deeply nested JSON must be prettified");
+        assert!(out.contains("42"), "leaf value must appear in output");
+    }
+
+    #[test]
+    fn test_json_array_of_objects_prettified() {
+        let out = process_output(r#"[{"id":1},{"id":2}]"#);
+        assert!(out.contains("\x1b["), "array of objects must be prettified");
+        // syntect may split tokens at quote boundaries; check the key text only.
+        assert!(out.contains("id"), "key name must appear in output");
+    }
+
+    #[test]
+    fn test_line_starting_with_brace_but_invalid_json_passes_through() {
+        let line = "{not valid json at all";
+        let out = process_output(line);
+        assert!(out.contains(line), "invalid JSON starting with '{{' must pass through");
+    }
+
+    #[test]
+    fn test_line_starting_with_bracket_but_invalid_json_passes_through() {
+        let line = "[1, 2, broken";
+        let out = process_output(line);
+        assert!(out.contains(line), "invalid JSON starting with '[' must pass through");
+    }
+
+    #[test]
+    fn test_json_with_null_value_prettified() {
+        let out = process_output(r#"{"key":null}"#);
+        assert!(out.contains("null"), "null value must appear in prettified output");
+    }
+
+    #[test]
+    fn test_json_with_boolean_values_prettified() {
+        let out = process_output(r#"{"ok":true,"fail":false}"#);
+        assert!(out.contains("true"));
+        assert!(out.contains("false"));
+    }
+
+    #[test]
+    fn test_multiple_keys_each_on_own_line_in_output() {
+        let out = process_output(r#"{"a":1,"b":2,"c":3}"#);
+        // serde_json::to_string_pretty puts each key on its own line.
+        let newline_count = out.chars().filter(|&c| c == '\n').count();
+        assert!(
+            newline_count >= 3,
+            "prettified 3-key object must have ≥3 newlines, got {newline_count}"
+        );
+    }
 }

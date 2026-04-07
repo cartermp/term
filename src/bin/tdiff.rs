@@ -398,4 +398,109 @@ mod tests {
     fn test_parse_file_path_whitespace_trimmed() {
         assert_eq!(parse_file_path("  a/foo.rs  "), "foo.rs");
     }
+
+    // ── syntax_hint ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_syntax_hint_rust_extension() {
+        assert_eq!(syntax_hint("src/main.rs"), "rs");
+    }
+
+    #[test]
+    fn test_syntax_hint_python_extension() {
+        assert_eq!(syntax_hint("script.py"), "py");
+    }
+
+    #[test]
+    fn test_syntax_hint_no_extension_returns_empty() {
+        assert_eq!(syntax_hint("Makefile"), "");
+    }
+
+    #[test]
+    fn test_syntax_hint_dotfile_no_ext_returns_empty() {
+        // ".gitignore" has no extension (the whole name is the stem).
+        assert_eq!(syntax_hint(".gitignore"), "");
+    }
+
+    #[test]
+    fn test_syntax_hint_empty_path_returns_empty() {
+        assert_eq!(syntax_hint(""), "");
+    }
+
+    #[test]
+    fn test_syntax_hint_uses_last_component() {
+        assert_eq!(syntax_hint("a/b/c/foo.ts"), "ts");
+    }
+
+    // ── write_code_line ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_code_line_contains_prefix_char() {
+        // write_code_line must emit the prefix sigil somewhere in its output.
+        let mut out = Vec::<u8>::new();
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let spans = hl_line("let x = 1;", &mut make_highlighter("rs", &ps, &ts), &ps);
+        write_code_line(&mut out, "+", (0, 255, 0), &spans, (30, 40, 30)).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains('+'), "output must contain the prefix sigil '+'");
+    }
+
+    #[test]
+    fn test_write_code_line_ends_with_newline() {
+        let mut out = Vec::<u8>::new();
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let spans = hl_line("x", &mut make_highlighter("rs", &ps, &ts), &ps);
+        write_code_line(&mut out, "-", (255, 0, 0), &spans, (40, 20, 20)).unwrap();
+        assert!(
+            out.ends_with(b"\n"),
+            "write_code_line must end with newline"
+        );
+    }
+
+    #[test]
+    fn test_write_code_line_empty_spans_still_writes_prefix_and_newline() {
+        let mut out = Vec::<u8>::new();
+        write_code_line(&mut out, " ", (200, 200, 200), &[], (0, 0, 0)).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        // Even with no spans, prefix and newline must be present.
+        assert!(out.ends_with(b"\n"));
+        // Must contain some ANSI sequences (bg, bold, reset).
+        assert!(s.contains('\x1b'), "must emit at least one ANSI escape");
+    }
+
+    // ── strip_ansi edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_ansi_lone_esc_not_followed_by_bracket_consumed() {
+        // A bare ESC that is NOT followed by '[' or ']' — the current
+        // implementation falls through to the CSI branch which consumes until
+        // the next alphabetic byte.  Either way the result must not contain
+        // the ESC byte.
+        let result = strip_ansi("\x1b7hello");
+        assert!(
+            !result.contains('\x1b'),
+            "lone ESC must not appear in output; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_multiple_osc_sequences_all_stripped() {
+        let result = strip_ansi("\x1b]0;first\x07\x1b]2;second\x07done");
+        assert_eq!(result, "done");
+    }
+
+    #[test]
+    fn test_strip_ansi_adjacent_csi_sequences() {
+        // Two back-to-back CSI sequences — both must be stripped.
+        let result = strip_ansi("\x1b[1m\x1b[0mtext");
+        assert_eq!(result, "text");
+    }
+
+    #[test]
+    fn test_strip_ansi_preserves_unicode_text() {
+        let result = strip_ansi("héllo\x1b[31m wörld\x1b[0m");
+        assert_eq!(result, "héllo wörld");
+    }
 }

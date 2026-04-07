@@ -372,12 +372,22 @@ impl TerminalState {
                     self.grid[row][c] = blank;
                 }
             }
-            2 | 3 => {
+            2 => {
                 for r in 0..self.rows {
                     for c in 0..self.cols {
                         self.grid[r][c] = blank;
                     }
                 }
+            }
+            3 => {
+                // ED 3: erase display and clear scrollback (xterm extension).
+                for r in 0..self.rows {
+                    for c in 0..self.cols {
+                        self.grid[r][c] = blank;
+                    }
+                }
+                self.scrollback.clear();
+                self.viewport_offset = 0;
             }
             _ => {}
         }
@@ -2084,6 +2094,329 @@ mod tests {
         assert_eq!(ch(&t, 5, 0), 'E', "scroll_bottom now has what was one above");
         assert_eq!(ch(&t, 6, 0), 'G', "below region unchanged");
         assert_eq!(ch(&t, 7, 0), 'H');
+    }
+
+    // ── SGR italic / underline ────────────────────────────────────────────────
+
+    #[test]
+    fn sgr_italic_on_off() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[3m");
+        assert!(t.state.attrs.italic, "SGR 3 must set italic");
+        t.process(b"\x1b[23m");
+        assert!(!t.state.attrs.italic, "SGR 23 must clear italic");
+    }
+
+    #[test]
+    fn sgr_underline_on_off() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4m");
+        assert!(t.state.attrs.underline, "SGR 4 must set underline");
+        t.process(b"\x1b[24m");
+        assert!(!t.state.attrs.underline, "SGR 24 must clear underline");
+    }
+
+    #[test]
+    fn sgr_fg_default_reset_restores_default_fg() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[31m"); // red fg
+        assert_ne!(t.state.attrs.fg, DEFAULT_FG);
+        t.process(b"\x1b[39m"); // reset fg
+        assert_eq!(t.state.attrs.fg, DEFAULT_FG, "SGR 39 must restore default fg");
+    }
+
+    #[test]
+    fn sgr_bg_default_reset_restores_default_bg() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[41m"); // red bg
+        assert_ne!(t.state.attrs.bg, DEFAULT_BG);
+        t.process(b"\x1b[49m"); // reset bg
+        assert_eq!(t.state.attrs.bg, DEFAULT_BG, "SGR 49 must restore default bg");
+    }
+
+    #[test]
+    fn sgr_bright_bg_100_to_107_uses_high_ansi() {
+        let mut t = t(10, 5);
+        for n in 0u8..8 {
+            t.process(format!("\x1b[{}m", 100 + n).as_bytes());
+            assert_eq!(
+                t.state.attrs.bg, ANSI_COLORS[(n + 8) as usize],
+                "SGR {} must use ANSI_COLORS[{}]", 100 + n, n + 8
+            );
+        }
+    }
+
+    // ── CSI E / F (cursor next/previous line) ─────────────────────────────────
+
+    #[test]
+    fn cnl_moves_cursor_down_and_to_col_zero() {
+        let mut t = t(10, 10);
+        t.process(b"\x1b[5;5H"); // row 5, col 5
+        t.process(b"\x1b[2E");   // CNL 2 — down 2, col 0
+        assert_eq!(t.state.cursor_row, 6, "CNL 2 from row 4 must land at row 6");
+        assert_eq!(t.state.cursor_col, 0, "CNL must reset col to 0");
+    }
+
+    #[test]
+    fn cpl_moves_cursor_up_and_to_col_zero() {
+        let mut t = t(10, 10);
+        t.process(b"\x1b[5;5H"); // row 5, col 5
+        t.process(b"\x1b[2F");   // CPL 2 — up 2, col 0
+        assert_eq!(t.state.cursor_row, 2, "CPL 2 from row 4 must land at row 2");
+        assert_eq!(t.state.cursor_col, 0, "CPL must reset col to 0");
+    }
+
+    #[test]
+    fn cpl_clamped_at_top() {
+        let mut t = t(10, 10);
+        t.process(b"\x1b[2;5H"); // row 2, col 5
+        t.process(b"\x1b[100F"); // CPL 100 — should clamp at row 0
+        assert_eq!(t.state.cursor_row, 0, "CPL past top must clamp at row 0");
+        assert_eq!(t.state.cursor_col, 0);
+    }
+
+    // ── CSI d (VPA — vertical position absolute) ──────────────────────────────
+
+    #[test]
+    fn vpa_sets_row_1indexed() {
+        let mut t = t(10, 10);
+        t.process(b"\x1b[5d"); // VPA 5 → row 4 (0-indexed)
+        assert_eq!(t.state.cursor_row, 4, "VPA 5 must set cursor_row to 4");
+    }
+
+    #[test]
+    fn vpa_default_goes_to_row_zero() {
+        let mut t = t(10, 10);
+        t.process(b"\x1b[5;1H"); // move away first
+        t.process(b"\x1b[1d");   // VPA 1 → row 0
+        assert_eq!(t.state.cursor_row, 0);
+    }
+
+    #[test]
+    fn vpa_clamped_to_last_row() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[100d"); // beyond last row
+        assert_eq!(t.state.cursor_row, 4, "VPA past last row must clamp");
+    }
+
+    // ── CSI S / T (scroll up / down) ─────────────────────────────────────────
+
+    #[test]
+    fn su_scroll_up_discards_top_lines() {
+        let mut t = t(5, 4);
+        t.process(b"A\r\nB\r\nC\r\nD");
+        t.process(b"\x1b[1S"); // SU 1
+        // After scrolling up 1, old row 1 ("B") is now row 0.
+        assert_eq!(ch(&t, 0, 0), 'B', "after SU 1, row 0 must be 'B'");
+        assert_eq!(ch(&t, 1, 0), 'C');
+        assert_eq!(ch(&t, 2, 0), 'D');
+        assert_eq!(ch(&t, 3, 0), ' ', "new bottom row must be blank");
+    }
+
+    #[test]
+    fn sd_scroll_down_inserts_blank_at_top() {
+        let mut t = t(5, 4);
+        t.process(b"A\r\nB\r\nC\r\nD");
+        t.process(b"\x1b[1T"); // SD 1
+        // After scrolling down 1, blank row inserted at top.
+        assert_eq!(ch(&t, 0, 0), ' ', "after SD 1, row 0 must be blank");
+        assert_eq!(ch(&t, 1, 0), 'A');
+        assert_eq!(ch(&t, 2, 0), 'B');
+        assert_eq!(ch(&t, 3, 0), 'C');
+    }
+
+    // ── CSI M (DL — delete line) ──────────────────────────────────────────────
+
+    #[test]
+    fn dl_deletes_line_at_cursor() {
+        let mut t = t(5, 4);
+        t.process(b"A\r\nB\r\nC\r\nD");
+        t.process(b"\x1b[2;1H"); // cursor to row 1 (0-indexed)
+        t.process(b"\x1b[1M");   // DL 1
+        // Row "B" deleted; "C","D" shift up.
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 1, 0), 'C', "DL must shift remaining rows up");
+        assert_eq!(ch(&t, 2, 0), 'D');
+        assert_eq!(ch(&t, 3, 0), ' ', "new bottom row must be blank");
+    }
+
+    // ── ESC D / E / M (IND / NEL / RI) ───────────────────────────────────────
+
+    #[test]
+    fn esc_d_index_advances_row() {
+        let mut t = t(5, 5);
+        t.process(b"\x1b[2;3H"); // row 1, col 2
+        t.process(b"\x1bD");     // IND — newline without CR
+        assert_eq!(t.state.cursor_row, 2, "ESC D must advance row");
+        assert_eq!(t.state.cursor_col, 2, "ESC D must not change col");
+    }
+
+    #[test]
+    fn esc_e_next_line_advances_row_and_resets_col() {
+        let mut t = t(5, 5);
+        t.process(b"\x1b[2;3H"); // row 1, col 2
+        t.process(b"\x1bE");     // NEL
+        assert_eq!(t.state.cursor_row, 2, "ESC E must advance row");
+        assert_eq!(t.state.cursor_col, 0, "ESC E must reset col to 0");
+    }
+
+    #[test]
+    fn esc_m_reverse_index_moves_up() {
+        let mut t = t(5, 5);
+        t.process(b"\x1b[3;1H"); // row 2
+        t.process(b"\x1bM");     // RI — reverse index
+        assert_eq!(t.state.cursor_row, 1, "ESC M must move cursor up");
+    }
+
+    #[test]
+    fn esc_m_at_scroll_top_scrolls_down() {
+        // At the scroll top, RI inserts a blank line (scrolls content down).
+        let mut t = t(5, 4);
+        t.process(b"A\r\nB\r\nC\r\nD");
+        t.process(b"\x1b[1;1H"); // cursor to row 0 (scroll_top)
+        t.process(b"\x1bM");
+        assert_eq!(ch(&t, 0, 0), ' ', "RI at top must insert blank row");
+        assert_eq!(ch(&t, 1, 0), 'A', "previous row 0 shifts down");
+    }
+
+    // ── ESC c (hard reset) ────────────────────────────────────────────────────
+
+    #[test]
+    fn esc_c_resets_to_fresh_state() {
+        let mut t = t(10, 5);
+        // Set some state.
+        t.process(b"\x1b[31m");       // red fg
+        t.process(b"\x1b[5;5H");      // move cursor
+        t.process(b"HELLO");
+        t.process(b"\x1bc");          // RIS — hard reset
+        assert_eq!(t.state.cursor_row, 0, "RIS must reset cursor to origin");
+        assert_eq!(t.state.cursor_col, 0);
+        assert_eq!(t.state.attrs.fg, DEFAULT_FG, "RIS must reset SGR attributes");
+        assert_eq!(ch(&t, 0, 0), ' ', "RIS must clear screen");
+    }
+
+    // ── CSI c (device attributes) ─────────────────────────────────────────────
+
+    #[test]
+    fn csi_c_queues_device_attributes_response() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[c");
+        assert!(
+            !t.state.pending_responses.is_empty(),
+            "CSI c must queue a device attributes response"
+        );
+        let resp = &t.state.pending_responses[0];
+        assert_eq!(resp, b"\x1b[?1;2c", "device attributes response must be ESC[?1;2c");
+    }
+
+    // ── Cursor keys application mode ──────────────────────────────────────────
+
+    #[test]
+    fn cursor_keys_app_mode_enabled_by_1h() {
+        let mut t = t(10, 5);
+        assert!(!t.state.cursor_keys_app_mode);
+        t.process(b"\x1b[?1h");
+        assert!(t.state.cursor_keys_app_mode, "?1h must enable app mode");
+    }
+
+    #[test]
+    fn cursor_keys_app_mode_disabled_by_1l() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[?1h");
+        t.process(b"\x1b[?1l");
+        assert!(!t.state.cursor_keys_app_mode, "?1l must disable app mode");
+    }
+
+    // ── OSC 7 hostname stripping ──────────────────────────────────────────────
+
+    #[test]
+    fn osc_7_strips_hostname_from_file_url() {
+        let mut t = t(10, 5);
+        // OSC 7 ; file://hostname/home/user ST
+        t.process(b"\x1b]7;file://mymac/home/user\x07");
+        assert_eq!(
+            t.state.current_dir, "/home/user",
+            "OSC 7 must strip the hostname and keep the path"
+        );
+    }
+
+    #[test]
+    fn osc_7_empty_host_preserves_path() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b]7;file:///tmp/work\x07");
+        assert_eq!(t.state.current_dir, "/tmp/work");
+    }
+
+    #[test]
+    fn osc_7_non_file_url_used_verbatim() {
+        // No file:// prefix → content used as-is.
+        let mut t = t(10, 5);
+        t.process(b"\x1b]7;/just/a/path\x07");
+        assert_eq!(t.state.current_dir, "/just/a/path");
+    }
+
+    // ── SGR: simultaneous bold + italic + underline ───────────────────────────
+
+    #[test]
+    fn sgr_combined_bold_italic_underline() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[1;3;4m");
+        assert!(t.state.attrs.bold);
+        assert!(t.state.attrs.italic);
+        assert!(t.state.attrs.underline);
+        // Reset clears all three.
+        t.process(b"\x1b[0m");
+        assert!(!t.state.attrs.bold);
+        assert!(!t.state.attrs.italic);
+        assert!(!t.state.attrs.underline);
+    }
+
+    // ── CUF/CUB with explicit count ───────────────────────────────────────────
+
+    #[test]
+    fn cuf_with_count_moves_right_n_cols() {
+        let mut t = t(20, 5);
+        t.process(b"\x1b[1;1H"); // col 0
+        t.process(b"\x1b[5C");   // CUF 5
+        assert_eq!(t.state.cursor_col, 5);
+    }
+
+    #[test]
+    fn cub_with_count_moves_left_n_cols() {
+        let mut t = t(20, 5);
+        t.process(b"\x1b[1;10H"); // col 9
+        t.process(b"\x1b[3D");    // CUB 3
+        assert_eq!(t.state.cursor_col, 6);
+    }
+
+    #[test]
+    fn cuf_clamped_at_last_col() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[1;1H");
+        t.process(b"\x1b[100C");
+        assert_eq!(t.state.cursor_col, 9, "CUF past last col must clamp");
+    }
+
+    #[test]
+    fn cub_clamped_at_col_zero() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[1;5H"); // col 4
+        t.process(b"\x1b[100D"); // CUB 100
+        assert_eq!(t.state.cursor_col, 0, "CUB past col 0 must clamp at 0");
+    }
+
+    // ── ED mode 3 (clear scrollback) ──────────────────────────────────────────
+
+    #[test]
+    fn ed3_clears_scrollback_buffer() {
+        let mut t = t(5, 3);
+        // Fill scrollback by printing more lines than the terminal height.
+        for i in 0..10 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(!t.state.scrollback.is_empty(), "scrollback must be non-empty before ED 3");
+        t.process(b"\x1b[3J");
+        assert!(t.state.scrollback.is_empty(), "ED 3 (CSI 3 J) must clear scrollback");
     }
 }
 

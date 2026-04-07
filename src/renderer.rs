@@ -4,6 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+static FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+
 // ── tcat gutter detection ─────────────────────────────────────────────────────
 
 /// Find the first content column of a tcat gutter line, or 0 if this row is
@@ -185,6 +187,29 @@ struct AtlasEntry {
     h: u32,
 }
 
+// ── Ligature shaping ──────────────────────────────────────────────────────────
+
+/// A single glyph produced by text shaping, mapped back to the input cells.
+struct ShapedGlyph {
+    /// OpenType glyph index (u16 fits all fonts; 0 means .notdef/missing).
+    glyph_id: u16,
+    /// Index into the input `chars` slice where this glyph starts.
+    /// For a ligature, the cells between this and the next glyph's `char_idx`
+    /// are covered — they receive no `GlyphOp::Glyph` and stay `Skip`.
+    char_idx: usize,
+}
+
+/// Per-cell render decision computed before the draw loop.
+#[derive(Copy, Clone)]
+enum GlyphOp {
+    /// Nothing to draw (space, null, or a cell consumed by a multi-cell ligature).
+    Skip,
+    /// Block or Braille character — rendered as fill rects, not from the atlas.
+    Block,
+    /// Draw glyph `id` from the atlas at this cell's pixel origin.
+    Glyph(u16),
+}
+
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
 fn c2f(c: Color) -> [f32; 4] {
@@ -205,6 +230,113 @@ pub fn push_rect(v: &mut Vec<RectInst>, x: f32, y: f32, w: f32, h: f32, color: [
     if w > 0. && h > 0. {
         v.push(RectInst { pos: [x, y], sz: [w, h], color });
     }
+}
+
+// ── Shaping helpers (free functions so tests can call them without a GPU) ─────
+
+fn shape_run_impl(face: &rustybuzz::Face<'_>, chars: &[char]) -> Vec<ShapedGlyph> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let text: String = chars.iter().collect();
+
+    // Build a byte-offset → char-index mapping for the UTF-8 string.
+    let mut byte_to_char = vec![0usize; text.len() + 1];
+    for (char_idx, (byte_off, c)) in text.char_indices().enumerate() {
+        for b in byte_off..byte_off + c.len_utf8() {
+            byte_to_char[b] = char_idx;
+        }
+    }
+    byte_to_char[text.len()] = chars.len();
+
+    let mut buf = rustybuzz::UnicodeBuffer::new();
+    buf.push_str(&text);
+    let output = rustybuzz::shape(face, &[], buf);
+    let infos = output.glyph_infos();
+
+    let mut result = Vec::with_capacity(infos.len());
+    for i in 0..infos.len() {
+        let cluster_byte = infos[i].cluster as usize;
+        let char_idx = byte_to_char[cluster_byte.min(text.len())];
+        result.push(ShapedGlyph {
+            glyph_id: infos[i].glyph_id as u16,
+            char_idx,
+        });
+    }
+    result
+}
+
+fn compute_row_glyph_ops_impl(
+    face: &rustybuzz::Face<'_>,
+    state: &TerminalState,
+    row: usize,
+    vis_cols: usize,
+) -> Vec<GlyphOp> {
+    let mut ops = vec![GlyphOp::Skip; vis_cols];
+
+    let mut col = 0;
+    while col < vis_cols {
+        let cell = state.visual_cell(row, col);
+        let c = cell.c;
+
+        if c == ' ' || c == '\0' {
+            col += 1;
+            continue;
+        }
+
+        if is_block_char(c) {
+            ops[col] = GlyphOp::Block;
+            col += 1;
+            continue;
+        }
+
+        // Effective fg (after inverse) — run boundary changes on fg change.
+        let fg_color = if cell.attrs.inverse { cell.attrs.bg } else { cell.attrs.fg };
+
+        // Extend the run as far as chars share the same fg and are printable.
+        let run_start = col;
+        let mut run_end = col + 1;
+        while run_end < vis_cols {
+            let nc = state.visual_cell(row, run_end);
+            let nc_c = nc.c;
+            if nc_c == ' ' || nc_c == '\0' || is_block_char(nc_c) {
+                break;
+            }
+            let nc_fg = if nc.attrs.inverse { nc.attrs.bg } else { nc.attrs.fg };
+            if nc_fg != fg_color {
+                break;
+            }
+            run_end += 1;
+        }
+
+        // Collect chars and shape.
+        let run_chars: Vec<char> = (run_start..run_end)
+            .map(|c| state.visual_cell(row, c).c)
+            .collect();
+        let shaped = shape_run_impl(face, &run_chars);
+
+        // Map shaped glyphs back to column positions.
+        // Cells covered by a ligature (not the first) stay as GlyphOp::Skip.
+        for sg in &shaped {
+            let abs_col = run_start + sg.char_idx;
+            if abs_col < vis_cols {
+                ops[abs_col] = if sg.glyph_id == 0 {
+                    GlyphOp::Skip
+                } else {
+                    GlyphOp::Glyph(sg.glyph_id)
+                };
+            }
+        }
+
+        col = run_end;
+    }
+
+    ops
+}
+
+fn is_block_char(c: char) -> bool {
+    matches!(c, '\u{2580}'..='\u{259F}' | '\u{2800}'..='\u{28FF}')
 }
 
 // ── PaneView ─────────────────────────────────────────────────────────────────
@@ -239,7 +371,9 @@ pub struct Renderer {
     _atlas_sampler: wgpu::Sampler,
     atlas_bg: wgpu::BindGroup,
     _atlas_bgl: wgpu::BindGroupLayout,
-    atlas_cache: HashMap<char, Option<AtlasEntry>>,
+    /// Atlas cache keyed by OpenType glyph ID (not char) so shaped ligature
+    /// glyphs share entries with their constituent characters when applicable.
+    atlas_cache: HashMap<u16, Option<AtlasEntry>>,
     atlas_x: u32,
     atlas_y: u32,
     atlas_row_h: u32,
@@ -251,6 +385,8 @@ pub struct Renderer {
     glyph_buf_cap: usize,
 
     font: fontdue::Font,
+    /// HarfBuzz-compatible shaper for OpenType ligature / calt substitution.
+    rb_face: rustybuzz::Face<'static>,
     pub cell_width: usize,
     pub cell_height: usize,
     pub baseline: i32,
@@ -267,9 +403,8 @@ impl Renderer {
     ) -> Self {
         // ── Font ──────────────────────────────────────────────────────────────
         let font_size = (FONT_SIZE_PT * scale_factor as f32).round();
-        let font_data = include_bytes!("../assets/JetBrainsMono-Regular.ttf").to_vec();
         let font = fontdue::Font::from_bytes(
-            font_data.as_slice(),
+            FONT_BYTES,
             fontdue::FontSettings {
                 scale: font_size,
                 collection_index: 0,
@@ -277,6 +412,8 @@ impl Renderer {
             },
         )
         .expect("font load");
+        let rb_face = rustybuzz::Face::from_slice(FONT_BYTES, 0)
+            .expect("rustybuzz face load");
 
         let (m, _) = font.rasterize('M', font_size);
         let cell_width = m.advance_width.ceil() as usize;
@@ -430,6 +567,7 @@ impl Renderer {
             glyph_buf,
             glyph_buf_cap: init_glyph,
             font,
+            rb_face,
             cell_width,
             cell_height,
             baseline: ascent,
@@ -529,20 +667,18 @@ impl Renderer {
 
     // ── Atlas management ──────────────────────────────────────────────────────
 
-    /// Ensure glyph `c` is in the atlas. Returns a clone of the entry, or None
-    /// if the character has no visible glyph (space, control, .notdef).
-    fn ensure_glyph(&mut self, c: char) -> Option<AtlasEntry> {
-        if let Some(entry) = self.atlas_cache.get(&c) {
-            return entry.clone();
-        }
-        // Skip chars not in font
-        if self.font.lookup_glyph_index(c) == 0 {
-            self.atlas_cache.insert(c, None);
+    /// Ensure OpenType glyph `id` is in the atlas. Returns the entry, or `None`
+    /// if the glyph is missing or invisible (id 0, zero-size bitmap).
+    fn ensure_glyph_id(&mut self, id: u16) -> Option<AtlasEntry> {
+        if id == 0 {
             return None;
         }
-        let (m, bitmap) = self.font.rasterize(c, self.font_size);
+        if let Some(entry) = self.atlas_cache.get(&id) {
+            return entry.clone();
+        }
+        let (m, bitmap) = self.font.rasterize_indexed(id, self.font_size);
         if m.width == 0 || m.height == 0 {
-            self.atlas_cache.insert(c, None);
+            self.atlas_cache.insert(id, None);
             return None;
         }
         let gw = m.width as u32;
@@ -600,11 +736,30 @@ impl Renderer {
             w: gw,
             h: gh,
         };
-        self.atlas_cache.insert(c, Some(entry.clone()));
+        self.atlas_cache.insert(id, Some(entry.clone()));
         Some(entry)
     }
 
-    // ── Glyph emit helper ─────────────────────────────────────────────────────
+    // ── Glyph emit helpers ────────────────────────────────────────────────────
+
+    fn emit_glyph_id(
+        &mut self,
+        glyphs: &mut Vec<GlyphInst>,
+        id: u16,
+        px: f32,
+        py: f32,
+        fg: [f32; 4],
+    ) {
+        if let Some(e) = self.ensure_glyph_id(id) {
+            glyphs.push(GlyphInst {
+                pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
+                sz: [e.w as f32, e.h as f32],
+                uv_pos: [e.uv_x, e.uv_y],
+                uv_sz: [e.uv_w, e.uv_h],
+                fg,
+            });
+        }
+    }
 
     fn emit_char(
         &mut self,
@@ -614,15 +769,25 @@ impl Renderer {
         py: f32,
         fg: [f32; 4],
     ) {
-        if let Some(e) = self.ensure_glyph(c) {
-            glyphs.push(GlyphInst {
-                pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
-                sz: [e.w as f32, e.h as f32],
-                uv_pos: [e.uv_x, e.uv_y],
-                uv_sz: [e.uv_w, e.uv_h],
-                fg,
-            });
-        }
+        let id = self.font.lookup_glyph_index(c);
+        self.emit_glyph_id(glyphs, id, px, py, fg);
+    }
+
+    // ── Ligature shaping ──────────────────────────────────────────────────────
+
+    /// Pre-compute per-column glyph operations for a single terminal row.
+    ///
+    /// Cells are grouped into same-fg-color runs.  Each run is shaped through
+    /// the OpenType engine; ligature glyphs that span multiple cells produce
+    /// `GlyphOp::Glyph` at the first cell and `GlyphOp::Skip` at subsequent
+    /// covered cells.
+    fn compute_row_glyph_ops(
+        &self,
+        state: &TerminalState,
+        row: usize,
+        vis_cols: usize,
+    ) -> Vec<GlyphOp> {
+        compute_row_glyph_ops_impl(&self.rb_face, state, row, vis_cols)
     }
 
     // ── Block character rects ─────────────────────────────────────────────────
@@ -800,6 +965,11 @@ impl Renderer {
                     0
                 };
 
+                // Pre-compute ligature-aware glyph ops for the row.
+                // This is a pure shaping step (no atlas mutation) so it can
+                // borrow &self while the draw loop later uses &mut self.
+                let glyph_ops = self.compute_row_glyph_ops(pane.state, row, vis_cols);
+
                 for col in 0..vis_cols {
                     let cell = pane.state.visual_cell(row, col);
                     let mut fg_color = cell.attrs.fg;
@@ -829,13 +999,23 @@ impl Renderer {
                     };
                     push_rect(&mut bg_rects, px, py, cw, ch, bg);
 
+                    let fg = c2f(fg_color);
                     let c = cell.c;
-                    if c != ' ' && c != '\0' {
-                        let fg = c2f(fg_color);
-                        if !Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg) {
-                            self.emit_char(&mut glyphs, c, px, py, fg);
+                    match glyph_ops[col] {
+                        GlyphOp::Skip => {}
+                        GlyphOp::Block => {
+                            // Block chars can't participate in ligatures; skip
+                            // the GlyphOp::Skip guard above — we always render.
+                            if c != ' ' && c != '\0' {
+                                Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg);
+                            }
+                        }
+                        GlyphOp::Glyph(glyph_id) => {
+                            self.emit_glyph_id(&mut glyphs, glyph_id, px, py, fg);
+                            // Combining chars overlay at the same cell origin.
                             for &combining in cell.combining_chars() {
-                                self.emit_char(&mut glyphs, combining, px, py, fg);
+                                let comb_id = self.font.lookup_glyph_index(combining);
+                                self.emit_glyph_id(&mut glyphs, comb_id, px, py, fg);
                             }
                         }
                     }
@@ -997,14 +1177,394 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::Terminal;
+
+    fn test_face() -> rustybuzz::Face<'static> {
+        rustybuzz::Face::from_slice(FONT_BYTES, 0)
+            .expect("bundled JetBrains Mono must parse as a valid font")
+    }
+
+    fn make_term(cols: usize, rows: usize) -> Terminal {
+        Terminal::new(cols, rows)
+    }
+
+    // ── Color helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn c2f_black_is_zero_rgb_full_alpha() {
+        let r = c2f(Color::new(0, 0, 0));
+        assert_eq!(r, [0., 0., 0., 1.]);
+    }
+
+    #[test]
+    fn c2f_white_is_one_rgb_full_alpha() {
+        let r = c2f(Color::new(255, 255, 255));
+        assert_eq!(r, [1., 1., 1., 1.]);
+    }
+
+    #[test]
+    fn c2f_channel_conversion_is_divide_by_255() {
+        let r = c2f(Color::new(255, 0, 128));
+        assert_eq!(r[0], 1.0);
+        assert_eq!(r[1], 0.0);
+        assert!((r[2] - 128. / 255.).abs() < 1e-6);
+        assert_eq!(r[3], 1.0);
+    }
+
+    #[test]
+    fn c2fa_carries_alpha() {
+        let r = c2fa(Color::new(255, 0, 0), 0.5);
+        assert_eq!(r[0], 1.0);
+        assert_eq!(r[1], 0.0);
+        assert_eq!(r[2], 0.0);
+        assert_eq!(r[3], 0.5);
+    }
+
+    #[test]
+    fn c2fa_zero_alpha() {
+        let r = c2fa(Color::new(255, 255, 255), 0.0);
+        assert_eq!(r[3], 0.0);
+    }
+
+    #[test]
+    fn rgb_f_converts_components() {
+        let r = rgb_f(0, 128, 255);
+        assert_eq!(r[0], 0.0);
+        assert!((r[1] - 128. / 255.).abs() < 1e-6);
+        assert_eq!(r[2], 1.0);
+        assert_eq!(r[3], 1.0);
+    }
+
+    #[test]
+    fn rgb_f_black() {
+        assert_eq!(rgb_f(0, 0, 0), [0., 0., 0., 1.]);
+    }
+
+    // ── push_rect ─────────────────────────────────────────────────────────────
 
     #[test]
     fn divider_rect_is_pushed_into_fg_rects() {
-        // Smoke test: push_rect with a divider coordinate should not panic.
         let mut v: Vec<RectInst> = Vec::new();
         push_rect(&mut v, 400., 0., 2., 600., rgb_f(0x3a, 0x3a, 0x3a));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].pos, [400., 0.]);
         assert_eq!(v[0].sz,  [2., 600.]);
+    }
+
+    #[test]
+    fn push_rect_zero_width_is_rejected() {
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 0., 0., 0., 100., rgb_f(255, 0, 0));
+        assert!(v.is_empty(), "zero-width rect must not be pushed");
+    }
+
+    #[test]
+    fn push_rect_zero_height_is_rejected() {
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 0., 0., 100., 0., rgb_f(255, 0, 0));
+        assert!(v.is_empty(), "zero-height rect must not be pushed");
+    }
+
+    #[test]
+    fn push_rect_negative_width_is_rejected() {
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 0., 0., -1., 100., rgb_f(255, 0, 0));
+        assert!(v.is_empty(), "negative-width rect must not be pushed");
+    }
+
+    #[test]
+    fn push_rect_negative_height_is_rejected() {
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 0., 0., 100., -1., rgb_f(255, 0, 0));
+        assert!(v.is_empty(), "negative-height rect must not be pushed");
+    }
+
+    #[test]
+    fn push_rect_stores_position_and_size() {
+        let mut v: Vec<RectInst> = Vec::new();
+        push_rect(&mut v, 10., 20., 30., 40., [1., 0., 0., 1.]);
+        assert_eq!(v[0].pos, [10., 20.]);
+        assert_eq!(v[0].sz, [30., 40.]);
+        assert_eq!(v[0].color, [1., 0., 0., 1.]);
+    }
+
+    // ── is_block_char ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_block_char_lower_block_boundary() {
+        assert!(is_block_char('\u{2580}'), "U+2580 UPPER HALF BLOCK must be a block char");
+    }
+
+    #[test]
+    fn is_block_char_upper_block_boundary() {
+        assert!(is_block_char('\u{259F}'), "U+259F QUADRANT LOWER-RIGHT must be a block char");
+    }
+
+    #[test]
+    fn is_block_char_just_before_block_range_is_false() {
+        assert!(!is_block_char('\u{257F}'), "U+257F must not be a block char");
+    }
+
+    #[test]
+    fn is_block_char_just_after_block_range_is_false() {
+        assert!(!is_block_char('\u{25A0}'), "U+25A0 BLACK SQUARE must not be a block char");
+    }
+
+    #[test]
+    fn is_block_char_braille_lower_boundary() {
+        assert!(is_block_char('\u{2800}'), "U+2800 BRAILLE BLANK must be a block char");
+    }
+
+    #[test]
+    fn is_block_char_braille_upper_boundary() {
+        assert!(is_block_char('\u{28FF}'), "U+28FF BRAILLE 8-DOT must be a block char");
+    }
+
+    #[test]
+    fn is_block_char_just_after_braille_range_is_false() {
+        assert!(!is_block_char('\u{2900}'), "U+2900 must not be a block char");
+    }
+
+    #[test]
+    fn is_block_char_ascii_is_false() {
+        for c in ' '..='~' {
+            assert!(!is_block_char(c), "ASCII '{c}' must not be a block char");
+        }
+    }
+
+    #[test]
+    fn is_block_char_mid_block_range() {
+        // U+2588 FULL BLOCK is the canonical block character.
+        assert!(is_block_char('\u{2588}'));
+    }
+
+    // ── shape_run_impl ────────────────────────────────────────────────────────
+
+    #[test]
+    fn shape_run_empty_input_returns_empty() {
+        let face = test_face();
+        let result = shape_run_impl(&face, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shape_run_single_ascii_char_returns_one_glyph_at_index_zero() {
+        let face = test_face();
+        let result = shape_run_impl(&face, &['A']);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].char_idx, 0);
+        assert_ne!(result[0].glyph_id, 0, "A must have a real glyph in JetBrains Mono");
+    }
+
+    #[test]
+    fn shape_run_multiple_ascii_chars_each_have_valid_char_idx() {
+        let face = test_face();
+        let chars: Vec<char> = "hello".chars().collect();
+        let result = shape_run_impl(&face, &chars);
+        assert!(!result.is_empty());
+        // All char_idxes must be in-range.
+        for sg in &result {
+            assert!(sg.char_idx < chars.len(), "char_idx {} out of range", sg.char_idx);
+        }
+    }
+
+    #[test]
+    fn shape_run_char_idxes_are_monotonically_nondecreasing() {
+        let face = test_face();
+        let chars: Vec<char> = "fn foo() ->".chars().collect();
+        let result = shape_run_impl(&face, &chars);
+        let mut prev = 0usize;
+        for sg in &result {
+            assert!(
+                sg.char_idx >= prev,
+                "char_idx went backwards: {} < {}",
+                sg.char_idx, prev
+            );
+            prev = sg.char_idx;
+        }
+    }
+
+    #[test]
+    fn shape_run_output_count_does_not_exceed_input_count() {
+        let face = test_face();
+        // Ligatures may reduce glyph count; they must never increase it.
+        let chars: Vec<char> = "->>=!=".chars().collect();
+        let result = shape_run_impl(&face, &chars);
+        assert!(
+            result.len() <= chars.len(),
+            "shaped output ({}) must not exceed input ({}) chars",
+            result.len(), chars.len()
+        );
+    }
+
+    #[test]
+    fn shape_run_all_glyph_ids_nonzero_for_ascii() {
+        // Every printable ASCII char must be present in JetBrains Mono.
+        let face = test_face();
+        for c in '!'..='~' {
+            let result = shape_run_impl(&face, &[c]);
+            assert_eq!(result.len(), 1);
+            assert_ne!(
+                result[0].glyph_id, 0,
+                "ASCII '{c}' (U+{:04X}) must have a glyph in JetBrains Mono",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn shape_run_unicode_multibyte_char_has_correct_char_idx() {
+        // U+00E9 (é) is 2 bytes in UTF-8; its cluster byte offset must map to char index 0.
+        let face = test_face();
+        let chars = vec!['\u{00E9}'];
+        let result = shape_run_impl(&face, &chars);
+        assert!(!result.is_empty());
+        assert_eq!(result[0].char_idx, 0, "char_idx for single multibyte char must be 0");
+    }
+
+    #[test]
+    fn shape_run_mixed_ascii_and_unicode_char_idxes_are_correct() {
+        let face = test_face();
+        // "aé" — 'a' is 1 byte, 'é' is 2 bytes; char indices must be 0 and 1.
+        let chars = vec!['a', '\u{00E9}'];
+        let result = shape_run_impl(&face, &chars);
+        assert!(!result.is_empty());
+        // The first glyph must come from char 0, second from char 1.
+        let idxes: Vec<usize> = result.iter().map(|s| s.char_idx).collect();
+        assert!(idxes.contains(&0), "char_idx 0 must appear in result");
+        // Char idx 1 might be merged if a ligature forms (unlikely for 'aé').
+        assert!(idxes.iter().all(|&i| i < 2), "all char_idxes must be < 2");
+    }
+
+    // ── compute_row_glyph_ops_impl ────────────────────────────────────────────
+
+    #[test]
+    fn glyph_ops_space_cells_are_skip() {
+        let face = test_face();
+        let term = make_term(10, 5);
+        // Default cells contain ' '.
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        for (i, op) in ops.iter().enumerate() {
+            assert!(
+                matches!(op, GlyphOp::Skip),
+                "col {i}: space must produce Skip, not Glyph/Block"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_ops_null_cell_is_skip() {
+        let face = test_face();
+        let term = make_term(4, 2);
+        // A fresh terminal has ' ' in every cell — all must be Skip.
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 4);
+        assert!(ops.iter().all(|o| matches!(o, GlyphOp::Skip)));
+        drop(term);
+    }
+
+    #[test]
+    fn glyph_ops_printable_ascii_produces_glyph() {
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        // Write 'A' at (0,0).
+        term.process(b"A");
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "col 0 with 'A' must produce Glyph, got Skip/Block"
+        );
+        // Remaining cols were not written → Skip.
+        for i in 1..10 {
+            assert!(matches!(ops[i], GlyphOp::Skip), "col {i} must be Skip");
+        }
+    }
+
+    #[test]
+    fn glyph_ops_block_char_is_block() {
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        // Write U+2588 FULL BLOCK.
+        term.process("\u{2588}".as_bytes());
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(
+            matches!(ops[0], GlyphOp::Block),
+            "U+2588 must produce Block op"
+        );
+    }
+
+    #[test]
+    fn glyph_ops_different_fg_colors_break_shaping_run() {
+        // Two chars with different fg colors must each produce an independent
+        // Glyph op (no cross-color ligature).
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        // Write '-' in red.
+        term.process(b"\x1b[31m-");
+        // Write '>' in green.
+        term.process(b"\x1b[32m>");
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        // Both cols must be Glyph (independent runs, not ligature-merged Skip).
+        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 '-' red must be Glyph");
+        assert!(matches!(ops[1], GlyphOp::Glyph(_)), "col 1 '>' green must be Glyph");
+    }
+
+    #[test]
+    fn glyph_ops_same_fg_color_allows_ligature_run() {
+        // '-' and '>' in the same fg color must be shaped as one run.
+        // If JetBrains Mono produces a true single-glyph ligature, col 1 will be
+        // Skip.  If it uses calt (2 contextual glyphs), both will be Glyph.
+        // Either way, neither should be Block, and col 0 must be Glyph.
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        term.process(b"->");
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "first char must be Glyph");
+        assert!(
+            matches!(ops[1], GlyphOp::Glyph(_) | GlyphOp::Skip),
+            "second char must be Glyph or Skip (ligature)"
+        );
+    }
+
+    #[test]
+    fn glyph_ops_space_breaks_run() {
+        // 'a', ' ', 'b' — the space must break the shaping run so 'a' and 'b'
+        // are shaped independently.
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        term.process(b"a b");
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 'a' must be Glyph");
+        assert!(matches!(ops[1], GlyphOp::Skip), "col 1 ' ' must be Skip");
+        assert!(matches!(ops[2], GlyphOp::Glyph(_)), "col 2 'b' must be Glyph");
+    }
+
+    #[test]
+    fn glyph_ops_block_char_breaks_run() {
+        // 'a', U+2588, 'b' — the block char must break shaping runs.
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        term.process("a\u{2588}b".as_bytes());
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 'a' must be Glyph");
+        assert!(matches!(ops[1], GlyphOp::Block), "col 1 U+2588 must be Block");
+        assert!(matches!(ops[2], GlyphOp::Glyph(_)), "col 2 'b' must be Glyph");
+    }
+
+    #[test]
+    fn glyph_ops_vis_cols_zero_returns_empty() {
+        let face = test_face();
+        let term = make_term(10, 5);
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 0);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn glyph_ops_row_out_of_visible_range_returns_all_skip() {
+        // Requesting a row beyond the grid should not panic; visual_cell returns
+        // a default (space) cell for out-of-range rows.
+        let face = test_face();
+        let term = make_term(5, 3);
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 10, 5);
+        assert!(ops.iter().all(|o| matches!(o, GlyphOp::Skip)));
     }
 }
