@@ -290,4 +290,86 @@ mod tests {
             && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
         assert!(!would_parse, "partial JSON must fall through to passthrough");
     }
+
+    // ── process_line passthrough ──────────────────────────────────────────────
+
+    fn process_output(line: &str) -> String {
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let syntax = ps.find_syntax_by_extension("json")
+            .unwrap_or_else(|| ps.find_syntax_plain_text());
+        let theme = ts.themes.values().next().expect("no theme");
+        let mut buf = Vec::new();
+        let mut drain = false;
+        process_line(line, &mut buf, &ps, syntax, theme, &mut drain);
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn test_number_passes_through_unchanged() {
+        let out = process_output("42");
+        assert!(out.contains("42"), "number must pass through: {out:?}");
+        assert!(!out.contains("\x1b["), "number must not be syntax-highlighted");
+    }
+
+    #[test]
+    fn test_null_passes_through_unchanged() {
+        let out = process_output("null");
+        assert!(out.contains("null"), "null literal must pass through");
+        assert!(!out.contains("\x1b["));
+    }
+
+    #[test]
+    fn test_boolean_passes_through_unchanged() {
+        let out = process_output("true");
+        assert!(out.contains("true"), "boolean must pass through");
+        assert!(!out.contains("\x1b["));
+    }
+
+    #[test]
+    fn test_plain_text_passes_through_unchanged() {
+        let line = "Starting server on port 3000";
+        let out = process_output(line);
+        assert!(out.contains(line), "plain text must pass through unchanged");
+    }
+
+    #[test]
+    fn test_invalid_json_braces_passes_through() {
+        // Looks like JSON but isn't — unquoted keys.
+        let line = "{key: value}";
+        let out = process_output(line);
+        assert!(out.contains("{key: value}"), "invalid JSON must pass through: {out:?}");
+    }
+
+    #[test]
+    fn test_json_with_trailing_garbage_passes_through() {
+        // serde_json rejects trailing non-whitespace after a valid value.
+        let line = r#"{"a": 1} not json"#;
+        let out = process_output(line);
+        assert!(out.contains(r#"{"a": 1} not json"#), "JSON with trailing garbage must pass through");
+    }
+
+    #[test]
+    fn test_empty_object_prettified() {
+        let out = process_output("{}");
+        assert!(out.contains("{}") || out.contains('{'), "empty object must be prettified");
+        assert!(out.contains("\x1b["), "prettified output must have ANSI escapes");
+    }
+
+    #[test]
+    fn test_empty_array_prettified() {
+        let out = process_output("[]");
+        assert!(out.contains("[]") || out.contains('['), "empty array must be prettified");
+        assert!(out.contains("\x1b["), "prettified output must have ANSI escapes");
+    }
+
+    #[test]
+    fn test_leading_whitespace_stripped_before_parse() {
+        // process_line calls `line.trim()` before JSON detection, so
+        // "   {}" is treated as "{}" and gets prettified.
+        let out = process_output(r#"   {"x": 1}"#);
+        assert!(out.contains("\x1b["), "JSON with leading spaces must be prettified");
+        // The raw leading spaces must NOT appear in prettified output.
+        assert!(!out.starts_with("   {"), "leading spaces must be stripped from prettified output");
+    }
 }

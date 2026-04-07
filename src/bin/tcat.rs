@@ -473,6 +473,66 @@ mod tests {
         );
     }
 
+    // ── parse_path_range adversarial ──────────────────────────────────────────
+
+    /// Simulate the highlight_file line-filter loop so we can test range
+    /// behaviour without touching files or stdout.
+    fn count_filtered_lines(total: usize, range: Option<(usize, usize)>) -> usize {
+        let mut count = 0;
+        for lineno in 1..=total {
+            if let Some((start, end)) = range {
+                if lineno < start { continue; }
+                if lineno > end   { break; }
+            }
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn test_reversed_range_produces_no_output() {
+        // parse_path_range accepts reversed ranges without validation.
+        // highlight_file skips lines below start (100), but end=50 means
+        // the loop immediately breaks when lineno > 50 — zero lines shown.
+        let (_, range) = parse_path_range("foo.rs:100-50");
+        assert_eq!(
+            range,
+            Some((100, 50)),
+            "reversed range must be parsed (not rejected at parse stage)"
+        );
+        assert_eq!(
+            count_filtered_lines(200, range),
+            0,
+            "reversed range must produce zero visible lines"
+        );
+    }
+
+    #[test]
+    fn test_line_zero_produces_no_output() {
+        // Line numbers are 1-indexed. parse_path_range accepts 0 without
+        // validation; the filter then skips lines where lineno < 1 but
+        // immediately breaks when lineno > 0 — zero lines shown.
+        let (_, range) = parse_path_range("foo.rs:0");
+        assert_eq!(range, Some((0, 0)), "line 0 must be parsed (not rejected at parse stage)");
+        assert_eq!(
+            count_filtered_lines(100, range),
+            0,
+            "line 0 must produce zero visible lines (invalid 1-indexed line)"
+        );
+    }
+
+    #[test]
+    fn test_normal_range_filter_is_correct() {
+        let (_, range) = parse_path_range("foo.rs:10-20");
+        assert_eq!(count_filtered_lines(100, range), 11);
+    }
+
+    #[test]
+    fn test_single_line_filter_is_correct() {
+        let (_, range) = parse_path_range("foo.rs:42");
+        assert_eq!(count_filtered_lines(100, range), 1);
+    }
+
     #[test]
     fn test_print_footer_contains_corner() {
         let out = capture(|b| print_footer(b));

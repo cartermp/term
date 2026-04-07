@@ -634,6 +634,8 @@ impl Perform for TerminalState {
             (0, 'u') => {
                 (self.cursor_row, self.cursor_col) = self.saved_cursor;
                 self.attrs = self.saved_attrs;
+                self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
+                self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
             }
             // Device attributes
             (0, 'c') => {
@@ -675,6 +677,8 @@ impl Perform for TerminalState {
             b'8' => {
                 (self.cursor_row, self.cursor_col) = self.saved_cursor;
                 self.attrs = self.saved_attrs;
+                self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
+                self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
             }
             b'D' => self.do_newline(),
             b'E' => {
@@ -1833,6 +1837,253 @@ mod tests {
         // Simulate host clearing the flag after responding.
         t.state.osc_52_query = false;
         assert!(!t.state.osc_52_query);
+    }
+
+    // ── SGR robustness ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sgr_256color_fg_missing_index_is_noop() {
+        // \x1b[38;5m has no color index — condition `i+2 < p.len()` = `2 < 2` = false.
+        let mut t = t(80, 24);
+        let default_fg = t.state.attrs.fg;
+        t.process(b"\x1b[38;5m");
+        assert_eq!(t.state.attrs.fg, default_fg, "incomplete SGR 38;5 must not change fg");
+    }
+
+    #[test]
+    fn sgr_256color_bg_missing_index_is_noop() {
+        let mut t = t(80, 24);
+        let default_bg = t.state.attrs.bg;
+        t.process(b"\x1b[48;5m");
+        assert_eq!(t.state.attrs.bg, default_bg, "incomplete SGR 48;5 must not change bg");
+    }
+
+    #[test]
+    fn sgr_truecolor_fg_only_one_rgb_component_is_noop() {
+        // \x1b[38;2;100m — R provided but G and B missing.
+        let mut t = t(80, 24);
+        let default_fg = t.state.attrs.fg;
+        t.process(b"\x1b[38;2;100m");
+        assert_eq!(t.state.attrs.fg, default_fg, "incomplete RGB (only R) must not change fg");
+    }
+
+    #[test]
+    fn sgr_truecolor_fg_only_two_rgb_components_is_noop() {
+        // \x1b[38;2;100;150m — R and G provided but B missing.
+        // Condition `i+4 < p.len()` = `4 < 4` = false → skipped.
+        let mut t = t(80, 24);
+        let default_fg = t.state.attrs.fg;
+        t.process(b"\x1b[38;2;100;150m");
+        assert_eq!(t.state.attrs.fg, default_fg, "incomplete RGB (no B) must not change fg");
+    }
+
+    #[test]
+    fn sgr_truecolor_full_rgb_applies() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[38;2;100;150;200m");
+        assert_eq!(t.state.attrs.fg.r, 100);
+        assert_eq!(t.state.attrs.fg.g, 150);
+        assert_eq!(t.state.attrs.fg.b, 200);
+    }
+
+    // ── Wrap-pending state ────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_next_not_cleared_by_cursor_movement_sequences() {
+        // CUP (H) explicitly clears wrap_next. Cursor movement sequences
+        // A/B/C/D do not — consistent with xterm behaviour.
+        let mut t = t(5, 5);
+        t.process(b"\x1b[2;1H"); // cursor to row 1, col 0
+        t.process(b"ABCDE");      // fill 5-col row → wrap_next = true
+        assert!(t.state.wrap_next);
+
+        // CUP must clear it
+        t.process(b"\x1b[2;1H");
+        assert!(!t.state.wrap_next, "CUP must clear wrap_next");
+
+        // Fill again
+        t.process(b"ABCDE");
+        assert!(t.state.wrap_next);
+
+        // CUU does NOT clear it
+        t.process(b"\x1b[1A");
+        assert!(t.state.wrap_next, "CUU must not affect pending wrap");
+    }
+
+    // ── Cursor clamping ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cup_out_of_bounds_clamps_to_grid_edges() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[999;999H");
+        assert_eq!(t.state.cursor_row, 23, "row must clamp to rows-1");
+        assert_eq!(t.state.cursor_col, 79, "col must clamp to cols-1");
+    }
+
+    #[test]
+    fn cursor_up_past_scroll_top_clamps_at_zero() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[10;1H"); // row 10 (1-indexed) = row 9
+        t.process(b"\x1b[100A");  // up 100 — should clamp at scroll_top (0)
+        assert_eq!(t.state.cursor_row, 0);
+    }
+
+    #[test]
+    fn cursor_down_clamped_at_scroll_bottom() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[1;1H"); // row 0
+        t.process(b"\x1b[100B"); // down 100 — should clamp at scroll_bottom (23)
+        assert_eq!(t.state.cursor_row, 23);
+    }
+
+    // ── Cursor save/restore across resize ────────────────────────────────────
+
+    #[test]
+    fn cursor_restore_after_resize_clamped_no_panic() {
+        // Restore places cursor at a position valid at save time but outside
+        // the shrunken grid. The cursor must be clamped to the new bounds.
+        let mut t = t(80, 24);
+        t.process(b"\x1b[24;80H"); // last cell (row=23, col=79)
+        t.process(b"\x1b[s");       // save
+        t.resize(40, 12);
+        t.process(b"\x1b[u");       // restore — cursor clamped to (11, 39)
+        assert_eq!(t.state.cursor_row, 11, "cursor row must clamp to new rows-1");
+        assert_eq!(t.state.cursor_col, 39, "cursor col must clamp to new cols-1");
+    }
+
+    #[test]
+    fn esc_8_restore_after_resize_clamped_no_panic() {
+        // Same as above but using ESC 7 / ESC 8 save/restore.
+        let mut t = t(80, 24);
+        t.process(b"\x1b[24;80H");
+        t.process(b"\x1b7");        // ESC 7: save
+        t.resize(40, 12);
+        t.process(b"\x1b8");        // ESC 8: restore
+        assert_eq!(t.state.cursor_row, 11);
+        assert_eq!(t.state.cursor_col, 39);
+    }
+
+    #[test]
+    fn erase_line_after_oob_cursor_does_not_panic() {
+        // Without clamping, cursor restore to row 23 in a 12-row grid followed
+        // by erase_line would index self.grid[23] and panic.
+        let mut t = t(80, 24);
+        t.process(b"\x1b[24;6H"); // row=23, col=5 (col is within 40-col bounds)
+        t.process(b"\x1b[s");      // save
+        t.resize(40, 12);
+        t.process(b"\x1b[u");      // restore — clamped to (11, 5)
+        t.process(b"\x1b[K");      // erase line — must not panic
+        assert_eq!(t.state.grid.len(), 12);
+    }
+
+    // ── ECH (erase character) ─────────────────────────────────────────────────
+
+    #[test]
+    fn ech_large_count_clamps_to_row_end() {
+        let mut t = t(10, 5);
+        t.process(b"ABCDEFGHIJ");  // fill row 0 (cols 0–9)
+        t.process(b"\x1b[1;6H");  // col 6 (1-indexed) → cursor at col 5
+        t.process(b"\x1b[1000X"); // erase 1000 chars — only cols 5–9 remain in range
+        assert_eq!(ch(&t, 0, 4), 'E', "col before cursor must be untouched");
+        assert_eq!(ch(&t, 0, 5), ' ', "col at cursor must be erased");
+        assert_eq!(ch(&t, 0, 9), ' ', "last col must be erased");
+    }
+
+    // ── Scroll region behaviour ───────────────────────────────────────────────
+
+    #[test]
+    fn scroll_up_restricted_region_leaves_outer_rows_intact() {
+        // DECSTBM rows 3–5 (1-indexed) → scroll_top=2, scroll_bottom=4.
+        let mut t = t(5, 8);
+        for row in 0..8u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;5r"); // set scroll region rows 3–5
+        t.process(b"\x1b[1S");   // SU: scroll up 1 within region
+
+        // Above region: untouched
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 1, 0), 'B');
+        // Region content shifted up by 1; blank inserted at scroll_bottom
+        assert_eq!(ch(&t, 2, 0), 'D');
+        assert_eq!(ch(&t, 3, 0), 'E');
+        assert_eq!(ch(&t, 4, 0), ' ', "scroll_bottom of region must be blank");
+        // Below region: untouched
+        assert_eq!(ch(&t, 5, 0), 'F');
+        assert_eq!(ch(&t, 6, 0), 'G');
+        assert_eq!(ch(&t, 7, 0), 'H');
+    }
+
+    #[test]
+    fn scroll_down_restricted_region_leaves_outer_rows_intact() {
+        let mut t = t(5, 8);
+        for row in 0..8u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;5r"); // scroll region rows 3–5
+        t.process(b"\x1b[1T");   // SD: scroll down 1 within region
+
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 1, 0), 'B');
+        assert_eq!(ch(&t, 2, 0), ' ', "scroll_top of region must be blank");
+        assert_eq!(ch(&t, 3, 0), 'C');
+        assert_eq!(ch(&t, 4, 0), 'D');
+        // 'E' was at scroll_bottom and got pushed off; rows below region untouched
+        assert_eq!(ch(&t, 5, 0), 'F');
+        assert_eq!(ch(&t, 6, 0), 'G');
+        assert_eq!(ch(&t, 7, 0), 'H');
+    }
+
+    // ── Erase display edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn ed_mode0_from_last_cell_erases_only_from_cursor() {
+        let mut t = t(5, 3);
+        t.process(b"\x1b[1;1HABCDE");
+        t.process(b"\x1b[2;1HFGHIJ");
+        t.process(b"\x1b[3;1HKLMNO");
+        t.process(b"\x1b[3;5H");  // cursor at last cell (row=2, col=4)
+        t.process(b"\x1b[0J");    // ED mode 0: erase from cursor to end
+
+        assert_eq!(ch(&t, 2, 3), 'N', "cell before cursor must be untouched");
+        assert_eq!(ch(&t, 2, 4), ' ', "cursor cell must be erased");
+        assert_eq!(ch(&t, 1, 4), 'J', "rows above cursor must be untouched");
+    }
+
+    #[test]
+    fn ed_mode1_from_first_cell_erases_only_cursor_cell() {
+        let mut t = t(5, 3);
+        t.process(b"\x1b[1;1HABCDE");
+        t.process(b"\x1b[1;1H");  // cursor at (0, 0)
+        t.process(b"\x1b[1J");    // ED mode 1: erase from start to cursor (inclusive)
+
+        assert_eq!(ch(&t, 0, 0), ' ', "cursor cell must be erased");
+        assert_eq!(ch(&t, 0, 1), 'B', "cells after cursor must be untouched");
+    }
+
+    // ── IL / DL within scroll region ─────────────────────────────────────────
+
+    #[test]
+    fn il_at_scroll_top_shifts_region_content_down() {
+        let mut t = t(5, 8);
+        for row in 0..8u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;6r"); // scroll region rows 3–6 (scroll_top=2, scroll_bottom=5)
+        t.process(b"\x1b[3;1H"); // cursor to scroll_top
+        t.process(b"\x1b[1L");   // IL: insert 1 blank line
+
+        assert_eq!(ch(&t, 0, 0), 'A', "above region unchanged");
+        assert_eq!(ch(&t, 1, 0), 'B', "above region unchanged");
+        assert_eq!(ch(&t, 2, 0), ' ', "blank inserted at cursor (scroll_top)");
+        assert_eq!(ch(&t, 3, 0), 'C', "previous scroll_top content shifted down");
+        assert_eq!(ch(&t, 4, 0), 'D');
+        assert_eq!(ch(&t, 5, 0), 'E', "scroll_bottom now has what was one above");
+        assert_eq!(ch(&t, 6, 0), 'G', "below region unchanged");
+        assert_eq!(ch(&t, 7, 0), 'H');
     }
 }
 

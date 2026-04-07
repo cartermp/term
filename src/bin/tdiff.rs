@@ -41,10 +41,23 @@ fn strip_ansi(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // consume until a letter (final byte of the CSI sequence)
-            for nc in chars.by_ref() {
-                if nc.is_ascii_alphabetic() {
-                    break;
+            match chars.peek().copied() {
+                Some(']') => {
+                    // OSC sequence — terminated by BEL (0x07) or ST (ESC \).
+                    chars.next(); // consume ']'
+                    while let Some(nc) = chars.next() {
+                        if nc == '\x07' { break; }
+                        if nc == '\x1b' {
+                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // CSI or other ESC sequence — consume until alphabetic final byte.
+                    for nc in chars.by_ref() {
+                        if nc.is_ascii_alphabetic() { break; }
+                    }
                 }
             }
         } else {
@@ -75,7 +88,7 @@ fn parse_file_path(header: &str) -> &str {
     let p = header.trim();
     let p = p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p);
     // Strip /dev/null (binary / new-file cases)
-    if p == "/dev/null" { "" } else { p }
+    if p.starts_with("/dev/null") { "" } else { p }
 }
 
 /// Infer a syntect extension/name hint from a file path.
@@ -289,5 +302,100 @@ fn main() {
             eprintln!("tdiff: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_ansi ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_ansi_plain_text_unchanged() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty_string() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_csi_color_sequence() {
+        // \x1b[31m — CSI 'm' is the final alphabetic byte.
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_multiple_csi_sequences() {
+        assert_eq!(strip_ansi("\x1b[1m\x1b[32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_bel_terminated_fully_stripped() {
+        // OSC sequence \x1b]0;Title\x07 — title is terminated by BEL (0x07),
+        // not by an alphabetic byte. The broken implementation stops at 'T'
+        // and leaks "itle\x07". The fix handles OSC specially.
+        assert_eq!(
+            strip_ansi("Hello\x1b]0;Title\x07World"),
+            "HelloWorld",
+            "OSC BEL-terminated sequence must be fully consumed"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_st_terminated_fully_stripped() {
+        // OSC sequence terminated by ST (ESC \).
+        assert_eq!(
+            strip_ansi("\x1b]2;My Window\x1b\\done"),
+            "done",
+            "OSC ST-terminated sequence must be fully consumed"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_lone_osc_no_panic() {
+        // OSC without a terminator — must not loop forever or panic.
+        let result = strip_ansi("\x1b]unterminated");
+        assert_eq!(result, "", "unterminated OSC must produce empty output");
+    }
+
+    // ── parse_file_path ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_file_path_strips_a_prefix() {
+        assert_eq!(parse_file_path("a/src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_file_path_strips_b_prefix() {
+        assert_eq!(parse_file_path("b/src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_file_path_no_prefix_unchanged() {
+        assert_eq!(parse_file_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_file_path_dev_null_empty() {
+        assert_eq!(parse_file_path("/dev/null"), "");
+    }
+
+    #[test]
+    fn test_parse_file_path_dev_null_with_annotation_empty() {
+        // git appends "(new file)" or "(deleted)" after /dev/null in some
+        // diff formats. Must still resolve to empty.
+        assert_eq!(
+            parse_file_path("/dev/null (new file)"),
+            "",
+            "/dev/null with annotation must resolve to empty path"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_path_whitespace_trimmed() {
+        assert_eq!(parse_file_path("  a/foo.rs  "), "foo.rs");
     }
 }
