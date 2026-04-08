@@ -1,0 +1,55 @@
+# cargo-deny configuration
+# Run: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+
+# ── Security advisories ────────────────────────────────────────────────────────
+[advisories]
+# Warn on unmaintained crates; error on known vulnerabilities.
+version = 2
+# Transitive unmaintained deps we can't control directly — treat as warnings.
+# RUSTSEC-2025-0141: bincode (via portable-pty)
+# RUSTSEC-2024-0436: paste (via metal / wgpu)
+# RUSTSEC-2017-0008: serial (via portable-pty)
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "transitive dep via portable-pty; no fix available upstream" },
+    { id = "RUSTSEC-2024-0436", reason = "transitive dep via wgpu/metal; no fix available upstream" },
+    { id = "RUSTSEC-2017-0008", reason = "transitive dep via portable-pty; no fix available upstream" },
+]
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+# Licenses considered acceptable for dependencies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "LGPL-2.1-or-later",    # via rustybuzz/ttf-parser; dynamic linking exemption
+]
+
+# ── Duplicate crates ──────────────────────────────────────────────────────────
+[bans]
+# Warn on duplicate versions of the same crate (not error — wgpu pulls in dupes).
+multiple-versions = "warn"
+# Crates that must never appear in the dependency tree.
+deny = []
+
+# ── Source hygiene ─────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

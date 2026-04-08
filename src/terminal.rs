@@ -68,6 +68,9 @@ pub struct TerminalState {
     pub grid: Vec<Vec<Cell>>,
     pub scrollback: VecDeque<Vec<Cell>>,
     pub viewport_offset: usize, // 0 = live view; N = scrolled N rows above live bottom
+    /// Incremented on every `Terminal::process()` call so callers can detect
+    /// when content has changed and invalidate derived caches (e.g. URL spans).
+    pub generation: u64,
     pub cols: usize,
     pub rows: usize,
     pub cursor_row: usize,
@@ -118,6 +121,7 @@ impl TerminalState {
             grid: vec![vec![Cell::default(); cols]; rows],
             scrollback: VecDeque::new(),
             viewport_offset: 0,
+            generation: 0,
             cols,
             rows,
             cursor_row: 0,
@@ -2454,6 +2458,7 @@ impl Terminal {
         for &b in bytes {
             self.parser.advance(&mut self.state, b);
         }
+        self.state.generation = self.state.generation.wrapping_add(1);
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

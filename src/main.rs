@@ -82,9 +82,25 @@ struct Pane {
     ghost_text: Option<String>,
     engine: Engine,
     selection: Option<Selection>,
+    /// Cached URL scan result. Keyed on (generation, vis_rows, vis_cols) so
+    /// we only re-scan when terminal content or viewport dimensions change.
+    url_cache: Vec<(usize, usize, usize, String)>,
+    url_cache_gen: u64,
+    url_cache_dims: (usize, usize),
 }
 
 impl Pane {
+    /// Return URL spans for the current view, using the cached result when
+    /// the terminal generation and viewport dimensions haven't changed.
+    fn urls_cached(&mut self, vis_rows: usize, vis_cols: usize) -> &[(usize, usize, usize, String)] {
+        let cur_gen = self.terminal.state.generation;
+        if self.url_cache_gen != cur_gen || self.url_cache_dims != (vis_rows, vis_cols) {
+            self.url_cache = find_urls(&self.terminal.state, vis_rows, vis_cols);
+            self.url_cache_gen = cur_gen;
+            self.url_cache_dims = (vis_rows, vis_cols);
+        }
+        &self.url_cache
+    }
     fn write(&mut self, data: &[u8]) {
         let _ = self.pty_writer.write_all(data);
         let _ = self.pty_writer.flush();
@@ -385,16 +401,15 @@ impl TerminalWindow {
         Some((pi, vrow as i64 - vo, col))
     }
 
-    fn update_cursor_icon(&self) {
+    fn update_cursor_icon(&mut self) {
         let icon = if self.modifiers.super_key() {
             let is_url = self.pixel_to_pane_cell(self.cursor_pos.0, self.cursor_pos.1)
                 .map(|(pi, row, col)| {
-                    let pane = &self.panes[pi];
                     let rects = self.pane_rects();
                     let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
                     let vis_cols = (pw as usize / self.renderer.cell_width).max(1);
                     let vis_rows = (ph as usize / self.renderer.cell_height).max(1);
-                    find_urls(&pane.terminal.state, vis_rows, vis_cols)
+                    self.panes[pi].urls_cached(vis_rows, vis_cols)
                         .iter()
                         .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                 })
@@ -460,22 +475,25 @@ impl TerminalWindow {
         let ch = self.renderer.cell_height;
         let mods_super = self.modifiers.super_key();
 
-        // Build URL underlines per pane
-        let url_ulines: Vec<Vec<(usize, usize, usize)>> = (0..self.panes.len())
-            .map(|i| {
+        // Build URL underlines per pane (uses cached scan when content unchanged)
+        let url_ulines: Vec<Vec<(usize, usize, usize)>> = {
+            let mut result = Vec::with_capacity(self.panes.len());
+            for i in 0..self.panes.len() {
                 if i < rects.len() && mods_super {
                     let (_, _, pw, ph) = rects[i];
                     let vis_rows = (ph as usize / ch).max(1);
                     let vis_cols = (pw as usize / cw).max(1);
-                    find_urls(&self.panes[i].terminal.state, vis_rows, vis_cols)
-                        .into_iter()
-                        .map(|(r, c0, c1, _)| (r, c0, c1))
-                        .collect()
+                    let spans = self.panes[i].urls_cached(vis_rows, vis_cols)
+                        .iter()
+                        .map(|(r, c0, c1, _)| (*r, *c0, *c1))
+                        .collect();
+                    result.push(spans);
                 } else {
-                    vec![]
+                    result.push(vec![]);
                 }
-            })
-            .collect();
+            }
+            result
+        };
 
         // Build PaneView slice
         let mut pane_views: Vec<PaneView<'_>> = Vec::new();
@@ -867,8 +885,20 @@ impl App {
         let _ = pair.slave.spawn_command(cmd);
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let writer = pair.master.take_writer().expect("take writer");
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("pty clone reader: {e}");
+                return None;
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("pty take writer: {e}");
+                return None;
+            }
+        };
 
         let proxy_clone = proxy.clone();
         std::thread::spawn(move || {
@@ -897,6 +927,9 @@ impl App {
             ghost_text: None,
             engine: Engine::new(),
             selection: None,
+            url_cache: Vec::new(),
+            url_cache_gen: u64::MAX, // sentinel: force first-use recompute
+            url_cache_dims: (0, 0),
         })
     }
 
@@ -1465,10 +1498,10 @@ impl ApplicationHandler<AppEvent> for App {
                             let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
                             let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
                             let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
-                            let url = find_urls(&tw.panes[pi].terminal.state, vis_rows, vis_cols)
-                                .into_iter()
+                            let url = tw.panes[pi].urls_cached(vis_rows, vis_cols)
+                                .iter()
                                 .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
-                                .map(|(_, _, _, u)| u);
+                                .map(|(_, _, _, u)| u.clone());
                             if let Some(u) = url {
                                 // Only open http/https URLs — defence in depth against
                                 // file:// or custom-scheme injection via terminal output.
