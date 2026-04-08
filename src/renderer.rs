@@ -232,7 +232,57 @@ pub fn push_rect(v: &mut Vec<RectInst>, x: f32, y: f32, w: f32, h: f32, color: [
     }
 }
 
-// ── Shaping helpers (free functions so tests can call them without a GPU) ─────
+/// Emit underline decoration rects for a single cell into `rects`.
+/// Extracted as a free function so tests can call it without a GPU.
+pub fn emit_underline_rects(
+    rects: &mut Vec<RectInst>,
+    x: f32,
+    y: f32,
+    cw: f32,
+    ch: f32,
+    style: crate::terminal::UnderlineStyle,
+    color: [f32; 4],
+) {
+    use crate::terminal::UnderlineStyle::*;
+    let uy = y + ch - 2.;
+    match style {
+        None => {}
+        Straight => {
+            push_rect(rects, x, uy, cw, 1., color);
+        }
+        Double => {
+            push_rect(rects, x, uy - 2., cw, 1., color);
+            push_rect(rects, x, uy, cw, 1., color);
+        }
+        Curly => {
+            let seg = (cw / 4.).max(1.);
+            let n = (cw / seg) as usize;
+            for i in 0..n {
+                let sx = x + i as f32 * seg;
+                let sy = if i % 2 == 0 { uy - 1. } else { uy + 1. };
+                push_rect(rects, sx, sy, seg, 1., color);
+            }
+        }
+        Dotted => {
+            let dot = 2_f32;
+            let gap = 2_f32;
+            let mut sx = x;
+            while sx + dot <= x + cw {
+                push_rect(rects, sx, uy, dot, 1., color);
+                sx += dot + gap;
+            }
+        }
+        Dashed => {
+            let dash = (cw * 0.45).max(2.);
+            let gap = (cw * 0.1).max(1.);
+            let mut sx = x;
+            while sx + dash <= x + cw {
+                push_rect(rects, sx, uy, dash, 1., color);
+                sx += dash + gap;
+            }
+        }
+    }
+}
 
 fn shape_run_impl(face: &rustybuzz::Face<'_>, chars: &[char]) -> Vec<ShapedGlyph> {
     if chars.is_empty() {
@@ -945,46 +995,7 @@ impl Renderer {
         style: crate::terminal::UnderlineStyle,
         color: [f32; 4],
     ) {
-        use crate::terminal::UnderlineStyle::*;
-        let uy = y + ch - 2.;
-        match style {
-            None => {}
-            Straight => {
-                push_rect(&mut self.fg_rects, x, uy, cw, 1., color);
-            }
-            Double => {
-                push_rect(&mut self.fg_rects, x, uy - 2., cw, 1., color);
-                push_rect(&mut self.fg_rects, x, uy, cw, 1., color);
-            }
-            Curly => {
-                // Sawtooth approximation: alternating 1-px-high segments.
-                let seg = (cw / 4.).max(1.);
-                let n = (cw / seg) as usize;
-                for i in 0..n {
-                    let sx = x + i as f32 * seg;
-                    let sy = if i % 2 == 0 { uy - 1. } else { uy + 1. };
-                    push_rect(&mut self.fg_rects, sx, sy, seg, 1., color);
-                }
-            }
-            Dotted => {
-                let dot = 2_f32;
-                let gap = 2_f32;
-                let mut sx = x;
-                while sx + dot <= x + cw {
-                    push_rect(&mut self.fg_rects, sx, uy, dot, 1., color);
-                    sx += dot + gap;
-                }
-            }
-            Dashed => {
-                let dash = (cw * 0.45).max(2.);
-                let gap = (cw * 0.1).max(1.);
-                let mut sx = x;
-                while sx + dash <= x + cw {
-                    push_rect(&mut self.fg_rects, sx, uy, dash, 1., color);
-                    sx += dash + gap;
-                }
-            }
-        }
+        emit_underline_rects(&mut self.fg_rects, x, y, cw, ch, style, color);
     }
 
     /// Render all `panes` into `view`.  `dividers` are solid rectangles
@@ -1653,5 +1664,150 @@ mod tests {
         let term = make_term(5, 3);
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 10, 5);
         assert!(ops.iter().all(|o| matches!(o, GlyphOp::Skip)));
+    }
+
+    // ── emit_underline_rects ──────────────────────────────────────────────────
+
+    const RED: [f32; 4] = [1., 0., 0., 1.];
+    const CW: f32 = 8.;
+    const CH: f32 = 16.;
+
+    fn underline_rects(style: crate::terminal::UnderlineStyle) -> Vec<RectInst> {
+        let mut v = Vec::new();
+        emit_underline_rects(&mut v, 0., 0., CW, CH, style, RED);
+        v
+    }
+
+    #[test]
+    fn underline_none_pushes_nothing() {
+        use crate::terminal::UnderlineStyle;
+        assert!(underline_rects(UnderlineStyle::None).is_empty());
+    }
+
+    #[test]
+    fn underline_straight_pushes_exactly_one_rect() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Straight);
+        assert_eq!(v.len(), 1, "straight must push exactly 1 rect");
+    }
+
+    #[test]
+    fn underline_straight_rect_at_cell_bottom() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Straight);
+        let expected_y = CH - 2.;
+        assert_eq!(v[0].pos[1], expected_y, "straight underline must be at y = ch - 2");
+        assert_eq!(v[0].sz[1], 1., "straight underline must be 1px tall");
+        assert_eq!(v[0].sz[0], CW, "straight underline must span full cell width");
+    }
+
+    #[test]
+    fn underline_straight_carries_color() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Straight);
+        assert_eq!(v[0].color, RED);
+    }
+
+    #[test]
+    fn underline_double_pushes_exactly_two_rects() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Double);
+        assert_eq!(v.len(), 2, "double underline must push exactly 2 rects");
+    }
+
+    #[test]
+    fn underline_double_lines_are_two_pixels_apart() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Double);
+        let y0 = v[0].pos[1];
+        let y1 = v[1].pos[1];
+        assert_eq!((y1 - y0).abs(), 2., "double underline lines must be 2px apart");
+    }
+
+    #[test]
+    fn underline_curly_pushes_multiple_rects() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Curly);
+        assert!(v.len() >= 2, "curly underline must push at least 2 rects, got {}", v.len());
+    }
+
+    #[test]
+    fn underline_curly_rects_span_full_width() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Curly);
+        let total_w: f32 = v.iter().map(|r| r.sz[0]).sum();
+        assert!(
+            (total_w - CW).abs() < 1.,
+            "curly rects total width {total_w} should equal cell width {CW}"
+        );
+    }
+
+    #[test]
+    fn underline_curly_alternates_y_position() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Curly);
+        if v.len() >= 2 {
+            assert_ne!(v[0].pos[1], v[1].pos[1], "adjacent curly segments must alternate y");
+        }
+    }
+
+    #[test]
+    fn underline_dotted_pushes_at_least_one_rect() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Dotted);
+        assert!(!v.is_empty(), "dotted underline must push at least 1 rect");
+    }
+
+    #[test]
+    fn underline_dotted_rects_all_at_same_y() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Dotted);
+        let y0 = v[0].pos[1];
+        for r in &v {
+            assert_eq!(r.pos[1], y0, "all dotted segments must be at same y");
+        }
+    }
+
+    #[test]
+    fn underline_dashed_pushes_at_least_one_rect() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Dashed);
+        assert!(!v.is_empty(), "dashed underline must push at least 1 rect");
+    }
+
+    #[test]
+    fn underline_dashed_rects_all_at_same_y() {
+        use crate::terminal::UnderlineStyle;
+        let v = underline_rects(UnderlineStyle::Dashed);
+        let y0 = v[0].pos[1];
+        for r in &v {
+            assert_eq!(r.pos[1], y0, "all dashed segments must be at same y");
+        }
+    }
+
+    #[test]
+    fn underline_dashed_segments_wider_than_dotted_segments() {
+        use crate::terminal::UnderlineStyle;
+        let dotted = underline_rects(UnderlineStyle::Dotted);
+        let dashed = underline_rects(UnderlineStyle::Dashed);
+        let dot_w = dotted[0].sz[0];
+        let dash_w = dashed[0].sz[0];
+        assert!(dash_w > dot_w, "dashed segments ({dash_w}px) must be wider than dotted ({dot_w}px)");
+    }
+
+    #[test]
+    fn underline_x_offset_is_respected() {
+        use crate::terminal::UnderlineStyle;
+        let mut v = Vec::new();
+        emit_underline_rects(&mut v, 50., 100., CW, CH, UnderlineStyle::Straight, RED);
+        assert_eq!(v[0].pos[0], 50., "underline x must follow the given x offset");
+    }
+
+    #[test]
+    fn underline_none_is_still_nothing_after_nonzero_x() {
+        use crate::terminal::UnderlineStyle;
+        let mut v = Vec::new();
+        emit_underline_rects(&mut v, 100., 200., CW, CH, UnderlineStyle::None, RED);
+        assert!(v.is_empty(), "None style must never push anything");
     }
 }

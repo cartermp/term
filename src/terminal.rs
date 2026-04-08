@@ -2877,6 +2877,279 @@ mod tests {
         assert_eq!(s.links[0], "https://a.com");
         assert_eq!(s.links[1], "https://b.com");
     }
+
+    // ── DECSCUSR comprehensive ────────────────────────────────────────────────
+
+    #[test]
+    fn decscusr_all_values_individually() {
+        for shape in 0u8..=6 {
+            let mut t = t(10, 5);
+            let seq = format!("\x1b[{} q", shape);
+            t.process(seq.as_bytes());
+            assert_eq!(t.state.cursor_shape, shape, "shape {shape} must be stored as-is");
+        }
+    }
+
+    #[test]
+    fn decscusr_last_write_wins() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[2 q");
+        t.process(b"\x1b[5 q");
+        assert_eq!(t.state.cursor_shape, 5, "last DECSCUSR write must win");
+    }
+
+    // ── DECSTR comprehensive ──────────────────────────────────────────────────
+
+    #[test]
+    fn decstr_preserves_cursor_position() {
+        let mut t = t(20, 10);
+        t.process(b"\x1b[5;8H"); // move to row 5, col 8 (1-based → row=4, col=7)
+        assert_eq!(t.state.cursor_row, 4);
+        assert_eq!(t.state.cursor_col, 7);
+        t.process(b"\x1b[!p");
+        assert_eq!(t.state.cursor_row, 4, "DECSTR must not change cursor row");
+        assert_eq!(t.state.cursor_col, 7, "DECSTR must not change cursor col");
+    }
+
+    #[test]
+    fn decstr_preserves_scrollback() {
+        let mut t = t(20, 5);
+        for i in 0..10 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        let sb_len = t.state.scrollback.len();
+        assert!(sb_len > 0, "scrollback must be non-empty before DECSTR");
+        t.process(b"\x1b[!p");
+        assert_eq!(t.state.scrollback.len(), sb_len, "DECSTR must not clear scrollback");
+    }
+
+    #[test]
+    fn decstr_resets_cursor_keys_app_mode() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[?1h"); // enable DECCKM
+        assert!(t.state.cursor_keys_app_mode);
+        t.process(b"\x1b[!p");
+        assert!(!t.state.cursor_keys_app_mode, "DECSTR must reset cursor key mode");
+    }
+
+    #[test]
+    fn decstr_resets_wrap_next_flag() {
+        // Fill a row to trigger wrap_next, then DECSTR should clear it.
+        let mut t = t(5, 5);
+        t.process(b"ABCDE"); // fills row 0, wrap_next=true on last char
+        assert!(t.state.wrap_next, "wrap_next should be set after filling a row");
+        t.process(b"\x1b[!p");
+        assert!(!t.state.wrap_next, "DECSTR must clear wrap_next");
+    }
+
+    #[test]
+    fn decstr_subsequent_print_uses_default_attrs() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[1;3;4:3m"); // bold, italic, curly underline
+        t.process(b"\x1b[!p");
+        t.process(b"X");
+        let cell = t.state.grid[0][0];
+        assert!(!cell.attrs.bold, "DECSTR must reset bold before next print");
+        assert!(!cell.attrs.italic, "DECSTR must reset italic before next print");
+        assert_eq!(cell.attrs.underline_style, UnderlineStyle::None,
+            "DECSTR must reset underline_style before next print");
+    }
+
+    // ── Focus tracking comprehensive ──────────────────────────────────────────
+
+    #[test]
+    fn focus_tracking_double_enable_is_idempotent() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?1004h");
+        t.process(b"\x1b[?1004h");
+        assert!(t.state.focus_tracking, "double-enable must still leave focus_tracking on");
+    }
+
+    #[test]
+    fn focus_tracking_double_disable_is_safe() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?1004l"); // disable when already off
+        assert!(!t.state.focus_tracking, "disable when already off must not panic");
+    }
+
+    #[test]
+    fn focus_tracking_enable_then_disable_then_enable() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?1004h");
+        t.process(b"\x1b[?1004l");
+        t.process(b"\x1b[?1004h");
+        assert!(t.state.focus_tracking, "re-enabling after disable must work");
+    }
+
+    // ── Synchronized output comprehensive ─────────────────────────────────────
+
+    #[test]
+    fn sync_output_double_enable_is_idempotent() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?2026h");
+        t.process(b"\x1b[?2026h");
+        assert!(t.state.sync_output);
+    }
+
+    #[test]
+    fn sync_output_content_is_processed_while_active() {
+        let mut t = t(20, 5);
+        t.process(b"\x1b[?2026h");
+        t.process(b"hello");
+        // Content must appear in the grid even though sync mode is active.
+        let row: String = t.state.grid[0][..5].iter().map(|c| c.c).collect();
+        assert_eq!(row, "hello", "characters must be placed during sync output");
+    }
+
+    #[test]
+    fn sync_output_off_after_clear() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?2026h");
+        assert!(t.state.sync_output);
+        t.process(b"\x1b[?2026l");
+        assert!(!t.state.sync_output, "sync_output must be false after ?2026l");
+    }
+
+    // ── SGR underline styles comprehensive ───────────────────────────────────
+
+    #[test]
+    fn underline_color_defaults_to_none() {
+        let s = TerminalState::new(80, 24);
+        assert_eq!(s.attrs.underline_color, None);
+    }
+
+    #[test]
+    fn sgr_4_does_not_clear_existing_underline_color() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:2:255:0:0m"); // set red underline color
+        t.process(b"\x1b[4m");             // set underline style
+        assert_eq!(t.state.attrs.underline_color, Some(Color::new(255, 0, 0)),
+            "SGR 4 must not clear existing underline color");
+    }
+
+    #[test]
+    fn sgr_58_legacy_truecolor_format() {
+        // 58;2;r;g;b — legacy form using semicolons, not sub-params
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58;2;100;150;200m");
+        assert_eq!(t.state.attrs.underline_color, Some(Color::new(100, 150, 200)));
+    }
+
+    #[test]
+    fn sgr_58_legacy_256_format() {
+        // 58;5;n — legacy form using semicolons
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58;5;196m");
+        assert_eq!(t.state.attrs.underline_color, Some(ansi_256_color(196)));
+    }
+
+    #[test]
+    fn cell_carries_underline_style_on_print() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4:3m"); // curly
+        t.process(b"A");
+        assert_eq!(t.state.grid[0][0].attrs.underline_style, UnderlineStyle::Curly,
+            "printed cell must carry the active underline style");
+    }
+
+    #[test]
+    fn cell_carries_underline_color_on_print() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:2:255:128:64m");
+        t.process(b"A");
+        assert_eq!(
+            t.state.grid[0][0].attrs.underline_color,
+            Some(Color::new(255, 128, 64)),
+            "printed cell must carry the active underline color"
+        );
+    }
+
+    #[test]
+    fn cell_after_underline_clear_has_no_underline() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4:3m");  // curly underline
+        t.process(b"\x1b[24m");   // clear underline
+        t.process(b"A");
+        assert_eq!(
+            t.state.grid[0][0].attrs.underline_style,
+            UnderlineStyle::None,
+            "cell must have no underline style after SGR 24"
+        );
+    }
+
+    #[test]
+    fn sgr_reset_clears_underline_style_and_color() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4:2m\x1b[58:2:1:2:3m"); // double + color
+        t.process(b"\x1b[0m");
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::None);
+        assert_eq!(t.state.attrs.underline_color, None);
+    }
+
+    // ── OSC 8 hyperlinks comprehensive ───────────────────────────────────────
+
+    #[test]
+    fn osc8_cells_after_link_close_have_no_link_id() {
+        let mut t = t(40, 5);
+        t.process(b"\x1b]8;;https://example.com\x07");
+        t.process(b"link");
+        t.process(b"\x1b]8;;\x07"); // close
+        t.process(b"plain text");
+        for col in 4..14 {
+            assert_eq!(t.state.grid[0][col].link_id, 0,
+                "col {col} after link close must have link_id 0");
+        }
+    }
+
+    #[test]
+    fn osc8_link_url_retrievable_from_table() {
+        let mut t = t(40, 5);
+        t.process(b"\x1b]8;;https://rust-lang.org\x07");
+        let id = t.state.current_link_id as usize;
+        assert!(id > 0);
+        assert_eq!(t.state.links[id - 1], "https://rust-lang.org");
+    }
+
+    #[test]
+    fn osc8_visual_cell_preserves_link_id() {
+        let mut t = t(40, 5);
+        t.process(b"\x1b]8;;https://example.com\x07");
+        t.process(b"AB");
+        t.process(b"\x1b]8;;\x07");
+        // visual_cell must return the same link_id as grid
+        assert_eq!(t.state.visual_cell(0, 0).link_id, 1);
+        assert_eq!(t.state.visual_cell(0, 1).link_id, 1);
+        assert_eq!(t.state.visual_cell(0, 2).link_id, 0);
+    }
+
+    #[test]
+    fn osc8_reopen_link_gives_new_id() {
+        let mut t = t(40, 5);
+        t.process(b"\x1b]8;;https://a.com\x07");
+        let id1 = t.state.current_link_id;
+        t.process(b"\x1b]8;;\x07"); // close
+        t.process(b"\x1b]8;;https://b.com\x07");
+        let id2 = t.state.current_link_id;
+        assert_ne!(id1, 0);
+        assert_ne!(id2, 0);
+        assert_ne!(id1, id2, "re-opened link must get a new ID");
+    }
+
+    #[test]
+    fn osc8_params_field_is_ignored_for_id_assignment() {
+        // OSC 8 allows optional params like id=foo before the URI
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"id=foo", b"https://example.com"], false);
+        assert_eq!(s.current_link_id, 1, "non-empty params field must not affect link id");
+        assert_eq!(s.links[0], "https://example.com");
+    }
+
+    #[test]
+    fn osc8_no_link_by_default() {
+        let s = TerminalState::new(80, 5);
+        assert_eq!(s.current_link_id, 0);
+        assert!(s.links.is_empty());
+    }
 }
 
 pub struct Terminal {
