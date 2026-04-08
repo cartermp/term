@@ -93,13 +93,14 @@ impl Pane {
     /// Return URL spans for the current view, using the cached result when
     /// the terminal generation and viewport dimensions haven't changed.
     fn urls_cached(&mut self, vis_rows: usize, vis_cols: usize) -> &[(usize, usize, usize, String)] {
-        let cur_gen = self.terminal.state.generation;
-        if self.url_cache_gen != cur_gen || self.url_cache_dims != (vis_rows, vis_cols) {
-            self.url_cache = find_urls(&self.terminal.state, vis_rows, vis_cols);
-            self.url_cache_gen = cur_gen;
-            self.url_cache_dims = (vis_rows, vis_cols);
-        }
-        &self.url_cache
+        urls_with_cache(
+            &mut self.url_cache,
+            &mut self.url_cache_gen,
+            &mut self.url_cache_dims,
+            &self.terminal.state,
+            vis_rows,
+            vis_cols,
+        )
     }
     fn write(&mut self, data: &[u8]) {
         let _ = self.pty_writer.write_all(data);
@@ -156,6 +157,28 @@ fn physical_key_to_ascii(kc: KeyCode) -> Option<u8> {
         KeyCode::Slash => Some(b'/'),
         _ => None,
     }
+}
+
+/// Core URL-cache logic extracted as a free function for testability.
+///
+/// Checks whether `cache_gen`/`cache_dims` match the current terminal
+/// generation and viewport size.  On a miss the cache is repopulated via
+/// `find_urls`; on a hit it is returned as-is.
+fn urls_with_cache<'a>(
+    cache: &'a mut Vec<(usize, usize, usize, String)>,
+    cache_gen: &mut u64,
+    cache_dims: &mut (usize, usize),
+    state: &terminal::TerminalState,
+    vis_rows: usize,
+    vis_cols: usize,
+) -> &'a [(usize, usize, usize, String)] {
+    let cur_gen = state.generation;
+    if *cache_gen != cur_gen || *cache_dims != (vis_rows, vis_cols) {
+        *cache = find_urls(state, vis_rows, vis_cols);
+        *cache_gen = cur_gen;
+        *cache_dims = (vis_rows, vis_cols);
+    }
+    cache
 }
 
 fn find_urls(
@@ -1941,8 +1964,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, find_urls, sh_sq_escape};
-    use crate::terminal::TerminalState;
+    use super::{base64_encode, find_urls, sh_sq_escape, urls_with_cache};
+    use crate::terminal::{Terminal, TerminalState};
 
     /// Write `text` into row 0 of a freshly-created state.
     fn make_state(text: &str) -> TerminalState {
@@ -2161,5 +2184,138 @@ mod tests {
     #[test]
     fn sh_sq_escape_only_quote_becomes_escaped() {
         assert_eq!(sh_sq_escape("'"), "'\\''");
+    }
+
+    // ── URL cache (urls_with_cache) ───────────────────────────────────────────
+
+    fn make_state_with_url(url: &str) -> TerminalState {
+        let cols = url.len() + 4;
+        let mut s = TerminalState::new(cols, 5);
+        for (i, c) in url.chars().enumerate() {
+            s.grid[0][i].c = c;
+        }
+        s
+    }
+
+    #[test]
+    fn url_cache_populated_on_first_call() {
+        let mut state = make_state_with_url("https://example.com");
+        state.generation = 1;
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX; // sentinel — forces initial miss
+        let mut cache_dims = (0usize, 0usize);
+        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].3, "https://example.com");
+        assert_eq!(cache_gen, 1);
+        assert_eq!(cache_dims, (1, 30));
+    }
+
+    #[test]
+    fn url_cache_hit_returns_same_result_without_rescan() {
+        let mut state = make_state_with_url("https://example.com");
+        state.generation = 5;
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_dims = (0, 0);
+        // First call — populates cache.
+        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        // Corrupt the state grid so a fresh scan would return nothing.
+        for cell in &mut state.grid[0] { cell.c = ' '; }
+        // Second call with same generation + dims — must return cached value.
+        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        assert_eq!(result.len(), 1, "cache hit must return previously scanned URL");
+    }
+
+    #[test]
+    fn url_cache_miss_on_generation_change() {
+        let mut state = make_state_with_url("https://example.com");
+        state.generation = 1;
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_dims = (0, 0);
+        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        assert_eq!(cache.len(), 1);
+        // Bump generation and clear the grid — rescan should return empty.
+        state.generation = 2;
+        for cell in &mut state.grid[0] { cell.c = ' '; }
+        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        assert_eq!(result.len(), 0, "stale generation must trigger rescan");
+        assert_eq!(cache_gen, 2);
+    }
+
+    #[test]
+    fn url_cache_miss_on_vis_rows_change() {
+        let mut state = make_state_with_url("https://example.com");
+        state.generation = 1;
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_dims = (0, 0);
+        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        // Same generation, different vis_rows — must rescan.
+        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 2, 30);
+        assert_eq!(cache_dims, (2, 30), "dims must update after miss");
+        let _ = result; // result correctness verified elsewhere
+    }
+
+    #[test]
+    fn url_cache_miss_on_vis_cols_change() {
+        let mut state = make_state_with_url("https://example.com");
+        state.generation = 1;
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_dims = (0, 0);
+        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 40);
+        assert_eq!(cache_dims, (1, 40));
+    }
+
+    #[test]
+    fn url_cache_sentinel_u64_max_always_misses_on_zero_generation() {
+        // Terminal starts with generation 0; sentinel is u64::MAX — always a miss.
+        let state = make_state_with_url("https://initial.com");
+        // state.generation == 0 (default)
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_dims = (0, 0);
+        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        assert_eq!(cache_gen, 0, "sentinel must be replaced after first call");
+        let _ = result;
+    }
+
+    // ── URL scheme guard ─────────────────────────────────────────────────────
+
+    #[test]
+    fn find_urls_never_returns_file_scheme() {
+        // file:// must not be detectable — it isn't in the HTTP prefix list.
+        let url = "file:///etc/passwd";
+        let cols = url.len() + 2;
+        let mut s = TerminalState::new(cols, 1);
+        for (i, c) in url.chars().enumerate() { s.grid[0][i].c = c; }
+        let urls: Vec<_> = find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect();
+        assert!(urls.is_empty(), "file:// must not be detected as a URL: {urls:?}");
+    }
+
+    #[test]
+    fn find_urls_never_returns_custom_scheme() {
+        for scheme in &["ftp://", "javascript:", "data:", "x-custom://"] {
+            let url = format!("{scheme}evil");
+            let cols = url.len() + 2;
+            let mut s = TerminalState::new(cols, 1);
+            for (i, c) in url.chars().enumerate() { s.grid[0][i].c = c; }
+            let urls: Vec<_> = find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect();
+            assert!(urls.is_empty(), "scheme '{scheme}' must not be detected: {urls:?}");
+        }
+    }
+
+    #[test]
+    fn find_urls_detects_http_and_https_only() {
+        let mut s = TerminalState::new(80, 1);
+        let line = "http://a.com https://b.com ftp://c.com";
+        for (i, c) in line.chars().enumerate() { s.grid[0][i].c = c; }
+        let urls: Vec<_> = find_urls(&s, 1, 80).into_iter().map(|(_, _, _, u)| u).collect();
+        assert_eq!(urls.len(), 2, "only http and https should be detected");
+        assert!(urls[0].starts_with("http://"));
+        assert!(urls[1].starts_with("https://"));
     }
 }

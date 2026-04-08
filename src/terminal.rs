@@ -2439,6 +2439,67 @@ mod tests {
         t.process(b"\x1b[3J");
         assert!(t.state.scrollback.is_empty(), "ED 3 (CSI 3 J) must clear scrollback");
     }
+
+    // ── OSC 9001 boundary tests ───────────────────────────────────────────────
+
+    #[test]
+    fn osc_9001_exactly_at_limit_is_accepted() {
+        // A payload of exactly 64 KiB should be stored without truncation.
+        let mut s = TerminalState::new(80, 24);
+        let payload = vec![b'a'; 64 * 1024];
+        s.osc_dispatch(&[b"9001", &payload], false);
+        assert_eq!(s.input_buffer.len(), 64 * 1024, "64 KiB payload must be accepted");
+    }
+
+    #[test]
+    fn osc_9001_one_byte_over_limit_is_rejected() {
+        let mut s = TerminalState::new(80, 24);
+        s.osc_dispatch(&[b"9001", b"seed\x1c0"], false);
+        assert_eq!(s.input_buffer, "seed");
+        let over = vec![b'b'; 64 * 1024 + 1];
+        s.osc_dispatch(&[b"9001", &over], false);
+        assert_eq!(s.input_buffer, "seed", "one byte over 64 KiB must be rejected");
+    }
+
+    // ── generation counter ───────────────────────────────────────────────────
+
+    #[test]
+    fn generation_starts_at_zero() {
+        let t = Terminal::new(80, 24);
+        assert_eq!(t.state.generation, 0);
+    }
+
+    #[test]
+    fn generation_increments_after_process() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"a");
+        assert_eq!(t.state.generation, 1);
+    }
+
+    #[test]
+    fn generation_increments_per_process_call() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"a");
+        t.process(b"b");
+        t.process(b"c");
+        assert_eq!(t.state.generation, 3);
+    }
+
+    #[test]
+    fn generation_empty_process_still_increments() {
+        // Even a zero-byte slice counts as one process() call.
+        let mut t = Terminal::new(80, 24);
+        t.process(b"");
+        assert_eq!(t.state.generation, 1);
+    }
+
+    #[test]
+    fn generation_wraps_without_panic() {
+        let mut t = Terminal::new(80, 24);
+        t.state.generation = u64::MAX;
+        t.process(b"x");
+        assert_eq!(t.state.generation, 0, "generation must wrap via wrapping_add");
+    }
 }
 
 pub struct Terminal {
