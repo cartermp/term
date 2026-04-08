@@ -115,6 +115,14 @@ pub struct TerminalState {
     pub cursor_shape: u8,
     /// Whether focus-in/out events are enabled (?1004h).
     pub focus_tracking: bool,
+    /// Whether any mouse tracking mode is active (?1000h/?1002h/?1003h).
+    /// When true, scroll wheel events are sent as mouse escape sequences instead
+    /// of being handled locally by the terminal.
+    pub mouse_tracking: bool,
+    /// Whether SGR mouse encoding is active (?1006h).
+    /// SGR format: `\x1b[<btn;col;rowM/m`  — supports >223 cols/rows.
+    /// When false, the legacy X10 format is used instead.
+    pub mouse_sgr: bool,
     /// Whether synchronized-output mode is active (?2026h). When true,
     /// redraws are suppressed until the mode is cleared.
     pub sync_output: bool,
@@ -177,6 +185,8 @@ impl TerminalState {
             cursor_keys_app_mode: false,
             cursor_shape: 0,
             focus_tracking: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
             sync_output: false,
             links: Vec::new(),
             current_link_id: 0,
@@ -786,7 +796,9 @@ impl Perform for TerminalState {
                 for &param in &p {
                     match param {
                         1 => self.cursor_keys_app_mode = true,
+                        1000 | 1002 | 1003 => self.mouse_tracking = true,
                         1004 => self.focus_tracking = true,
+                        1006 => self.mouse_sgr = true,
                         47 | 1047 => self.enter_alt_screen(false),
                         1049 => self.enter_alt_screen(true),
                         2004 => self.bracketed_paste = true,
@@ -799,7 +811,9 @@ impl Perform for TerminalState {
                 for &param in &p {
                     match param {
                         1 => self.cursor_keys_app_mode = false,
+                        1000 | 1002 | 1003 => self.mouse_tracking = false,
                         1004 => self.focus_tracking = false,
+                        1006 => self.mouse_sgr = false,
                         47 | 1047 => self.leave_alt_screen(false),
                         1049 => self.leave_alt_screen(true),
                         2004 => self.bracketed_paste = false,
@@ -931,6 +945,8 @@ impl TerminalState {
         self.scroll_bottom = self.rows.saturating_sub(1);
         self.cursor_keys_app_mode = false;
         self.cursor_shape = 0;
+        self.mouse_tracking = false;
+        self.mouse_sgr = false;
         self.wrap_next = false;
     }
 }
@@ -3149,6 +3165,101 @@ mod tests {
         let s = TerminalState::new(80, 5);
         assert_eq!(s.current_link_id, 0);
         assert!(s.links.is_empty());
+    }
+
+    // ── Mouse tracking ────────────────────────────────────────────────────────
+
+    #[test]
+    fn mouse_tracking_off_by_default() {
+        let s = TerminalState::new(80, 24);
+        assert!(!s.mouse_tracking);
+        assert!(!s.mouse_sgr);
+    }
+
+    #[test]
+    fn mouse_tracking_enabled_by_1000h() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000h");
+        assert!(t.state.mouse_tracking);
+    }
+
+    #[test]
+    fn mouse_tracking_enabled_by_1002h() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1002h");
+        assert!(t.state.mouse_tracking);
+    }
+
+    #[test]
+    fn mouse_tracking_enabled_by_1003h() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1003h");
+        assert!(t.state.mouse_tracking);
+    }
+
+    #[test]
+    fn mouse_tracking_disabled_by_1000l() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000h");
+        assert!(t.state.mouse_tracking);
+        t.process(b"\x1b[?1000l");
+        assert!(!t.state.mouse_tracking);
+    }
+
+    #[test]
+    fn mouse_sgr_enabled_by_1006h() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1006h");
+        assert!(t.state.mouse_sgr);
+    }
+
+    #[test]
+    fn mouse_sgr_disabled_by_1006l() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1006h");
+        t.process(b"\x1b[?1006l");
+        assert!(!t.state.mouse_sgr);
+    }
+
+    #[test]
+    fn mouse_tracking_and_sgr_enabled_together() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(t.state.mouse_tracking);
+        assert!(t.state.mouse_sgr);
+    }
+
+    #[test]
+    fn mouse_tracking_does_not_affect_cursor_keys() {
+        // ?1000h must not change cursor_keys_app_mode
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.state.cursor_keys_app_mode);
+        t.process(b"\x1b[?1000h");
+        assert!(!t.state.cursor_keys_app_mode);
+    }
+
+    #[test]
+    fn mouse_tracking_reset_by_soft_reset() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000h\x1b[?1006h");
+        t.state.reset_soft();
+        assert!(!t.state.mouse_tracking);
+        assert!(!t.state.mouse_sgr);
+    }
+
+    #[test]
+    fn mouse_tracking_double_enable_is_idempotent() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000h");
+        t.process(b"\x1b[?1000h");
+        assert!(t.state.mouse_tracking);
+    }
+
+    #[test]
+    fn mouse_tracking_disable_without_enable_is_safe() {
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[?1000l");
+        assert!(!t.state.mouse_tracking);
     }
 }
 

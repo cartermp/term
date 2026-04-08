@@ -1599,7 +1599,11 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(tw) = self.windows.get_mut(&window_id) {
                     let state = &tw.panes[tw.active_pane].terminal.state;
-                    let app_scroll = state.is_alt_screen() || state.cursor_keys_app_mode;
+                    // Forward scroll as arrow keys only in alt-screen mode (vim, htop, etc.),
+                    // unless mouse tracking is active — then the app receives raw mouse events.
+                    let mouse_tracking = state.mouse_tracking;
+                    let mouse_sgr = state.mouse_sgr;
+                    let app_scroll = state.is_alt_screen() && !mouse_tracking;
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => {
                             tw.scroll_frac = 0.0;
@@ -1614,8 +1618,35 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     };
                     if lines != 0 {
-                        if app_scroll {
-                            // Forward scroll to the PTY as arrow key presses
+                        if mouse_tracking {
+                            // Send mouse scroll events to the PTY so the app can handle them
+                            // in context (e.g. scroll a specific pane / list, not the history).
+                            // Button 64 = scroll up, 65 = scroll down (X10/SGR encoding).
+                            let (mx, my) = tw.cursor_pos;
+                            if let Some((_pi, row, col)) = tw.pixel_to_pane_cell(mx, my) {
+                                let count = lines.unsigned_abs();
+                                // Positive lines = scroll up (content moves up = wheel up).
+                                let button = if lines > 0 { 64u32 } else { 65u32 };
+                                let col1 = col + 1;
+                                let row1 = row + 1;
+                                if mouse_sgr {
+                                    let seq = format!("\x1b[<{button};{col1};{row1}M");
+                                    for _ in 0..count {
+                                        tw.panes[tw.active_pane].write(seq.as_bytes());
+                                    }
+                                } else {
+                                    // X10 format: ESC [ M Cb Cx Cy (capped at char 255)
+                                    let cb = (32 + button).min(255) as u8;
+                                    let cx = (32 + col1).min(255) as u8;
+                                    let cy = (32 + row1).min(255) as u8;
+                                    let seq = [0x1b, b'[', b'M', cb, cx, cy];
+                                    for _ in 0..count {
+                                        tw.panes[tw.active_pane].write(&seq);
+                                    }
+                                }
+                            }
+                        } else if app_scroll {
+                            // Alt screen without mouse tracking: forward as arrow keys (vim, htop).
                             let seq = if lines > 0 { b"\x1bOA".as_ref() } else { b"\x1bOB".as_ref() };
                             for _ in 0..lines.unsigned_abs() {
                                 tw.panes[tw.active_pane].write(seq);
