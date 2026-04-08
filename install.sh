@@ -7,6 +7,10 @@ APP_NAME="Term"
 APP_BUNDLE="/Applications/$APP_NAME.app"
 BIN_DIR="$REPO_DIR/target/release"
 
+# Clean up the iconset temp dir on exit (success or failure).
+_ICONSET_TMP=""
+trap '[[ -n "$_ICONSET_TMP" ]] && rm -rf "$_ICONSET_TMP"' EXIT
+
 echo "→ Building (release)…"
 cd "$REPO_DIR"
 cargo build --release
@@ -27,6 +31,7 @@ ICON_ICNS="$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 if [ -f "$ICON_SVG" ]; then
   echo "→ Generating AppIcon.icns from assets/icon.svg"
   ICONSET=$(mktemp -d)
+  _ICONSET_TMP="$ICONSET"
   ICONSET_DIR="$ICONSET/AppIcon.iconset"
   mkdir -p "$ICONSET_DIR"
 

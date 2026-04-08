@@ -384,6 +384,13 @@ pub struct Renderer {
     glyph_buf: wgpu::Buffer,
     glyph_buf_cap: usize,
 
+    // Per-frame CPU-side instance staging buffers; cleared at the start of
+    // each render() call instead of being allocated fresh every frame.
+    bg_rects: Vec<RectInst>,
+    block_rects: Vec<RectInst>,
+    glyphs: Vec<GlyphInst>,
+    fg_rects: Vec<RectInst>,
+
     font: fontdue::Font,
     /// HarfBuzz-compatible shaper for OpenType ligature / calt substitution.
     rb_face: rustybuzz::Face<'static>,
@@ -566,6 +573,10 @@ impl Renderer {
             rect_buf_cap: init_rect,
             glyph_buf,
             glyph_buf_cap: init_glyph,
+            bg_rects: Vec::with_capacity(4096),
+            block_rects: Vec::with_capacity(256),
+            glyphs: Vec::with_capacity(4096),
+            fg_rects: Vec::with_capacity(256),
             font,
             rb_face,
             cell_width,
@@ -744,14 +755,13 @@ impl Renderer {
 
     fn emit_glyph_id(
         &mut self,
-        glyphs: &mut Vec<GlyphInst>,
         id: u16,
         px: f32,
         py: f32,
         fg: [f32; 4],
     ) {
         if let Some(e) = self.ensure_glyph_id(id) {
-            glyphs.push(GlyphInst {
+            self.glyphs.push(GlyphInst {
                 pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
                 sz: [e.w as f32, e.h as f32],
                 uv_pos: [e.uv_x, e.uv_y],
@@ -763,14 +773,13 @@ impl Renderer {
 
     fn emit_char(
         &mut self,
-        glyphs: &mut Vec<GlyphInst>,
         c: char,
         px: f32,
         py: f32,
         fg: [f32; 4],
     ) {
         let id = self.font.lookup_glyph_index(c);
-        self.emit_glyph_id(glyphs, id, px, py, fg);
+        self.emit_glyph_id(id, px, py, fg);
     }
 
     // ── Ligature shaping ──────────────────────────────────────────────────────
@@ -795,7 +804,7 @@ impl Renderer {
     /// Decompose a Unicode block/Braille char into colored fill rects.
     /// Returns false if `c` is not a handled block character.
     fn push_block_char(
-        block_rects: &mut Vec<RectInst>,
+        &mut self,
         px: f32,
         py: f32,
         cw: f32,
@@ -811,7 +820,7 @@ impl Renderer {
                 let x1 = ($x1 as f32).min(cw);
                 let y1 = ($y1 as f32).min(ch);
                 if x1 > x0 && y1 > y0 {
-                    block_rects.push(RectInst {
+                    self.block_rects.push(RectInst {
                         pos: [px + x0, py + y0],
                         sz: [x1 - x0, y1 - y0],
                         color: fg,
@@ -944,10 +953,10 @@ impl Renderer {
         let res: [f32; 4] = [bw, bh, 0., 0.];
         self.queue.write_buffer(&self.uni_buf, 0, bytemuck::cast_slice(&res));
 
-        let mut bg_rects: Vec<RectInst>    = Vec::with_capacity(4096);
-        let mut block_rects: Vec<RectInst> = Vec::new();
-        let mut glyphs: Vec<GlyphInst>     = Vec::with_capacity(4096);
-        let mut fg_rects: Vec<RectInst>    = Vec::new();
+        self.bg_rects.clear();
+        self.block_rects.clear();
+        self.glyphs.clear();
+        self.fg_rects.clear();
 
         let sel_bg = c2fa(Color::new(0x26, 0x4a, 0x7a), 1.0);
 
@@ -997,7 +1006,7 @@ impl Renderer {
                         let a = if bg_color == DEFAULT_BG { BG_ALPHA as f32 / 255. } else { 1. };
                         c2fa(bg_color, a)
                     };
-                    push_rect(&mut bg_rects, px, py, cw, ch, bg);
+                    push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
 
                     let fg = c2f(fg_color);
                     let c = cell.c;
@@ -1007,15 +1016,15 @@ impl Renderer {
                             // Block chars can't participate in ligatures; skip
                             // the GlyphOp::Skip guard above — we always render.
                             if c != ' ' && c != '\0' {
-                                Self::push_block_char(&mut block_rects, px, py, cw, ch, c, fg);
+                                self.push_block_char(px, py, cw, ch, c, fg);
                             }
                         }
                         GlyphOp::Glyph(glyph_id) => {
-                            self.emit_glyph_id(&mut glyphs, glyph_id, px, py, fg);
+                            self.emit_glyph_id(glyph_id, px, py, fg);
                             // Combining chars overlay at the same cell origin.
                             for &combining in cell.combining_chars() {
                                 let comb_id = self.font.lookup_glyph_index(combining);
-                                self.emit_glyph_id(&mut glyphs, comb_id, px, py, fg);
+                                self.emit_glyph_id(comb_id, px, py, fg);
                             }
                         }
                     }
@@ -1030,7 +1039,7 @@ impl Renderer {
                     let uy = oy + row as f32 * ch + ch - 2.;
                     let x0 = ox + c0 as f32 * cw;
                     let x1 = ox + c1.min(vis_cols) as f32 * cw;
-                    push_rect(&mut fg_rects, x0, uy, x1 - x0, 2., u_col);
+                    push_rect(&mut self.fg_rects, x0, uy, x1 - x0, 2., u_col);
                 }
             }
 
@@ -1041,7 +1050,7 @@ impl Renderer {
                     for (i, c) in g.chars().enumerate() {
                         let col = pane.state.cursor_col + i;
                         if col >= vis_cols { break; }
-                        self.emit_char(&mut glyphs, c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
+                        self.emit_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
                     }
                 }
             }
@@ -1054,7 +1063,7 @@ impl Renderer {
             {
                 let px = ox + pane.state.cursor_col as f32 * cw;
                 let py = oy + pane.state.cursor_row as f32 * ch;
-                push_rect(&mut fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+                push_rect(&mut self.fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
             }
 
             // ── Scrollbar ─────────────────────────────────────────────────────────
@@ -1072,49 +1081,49 @@ impl Renderer {
                 } else {
                     rgb_f(0x44, 0x44, 0x44)
                 };
-                push_rect(&mut fg_rects, bar_x, oy, 2., pane.height, track);
-                push_rect(&mut fg_rects, bar_x, thumb_y, 2., thumb_h as f32, thumb);
+                push_rect(&mut self.fg_rects, bar_x, oy, 2., pane.height, track);
+                push_rect(&mut self.fg_rects, bar_x, thumb_y, 2., thumb_h as f32, thumb);
             }
         }
 
         // ── Split dividers ────────────────────────────────────────────────────────
         let div_col = rgb_f(0x3a, 0x3a, 0x3a);
         for &(x, y, w, h) in dividers {
-            push_rect(&mut fg_rects, x, y, w, h, div_col);
+            push_rect(&mut self.fg_rects, x, y, w, h, div_col);
         }
 
         // ── Upload ────────────────────────────────────────────────────────────────
-        let bg_count    = bg_rects.len();
-        let block_count = block_rects.len();
-        let fg_count    = fg_rects.len();
+        let bg_count    = self.bg_rects.len();
+        let block_count = self.block_rects.len();
+        let fg_count    = self.fg_rects.len();
         let total_rects = bg_count + block_count + fg_count;
 
         self.ensure_rect_buf(total_rects.max(1));
-        let glyph_count = glyphs.len();
+        let glyph_count = self.glyphs.len();
         self.ensure_glyph_buf(glyph_count.max(1));
 
         let ri_size = std::mem::size_of::<RectInst>();
         let gi_size = std::mem::size_of::<GlyphInst>();
 
-        if !bg_rects.is_empty() {
-            self.queue.write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&bg_rects));
+        if !self.bg_rects.is_empty() {
+            self.queue.write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&self.bg_rects));
         }
-        if !block_rects.is_empty() {
+        if !self.block_rects.is_empty() {
             self.queue.write_buffer(
                 &self.rect_buf,
                 (bg_count * ri_size) as u64,
-                bytemuck::cast_slice(&block_rects),
+                bytemuck::cast_slice(&self.block_rects),
             );
         }
-        if !fg_rects.is_empty() {
+        if !self.fg_rects.is_empty() {
             self.queue.write_buffer(
                 &self.rect_buf,
                 ((bg_count + block_count) * ri_size) as u64,
-                bytemuck::cast_slice(&fg_rects),
+                bytemuck::cast_slice(&self.fg_rects),
             );
         }
-        if !glyphs.is_empty() {
-            self.queue.write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&glyphs));
+        if !self.glyphs.is_empty() {
+            self.queue.write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&self.glyphs));
         }
 
         // ── Render pass ───────────────────────────────────────────────────────────

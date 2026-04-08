@@ -55,7 +55,11 @@ echo "→ Tagging $VERSION"
 git tag "$VERSION" "$(git rev-parse main)"
 
 echo "→ Pushing tag to origin"
-git push origin "$VERSION"
+if ! git push origin "$VERSION"; then
+  git tag -d "$VERSION"
+  echo "error: push failed — local tag $VERSION deleted" >&2
+  exit 1
+fi
 
 echo ""
 echo "✓ Release $VERSION is building:"

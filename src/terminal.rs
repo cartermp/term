@@ -746,11 +746,16 @@ impl Perform for TerminalState {
                 // Shell integration: ZLE hook sends current buffer + cursor.
                 // Format: OSC 9001 ; <buffer_with_semicolons_rejoined> \x1c <cursor> ST
                 // (vte splits on ";", so we rejoin params[1..] with ";")
+                const OSC_9001_MAX: usize = 64 * 1024;
                 let content = params[1..]
                     .iter()
                     .filter_map(|p| std::str::from_utf8(p).ok())
                     .collect::<Vec<_>>()
                     .join(";");
+                // Guard against maliciously large OSC 9001 payloads (DoS).
+                if content.len() > OSC_9001_MAX {
+                    return;
+                }
                 // \x1c (ASCII 28, FS) separates buffer from cursor position
                 if let Some(sep) = content.find('\x1c') {
                     self.input_buffer = content[..sep].to_string();
@@ -1600,6 +1605,18 @@ mod tests {
         s.osc_dispatch(&[b"9001", b"hello\x1c5"], false);
         assert_eq!(s.input_buffer, "hello");
         assert_eq!(s.input_cursor, 5);
+    }
+
+    #[test]
+    fn osc_9001_oversized_payload_is_ignored() {
+        let mut s = TerminalState::new(80, 24);
+        // Seed a known value first.
+        s.osc_dispatch(&[b"9001", b"prior\x1c0"], false);
+        assert_eq!(s.input_buffer, "prior");
+        // Send a payload larger than 64 KiB — input_buffer must be unchanged.
+        let huge = vec![b'x'; 65 * 1024];
+        s.osc_dispatch(&[b"9001", &huge], false);
+        assert_eq!(s.input_buffer, "prior", "oversized OSC 9001 must not overwrite input_buffer");
     }
 
     // ── Device status report ──────────────────────────────────────────────────

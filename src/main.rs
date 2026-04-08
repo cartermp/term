@@ -270,15 +270,18 @@ impl TerminalWindow {
     }
 
     fn active(&self) -> &Pane {
-        &self.panes[self.active_pane]
+        let idx = self.active_pane.min(self.panes.len().saturating_sub(1));
+        &self.panes[idx]
     }
 
     fn active_mut(&mut self) -> &mut Pane {
-        &mut self.panes[self.active_pane]
+        let idx = self.active_pane.min(self.panes.len().saturating_sub(1));
+        &mut self.panes[idx]
     }
 
     fn pty_write(&mut self, data: &[u8]) {
-        self.panes[self.active_pane].write(data);
+        let idx = self.active_pane.min(self.panes.len().saturating_sub(1));
+        self.panes[idx].write(data);
     }
 
     fn reset_blink(&mut self) {
@@ -1467,7 +1470,11 @@ impl ApplicationHandler<AppEvent> for App {
                                 .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                                 .map(|(_, _, _, u)| u);
                             if let Some(u) = url {
-                                let _ = std::process::Command::new("open").arg(&u).spawn();
+                                // Only open http/https URLs — defence in depth against
+                                // file:// or custom-scheme injection via terminal output.
+                                if u.starts_with("http://") || u.starts_with("https://") {
+                                    let _ = std::process::Command::new("open").arg(&u).spawn();
+                                }
                                 true
                             } else {
                                 false
@@ -1769,11 +1776,19 @@ fn paste_from_clipboard() -> String {
 
 // ── Shell environment setup ───────────────────────────────────────────────────
 
+/// POSIX single-quote escape a string for safe embedding between `'...'` in shell.
+/// Every `'` in the value becomes `'\''` (end quote, escaped quote, reopen quote).
+fn sh_sq_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 fn setup_shell_env(cmd: &mut CommandBuilder) {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return,
     };
+    // Escape for safe embedding in POSIX single-quoted shell strings.
+    let home = sh_sq_escape(&home);
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -1804,21 +1819,21 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
     let cat_fn = match &tcat {
         Some(p) => format!(
             "_TCAT='{}'\nfunction cat() {{\n  if [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
-            p.display()
+            sh_sq_escape(&p.display().to_string())
         ),
         None => String::new(),
     };
     let diff_fn = match &tdiff {
         Some(p) => format!(
             "export GIT_PAGER='{}'\nexport GIT_COLOR_UI=never\n",
-            p.display()
+            sh_sq_escape(&p.display().to_string())
         ),
         None => String::new(),
     };
     let json_fn = match &tjson {
         Some(p) => format!(
             "_TJSON='{}'\nfunction json() {{ \"$_TJSON\" \"$@\"; }}\n",
-            p.display()
+            sh_sq_escape(&p.display().to_string())
         ),
         None => String::new(),
     };
@@ -1893,7 +1908,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, find_urls};
+    use super::{base64_encode, find_urls, sh_sq_escape};
     use crate::terminal::TerminalState;
 
     /// Write `text` into row 0 of a freshly-created state.
@@ -2085,5 +2100,33 @@ mod tests {
         // 1-byte input → 2 output chars + "=="
         let enc = base64_encode(b"a");
         assert!(enc.ends_with("=="), "got: {enc}");
+    }
+
+    // ── sh_sq_escape ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sh_sq_escape_plain_path_unchanged() {
+        assert_eq!(sh_sq_escape("/Users/alice/.zshrc"), "/Users/alice/.zshrc");
+    }
+
+    #[test]
+    fn sh_sq_escape_quote_in_path_becomes_posix_escaped() {
+        // O'Brien → O'\''Brien  (end-quote, backslash-quote, reopen-quote)
+        assert_eq!(sh_sq_escape("O'Brien"), "O'\\''Brien");
+    }
+
+    #[test]
+    fn sh_sq_escape_multiple_quotes() {
+        assert_eq!(sh_sq_escape("it's a 'test'"), "it'\\''s a '\\''test'\\''");
+    }
+
+    #[test]
+    fn sh_sq_escape_empty_string_unchanged() {
+        assert_eq!(sh_sq_escape(""), "");
+    }
+
+    #[test]
+    fn sh_sq_escape_only_quote_becomes_escaped() {
+        assert_eq!(sh_sq_escape("'"), "'\\''");
     }
 }
