@@ -1347,8 +1347,17 @@ impl ApplicationHandler<AppEvent> for App {
 
             // Re-sync all tab numbers when a window gains focus — this fires
             // after a drag-reorder because macOS activates the moved tab.
-            WindowEvent::Focused(true) => {
-                self.sync_all_titles();
+            WindowEvent::Focused(focused) => {
+                if focused {
+                    self.sync_all_titles();
+                }
+                // Send focus-in / focus-out to the active pane if ?1004h is on.
+                if let Some(tw) = self.windows.get_mut(&window_id) {
+                    let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                    if tw.active().terminal.state.focus_tracking {
+                        tw.active_mut().write(seq);
+                    }
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -1514,17 +1523,29 @@ impl ApplicationHandler<AppEvent> for App {
                     let (mx, my) = tw.cursor_pos;
                     let sup = tw.modifiers.super_key();
 
-                    // Cmd+click: open URL
+                    // Cmd+click: open URL or OSC 8 link
                     let opened = if sup {
                         if let Some((pi, row, col)) = tw.pixel_to_pane_cell(mx, my) {
                             let rects = tw.pane_rects();
                             let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
                             let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
                             let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
-                            let url = tw.panes[pi].urls_cached(vis_rows, vis_cols)
-                                .iter()
-                                .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
-                                .map(|(_, _, _, u)| u.clone());
+                            // Check OSC 8 link first (higher priority than raw URL detection).
+                            let osc8_url = {
+                                let cell = tw.panes[pi].terminal.state.visual_cell(row, col);
+                                if cell.link_id != 0 {
+                                    let idx = (cell.link_id as usize).saturating_sub(1);
+                                    tw.panes[pi].terminal.state.links.get(idx).cloned()
+                                } else {
+                                    None
+                                }
+                            };
+                            let url = osc8_url.or_else(|| {
+                                tw.panes[pi].urls_cached(vis_rows, vis_cols)
+                                    .iter()
+                                    .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+                                    .map(|(_, _, _, u)| u.clone())
+                            });
                             if let Some(u) = url {
                                 // Only open http/https URLs — defence in depth against
                                 // file:// or custom-scheme injection via terminal output.
@@ -1675,7 +1696,13 @@ impl ApplicationHandler<AppEvent> for App {
                     if !pane.terminal.state.is_scrolled_back() {
                         pane.terminal.state.snap_to_bottom();
                     }
+                    let sync_before = pane.terminal.state.sync_output;
                     pane.terminal.process(&data);
+                    let sync_after = pane.terminal.state.sync_output;
+                    // If ?2026l just cleared sync mode, force a redraw now.
+                    if sync_before && !sync_after {
+                        tw.window.request_redraw();
+                    }
                     let responses: Vec<Vec<u8>> =
                         pane.terminal.state.pending_responses.drain(..).collect();
                     for r in responses {
@@ -1696,7 +1723,17 @@ impl ApplicationHandler<AppEvent> for App {
                     tw.sync_title();
                 }
                 tw.reset_blink();
-                tw.window.request_redraw();
+                // Only redraw immediately if synchronized-output mode is off.
+                // When ?2026h is active the application will clear it (?2026l)
+                // once it has finished writing, which triggers the redraw then.
+                if !tw.panes
+                    .iter()
+                    .find(|p| p.id == pane_id)
+                    .map(|p| p.terminal.state.sync_output)
+                    .unwrap_or(false)
+                {
+                    tw.window.request_redraw();
+                }
             }
             AppEvent::PtyExit { pane_id } => {
                 let window_id = match self.pane_to_window.get(&pane_id).copied() {

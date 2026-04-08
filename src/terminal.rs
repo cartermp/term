@@ -4,13 +4,26 @@ use vte::{Params, Perform};
 
 const SCROLLBACK_MAX: usize = 10_000;
 
-#[derive(Clone, Copy, Debug)]
+/// SGR underline style (4:N sub-parameter family).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Straight,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline_style: UnderlineStyle,
+    pub underline_color: Option<Color>,
     pub inverse: bool,
 }
 
@@ -21,7 +34,8 @@ impl Default for Attrs {
             bg: DEFAULT_BG,
             bold: false,
             italic: false,
-            underline: false,
+            underline_style: UnderlineStyle::None,
+            underline_color: None,
             inverse: false,
         }
     }
@@ -36,6 +50,8 @@ pub struct Cell {
     combining: [char; 3],
     combining_len: u8,
     pub attrs: Attrs,
+    /// OSC 8 hyperlink: index into `TerminalState::links` (1-based, 0 = none).
+    pub link_id: u16,
 }
 
 impl Default for Cell {
@@ -45,6 +61,7 @@ impl Default for Cell {
             combining: ['\0'; 3],
             combining_len: 0,
             attrs: Attrs::default(),
+            link_id: 0,
         }
     }
 }
@@ -93,6 +110,19 @@ pub struct TerminalState {
     /// Whether cursor key application mode is active (?1h = DECCKM).
     /// When true, arrow keys send \x1bO[ABCD] instead of \x1b[[ABCD].
     pub cursor_keys_app_mode: bool,
+    /// DECSCUSR cursor shape. 0/1=blinking block, 2=steady block,
+    /// 3=blinking underline, 4=steady underline, 5=blinking bar, 6=steady bar.
+    pub cursor_shape: u8,
+    /// Whether focus-in/out events are enabled (?1004h).
+    pub focus_tracking: bool,
+    /// Whether synchronized-output mode is active (?2026h). When true,
+    /// redraws are suppressed until the mode is cleared.
+    pub sync_output: bool,
+    /// OSC 8 hyperlink URL table. Index 0 is unused; `link_id` in Cell is
+    /// 1-based into this vec.
+    pub links: Vec<String>,
+    /// The `links` index (1-based) for characters currently being printed.
+    current_link_id: u16,
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
     wrap_next: bool,
@@ -145,6 +175,11 @@ impl TerminalState {
             osc_52_query: false,
             bracketed_paste: false,
             cursor_keys_app_mode: false,
+            cursor_shape: 0,
+            focus_tracking: false,
+            sync_output: false,
+            links: Vec::new(),
+            current_link_id: 0,
         }
     }
 
@@ -288,6 +323,7 @@ impl TerminalState {
                 combining: ['\0'; 3],
                 combining_len: 0,
                 attrs: self.attrs,
+                link_id: self.current_link_id,
             };
             if self.cursor_col + 1 >= self.cols {
                 self.wrap_next = true;
@@ -324,6 +360,7 @@ impl TerminalState {
                 bg: self.attrs.bg,
                 ..Default::default()
             },
+            link_id: 0,
         }
     }
 
@@ -397,41 +434,124 @@ impl TerminalState {
         }
     }
 
-    fn apply_sgr(&mut self, p: &[u16]) {
+    fn apply_sgr(&mut self, params: &Params) {
+        // Collect parameter groups (each group: [main_param, sub1, sub2, ...]).
+        // This preserves sub-parameter structure (e.g. 4:3 for curly underline)
+        // while still supporting legacy multi-param forms like 38;2;r;g;b.
+        let groups: Vec<&[u16]> = params.iter().collect();
         let mut i = 0;
-        while i < p.len() {
-            match p[i] {
+        while i < groups.len() {
+            let g = groups[i];
+            let p0 = g.first().copied().unwrap_or(0);
+            match p0 {
                 0 => self.attrs = Attrs::default(),
                 1 => self.attrs.bold = true,
                 3 => self.attrs.italic = true,
-                4 => self.attrs.underline = true,
+                4 => {
+                    // 4 alone = straight underline; 4:N = specific style
+                    self.attrs.underline_style = if g.len() >= 2 {
+                        match g[1] {
+                            0 => UnderlineStyle::None,
+                            1 => UnderlineStyle::Straight,
+                            2 => UnderlineStyle::Double,
+                            3 => UnderlineStyle::Curly,
+                            4 => UnderlineStyle::Dotted,
+                            5 => UnderlineStyle::Dashed,
+                            _ => UnderlineStyle::Straight,
+                        }
+                    } else {
+                        UnderlineStyle::Straight
+                    };
+                }
                 7 => self.attrs.inverse = true,
                 22 => self.attrs.bold = false,
                 23 => self.attrs.italic = false,
-                24 => self.attrs.underline = false,
+                24 => self.attrs.underline_style = UnderlineStyle::None,
                 27 => self.attrs.inverse = false,
                 n @ 30..=37 => self.attrs.fg = ANSI_COLORS[(n - 30) as usize],
                 38 => {
-                    if i + 2 < p.len() && p[i + 1] == 5 {
-                        self.attrs.fg = ansi_256_color(p[i + 2] as u8);
-                        i += 2;
-                    } else if i + 4 < p.len() && p[i + 1] == 2 {
-                        self.attrs.fg = Color::new(p[i + 2] as u8, p[i + 3] as u8, p[i + 4] as u8);
+                    // Sub-param form: 38:2:r:g:b or 38:5:n
+                    if g.len() >= 3 && g[1] == 2 {
+                        self.attrs.fg = Color::new(
+                            g.get(2).copied().unwrap_or(0) as u8,
+                            g.get(3).copied().unwrap_or(0) as u8,
+                            g.get(4).copied().unwrap_or(0) as u8,
+                        );
+                    } else if g.len() >= 3 && g[1] == 5 {
+                        self.attrs.fg = ansi_256_color(g[2] as u8);
+                    // Legacy form: 38;2;r;g;b
+                    } else if i + 4 < groups.len()
+                        && groups[i + 1].first().copied() == Some(2)
+                    {
+                        let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
+                        let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
+                        self.attrs.fg = Color::new(r, g_, b);
                         i += 4;
+                    // Legacy form: 38;5;n
+                    } else if i + 2 < groups.len()
+                        && groups[i + 1].first().copied() == Some(5)
+                    {
+                        let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        self.attrs.fg = ansi_256_color(n);
+                        i += 2;
                     }
                 }
                 39 => self.attrs.fg = DEFAULT_FG,
                 n @ 40..=47 => self.attrs.bg = ANSI_COLORS[(n - 40) as usize],
                 48 => {
-                    if i + 2 < p.len() && p[i + 1] == 5 {
-                        self.attrs.bg = ansi_256_color(p[i + 2] as u8);
-                        i += 2;
-                    } else if i + 4 < p.len() && p[i + 1] == 2 {
-                        self.attrs.bg = Color::new(p[i + 2] as u8, p[i + 3] as u8, p[i + 4] as u8);
+                    if g.len() >= 3 && g[1] == 2 {
+                        self.attrs.bg = Color::new(
+                            g.get(2).copied().unwrap_or(0) as u8,
+                            g.get(3).copied().unwrap_or(0) as u8,
+                            g.get(4).copied().unwrap_or(0) as u8,
+                        );
+                    } else if g.len() >= 3 && g[1] == 5 {
+                        self.attrs.bg = ansi_256_color(g[2] as u8);
+                    } else if i + 4 < groups.len()
+                        && groups[i + 1].first().copied() == Some(2)
+                    {
+                        let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
+                        let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
+                        self.attrs.bg = Color::new(r, g_, b);
                         i += 4;
+                    } else if i + 2 < groups.len()
+                        && groups[i + 1].first().copied() == Some(5)
+                    {
+                        let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        self.attrs.bg = ansi_256_color(n);
+                        i += 2;
                     }
                 }
                 49 => self.attrs.bg = DEFAULT_BG,
+                // SGR 58: underline color; 59: reset underline color
+                58 => {
+                    if g.len() >= 3 && g[1] == 2 {
+                        self.attrs.underline_color = Some(Color::new(
+                            g.get(2).copied().unwrap_or(0) as u8,
+                            g.get(3).copied().unwrap_or(0) as u8,
+                            g.get(4).copied().unwrap_or(0) as u8,
+                        ));
+                    } else if g.len() >= 3 && g[1] == 5 {
+                        self.attrs.underline_color = Some(ansi_256_color(g[2] as u8));
+                    } else if i + 4 < groups.len()
+                        && groups[i + 1].first().copied() == Some(2)
+                    {
+                        let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
+                        let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
+                        self.attrs.underline_color = Some(Color::new(r, g_, b));
+                        i += 4;
+                    } else if i + 2 < groups.len()
+                        && groups[i + 1].first().copied() == Some(5)
+                    {
+                        let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
+                        self.attrs.underline_color = Some(ansi_256_color(n));
+                        i += 2;
+                    }
+                }
+                59 => self.attrs.underline_color = None,
                 n @ 90..=97 => self.attrs.fg = ANSI_COLORS[(n - 90 + 8) as usize],
                 n @ 100..=107 => self.attrs.bg = ANSI_COLORS[(n - 100 + 8) as usize],
                 _ => {}
@@ -624,7 +744,7 @@ impl Perform for TerminalState {
             (0, 'd') => {
                 self.cursor_row = (p0.max(1) as usize - 1).min(self.rows.saturating_sub(1));
             }
-            (0, 'm') => self.apply_sgr(&p),
+            (0, 'm') => self.apply_sgr(params),
             (0, 'n') => {
                 if p0 == 6 {
                     let resp = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
@@ -655,14 +775,22 @@ impl Perform for TerminalState {
             (0, 'c') => {
                 self.pending_responses.push(b"\x1b[?1;2c".to_vec());
             }
+            // DECSCUSR — cursor shape: CSI n SP q  (intermediate = 0x20 = b' ')
+            (b' ', 'q') => {
+                self.cursor_shape = p0.min(6) as u8;
+            }
+            // DECSTR — soft terminal reset: CSI ! p
+            (b'!', 'p') => self.reset_soft(),
             // Private modes
             (b'?', 'h') => {
                 for &param in &p {
                     match param {
                         1 => self.cursor_keys_app_mode = true,
+                        1004 => self.focus_tracking = true,
                         47 | 1047 => self.enter_alt_screen(false),
                         1049 => self.enter_alt_screen(true),
                         2004 => self.bracketed_paste = true,
+                        2026 => self.sync_output = true,
                         _ => {}
                     }
                 }
@@ -671,9 +799,11 @@ impl Perform for TerminalState {
                 for &param in &p {
                     match param {
                         1 => self.cursor_keys_app_mode = false,
+                        1004 => self.focus_tracking = false,
                         47 | 1047 => self.leave_alt_screen(false),
                         1049 => self.leave_alt_screen(true),
                         2004 => self.bracketed_paste = false,
+                        2026 => self.sync_output = false,
                         _ => {}
                     }
                 }
@@ -769,13 +899,40 @@ impl Perform for TerminalState {
                     self.input_cursor = self.input_buffer.len();
                 }
             }
+            b"8" => {
+                // OSC 8 hyperlinks: OSC 8 ; params ; uri BEL
+                // vte splits on ";": params[0]="8", params[1]=param_str, params[2]=uri
+                if params.len() >= 3 {
+                    if let Ok(uri) = std::str::from_utf8(params[2]) {
+                        if uri.is_empty() {
+                            self.current_link_id = 0;
+                        } else if self.links.len() < u16::MAX as usize {
+                            self.links.push(uri.to_owned());
+                            self.current_link_id = self.links.len() as u16;
+                        }
+                    }
+                } else {
+                    self.current_link_id = 0;
+                }
+            }
             _ => {}
         }
     }
-
-    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
     fn unhook(&mut self) {}
+}
+
+impl TerminalState {
+    /// Soft terminal reset (DECSTR, `CSI ! p`): resets modes and attributes
+    /// without clearing the screen, scrollback, or changing the cursor position.
+    pub fn reset_soft(&mut self) {
+        self.attrs = Attrs::default();
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.cursor_keys_app_mode = false;
+        self.cursor_shape = 0;
+        self.wrap_next = false;
+    }
 }
 
 #[cfg(test)]
@@ -1482,7 +1639,7 @@ mod tests {
         let mut t = t(80, 24);
         t.process(b"\x1b[1;3;4;7mA\x1b[0mB");
         let b = t.state.grid[0][1].attrs;
-        assert!(!b.bold && !b.italic && !b.underline && !b.inverse);
+        assert!(!b.bold && !b.italic && b.underline_style == UnderlineStyle::None && !b.inverse);
     }
 
     #[test]
@@ -2132,9 +2289,9 @@ mod tests {
     fn sgr_underline_on_off() {
         let mut t = t(10, 5);
         t.process(b"\x1b[4m");
-        assert!(t.state.attrs.underline, "SGR 4 must set underline");
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::Straight, "SGR 4 must set straight underline");
         t.process(b"\x1b[24m");
-        assert!(!t.state.attrs.underline, "SGR 24 must clear underline");
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::None, "SGR 24 must clear underline");
     }
 
     #[test]
@@ -2384,12 +2541,12 @@ mod tests {
         t.process(b"\x1b[1;3;4m");
         assert!(t.state.attrs.bold);
         assert!(t.state.attrs.italic);
-        assert!(t.state.attrs.underline);
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::Straight);
         // Reset clears all three.
         t.process(b"\x1b[0m");
         assert!(!t.state.attrs.bold);
         assert!(!t.state.attrs.italic);
-        assert!(!t.state.attrs.underline);
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::None);
     }
 
     // ── CUF/CUB with explicit count ───────────────────────────────────────────
@@ -2499,6 +2656,226 @@ mod tests {
         t.state.generation = u64::MAX;
         t.process(b"x");
         assert_eq!(t.state.generation, 0, "generation must wrap via wrapping_add");
+    }
+
+    // ── DECSCUSR ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decscusr_sets_cursor_shape() {
+        let mut t = t(10, 5);
+        assert_eq!(t.state.cursor_shape, 0, "default cursor shape is 0");
+        t.process(b"\x1b[2 q"); // steady block
+        assert_eq!(t.state.cursor_shape, 2);
+        t.process(b"\x1b[4 q"); // steady underline
+        assert_eq!(t.state.cursor_shape, 4);
+        t.process(b"\x1b[6 q"); // steady bar
+        assert_eq!(t.state.cursor_shape, 6);
+        t.process(b"\x1b[0 q"); // reset to default
+        assert_eq!(t.state.cursor_shape, 0);
+    }
+
+    #[test]
+    fn decscusr_clamps_to_max_six() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[99 q");
+        assert_eq!(t.state.cursor_shape, 6, "values >6 should clamp to 6");
+    }
+
+    #[test]
+    fn decstr_resets_attrs_and_scroll_region() {
+        let mut t = t(20, 10);
+        t.process(b"\x1b[1;3;4m"); // bold, italic, underline
+        t.process(b"\x1b[3;8r");   // scroll region rows 3-8
+        t.process(b"\x1b[2 q");    // steady block cursor
+        assert_ne!(t.state.attrs, Attrs::default());
+        assert_eq!(t.state.scroll_top, 2);
+        assert_eq!(t.state.scroll_bottom, 7);
+        assert_eq!(t.state.cursor_shape, 2);
+        // DECSTR: CSI ! p
+        t.process(b"\x1b[!p");
+        assert_eq!(t.state.attrs, Attrs::default(), "DECSTR must reset SGR attrs");
+        assert_eq!(t.state.scroll_top, 0, "DECSTR must reset scroll region top");
+        assert_eq!(t.state.scroll_bottom, 9, "DECSTR must reset scroll region bottom");
+        assert_eq!(t.state.cursor_shape, 0, "DECSTR must reset cursor shape");
+    }
+
+    #[test]
+    fn decstr_preserves_screen_content() {
+        let mut t = t(20, 5);
+        t.process(b"hello");
+        t.process(b"\x1b[!p"); // soft reset
+        let row: String = t.state.grid[0].iter().map(|c| c.c).collect();
+        assert!(row.starts_with("hello"), "DECSTR must not clear screen content");
+    }
+
+    // ── Focus tracking (?1004h) ───────────────────────────────────────────────
+
+    #[test]
+    fn focus_tracking_disabled_by_default() {
+        let s = TerminalState::new(80, 24);
+        assert!(!s.focus_tracking);
+    }
+
+    #[test]
+    fn focus_tracking_enabled_by_1004h() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?1004h");
+        assert!(t.state.focus_tracking);
+        t.process(b"\x1b[?1004l");
+        assert!(!t.state.focus_tracking);
+    }
+
+    // ── Synchronized output (?2026h) ──────────────────────────────────────────
+
+    #[test]
+    fn sync_output_disabled_by_default() {
+        let s = TerminalState::new(80, 24);
+        assert!(!s.sync_output);
+    }
+
+    #[test]
+    fn sync_output_toggled_by_2026() {
+        let mut t = t(80, 24);
+        t.process(b"\x1b[?2026h");
+        assert!(t.state.sync_output);
+        t.process(b"\x1b[?2026l");
+        assert!(!t.state.sync_output);
+    }
+
+    // ── SGR underline styles ──────────────────────────────────────────────────
+
+    #[test]
+    fn sgr_4_straight_underline() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4m");
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::Straight);
+    }
+
+    #[test]
+    fn sgr_4_subparam_underline_styles() {
+        let cases: &[(&[u8], UnderlineStyle)] = &[
+            (b"\x1b[4:0m", UnderlineStyle::None),
+            (b"\x1b[4:1m", UnderlineStyle::Straight),
+            (b"\x1b[4:2m", UnderlineStyle::Double),
+            (b"\x1b[4:3m", UnderlineStyle::Curly),
+            (b"\x1b[4:4m", UnderlineStyle::Dotted),
+            (b"\x1b[4:5m", UnderlineStyle::Dashed),
+        ];
+        for (seq, expected) in cases {
+            let mut t = t(10, 5);
+            t.process(seq);
+            assert_eq!(
+                t.state.attrs.underline_style, *expected,
+                "sequence {:?} should give {expected:?}",
+                std::str::from_utf8(seq).unwrap_or("?")
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_24_clears_underline_style() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[4:3m"); // curly
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::Curly);
+        t.process(b"\x1b[24m");
+        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::None);
+    }
+
+    #[test]
+    fn sgr_58_underline_color_truecolor() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:2:255:128:0m");
+        assert_eq!(t.state.attrs.underline_color, Some(Color::new(255, 128, 0)));
+    }
+
+    #[test]
+    fn sgr_58_underline_color_256() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:5:196m"); // bright red in 256-color palette
+        assert_eq!(t.state.attrs.underline_color, Some(ansi_256_color(196)));
+    }
+
+    #[test]
+    fn sgr_59_clears_underline_color() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:2:255:0:0m");
+        assert!(t.state.attrs.underline_color.is_some());
+        t.process(b"\x1b[59m");
+        assert_eq!(t.state.attrs.underline_color, None);
+    }
+
+    #[test]
+    fn sgr_0_reset_clears_underline_color() {
+        let mut t = t(10, 5);
+        t.process(b"\x1b[58:2:255:0:0m");
+        t.process(b"\x1b[0m");
+        assert_eq!(t.state.attrs.underline_color, None);
+    }
+
+    // ── OSC 8 hyperlinks ─────────────────────────────────────────────────────
+
+    #[test]
+    fn osc8_sets_current_link_id() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        assert_eq!(s.current_link_id, 1);
+        assert_eq!(s.links[0], "https://example.com");
+    }
+
+    #[test]
+    fn osc8_empty_uri_closes_link() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        s.osc_dispatch(&[b"8", b"", b""], false);
+        assert_eq!(s.current_link_id, 0, "empty uri should clear current link");
+    }
+
+    #[test]
+    fn osc8_short_params_closes_link() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        s.osc_dispatch(&[b"8", b""], false); // only 2 params
+        assert_eq!(s.current_link_id, 0, "missing uri param should close link");
+    }
+
+    #[test]
+    fn osc8_link_id_stamped_on_cells() {
+        let mut t = t(40, 5);
+        t.process(b"\x1b]8;;https://rust-lang.org\x07");
+        t.process(b"Rust");
+        t.process(b"\x1b]8;;\x07"); // close link
+        t.process(b"plain");
+        // Cells 0-3 in row 0 should carry link_id = 1
+        for col in 0..4 {
+            assert_eq!(t.state.grid[0][col].link_id, 1, "col {col} should have link_id 1");
+        }
+        // Cell 4 onward should have link_id 0
+        assert_eq!(t.state.grid[0][4].link_id, 0, "col 4 should have no link");
+    }
+
+    #[test]
+    fn osc8_sgr_reset_does_not_clear_link() {
+        let mut t = t(20, 5);
+        t.process(b"\x1b]8;;https://example.com\x07");
+        assert_eq!(t.state.current_link_id, 1);
+        t.process(b"\x1b[0m"); // SGR reset
+        // link should still be active
+        assert_eq!(
+            t.state.current_link_id, 1,
+            "SGR reset must not clear the OSC 8 link"
+        );
+    }
+
+    #[test]
+    fn osc8_multiple_links_get_distinct_ids() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://a.com"], false);
+        let id1 = s.current_link_id;
+        s.osc_dispatch(&[b"8", b"", b"https://b.com"], false);
+        let id2 = s.current_link_id;
+        assert_ne!(id1, id2, "two different links must get distinct ids");
+        assert_eq!(s.links[0], "https://a.com");
+        assert_eq!(s.links[1], "https://b.com");
     }
 }
 

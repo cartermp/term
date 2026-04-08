@@ -935,6 +935,58 @@ impl Renderer {
 
     // ── Public render ─────────────────────────────────────────────────────────
 
+    /// Emit underline decorations for a single cell.
+    fn emit_underline(
+        &mut self,
+        x: f32,
+        y: f32,
+        cw: f32,
+        ch: f32,
+        style: crate::terminal::UnderlineStyle,
+        color: [f32; 4],
+    ) {
+        use crate::terminal::UnderlineStyle::*;
+        let uy = y + ch - 2.;
+        match style {
+            None => {}
+            Straight => {
+                push_rect(&mut self.fg_rects, x, uy, cw, 1., color);
+            }
+            Double => {
+                push_rect(&mut self.fg_rects, x, uy - 2., cw, 1., color);
+                push_rect(&mut self.fg_rects, x, uy, cw, 1., color);
+            }
+            Curly => {
+                // Sawtooth approximation: alternating 1-px-high segments.
+                let seg = (cw / 4.).max(1.);
+                let n = (cw / seg) as usize;
+                for i in 0..n {
+                    let sx = x + i as f32 * seg;
+                    let sy = if i % 2 == 0 { uy - 1. } else { uy + 1. };
+                    push_rect(&mut self.fg_rects, sx, sy, seg, 1., color);
+                }
+            }
+            Dotted => {
+                let dot = 2_f32;
+                let gap = 2_f32;
+                let mut sx = x;
+                while sx + dot <= x + cw {
+                    push_rect(&mut self.fg_rects, sx, uy, dot, 1., color);
+                    sx += dot + gap;
+                }
+            }
+            Dashed => {
+                let dash = (cw * 0.45).max(2.);
+                let gap = (cw * 0.1).max(1.);
+                let mut sx = x;
+                while sx + dash <= x + cw {
+                    push_rect(&mut self.fg_rects, sx, uy, dash, 1., color);
+                    sx += dash + gap;
+                }
+            }
+        }
+    }
+
     /// Render all `panes` into `view`.  `dividers` are solid rectangles
     /// (x, y, w, h) drawn between panes — typically 2 px wide/tall separator lines.
     pub fn render(
@@ -1028,6 +1080,19 @@ impl Renderer {
                             }
                         }
                     }
+
+                    // ── Per-cell underlines (SGR style + OSC 8 links) ─────────
+                    let ul_style = cell.attrs.underline_style;
+                    if ul_style != crate::terminal::UnderlineStyle::None {
+                        let ul_color = cell.attrs.underline_color
+                            .map(c2f)
+                            .unwrap_or(c2f(fg_color));
+                        self.emit_underline(px, py, cw, ch, ul_style, ul_color);
+                    } else if cell.link_id != 0 {
+                        // OSC 8 hyperlink — use same blue as URL underlines.
+                        let lc = rgb_f(0x58, 0x9a, 0xdd);
+                        push_rect(&mut self.fg_rects, px, py + ch - 2., cw, 1., lc);
+                    }
                 }
             }
 
@@ -1063,7 +1128,20 @@ impl Renderer {
             {
                 let px = ox + pane.state.cursor_col as f32 * cw;
                 let py = oy + pane.state.cursor_row as f32 * ch;
-                push_rect(&mut self.fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+                match pane.state.cursor_shape {
+                    1 | 2 => {
+                        // Block cursor: fill entire cell
+                        push_rect(&mut self.fg_rects, px, py, cw, ch, c2f(CURSOR_COLOR));
+                    }
+                    3 | 4 => {
+                        // Underline cursor: thin bar at cell bottom
+                        push_rect(&mut self.fg_rects, px, py + ch - 2., cw, 2., c2f(CURSOR_COLOR));
+                    }
+                    _ => {
+                        // Bar cursor (default, 0, 5, 6): thin vertical bar at left
+                        push_rect(&mut self.fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+                    }
+                }
             }
 
             // ── Scrollbar ─────────────────────────────────────────────────────────
