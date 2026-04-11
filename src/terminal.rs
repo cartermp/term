@@ -943,6 +943,7 @@ impl TerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1083,6 +1084,21 @@ mod tests {
         }
     }
 
+    fn process_chunk_plan(term: &mut Terminal, bytes: &[u8], chunk_lengths: &[usize]) {
+        let mut cursor = 0usize;
+        for &len in chunk_lengths {
+            if cursor >= bytes.len() {
+                break;
+            }
+            let end = (cursor + len.max(1)).min(bytes.len());
+            term.process(&bytes[cursor..end]);
+            cursor = end;
+        }
+        if cursor < bytes.len() {
+            term.process(&bytes[cursor..]);
+        }
+    }
+
     fn assert_chunking_equivalence(cols: usize, rows: usize, bytes: &[u8]) {
         let mut whole = t(cols, rows);
         whole.process(bytes);
@@ -1103,6 +1119,56 @@ mod tests {
             expected,
             "deterministic pseudo-random chunking changed the final state"
         );
+    }
+
+    fn assert_terminal_invariants(term: &Terminal) {
+        let state = &term.state;
+        assert_eq!(state.grid.len(), state.rows);
+        assert_eq!(state.alt_grid.len(), state.rows);
+        assert!(state.rows > 0);
+        assert!(state.cols > 0);
+        assert!(state.cursor_row < state.rows, "cursor_row={} rows={}", state.cursor_row, state.rows);
+        assert!(state.cursor_col < state.cols, "cursor_col={} cols={}", state.cursor_col, state.cols);
+        assert!(state.scroll_top <= state.scroll_bottom);
+        assert!(state.scroll_bottom < state.rows);
+        assert!(state.viewport_offset <= state.scrollback.len());
+        assert!(state.current_link_id as usize <= state.links.len());
+
+        for row in &state.grid {
+            assert_eq!(row.len(), state.cols);
+            for cell in row {
+                assert!(cell.link_id as usize <= state.links.len());
+            }
+        }
+        for row in &state.alt_grid {
+            assert_eq!(row.len(), state.cols);
+            for cell in row {
+                assert!(cell.link_id as usize <= state.links.len());
+            }
+        }
+        for row in &state.scrollback {
+            for cell in row {
+                assert!(cell.link_id as usize <= state.links.len());
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum RandomAction {
+        Write(Vec<u8>),
+        Resize { cols: usize, rows: usize },
+        ScrollViewport(i32),
+        SnapToBottom,
+    }
+
+    fn random_action_strategy() -> impl Strategy<Value = RandomAction> {
+        prop_oneof![
+            proptest::collection::vec(any::<u8>(), 0..64).prop_map(RandomAction::Write),
+            (1usize..80, 1usize..32)
+                .prop_map(|(cols, rows)| RandomAction::Resize { cols, rows }),
+            (-200i32..=200).prop_map(RandomAction::ScrollViewport),
+            Just(RandomAction::SnapToBottom),
+        ]
     }
 
     fn shell_session_transcript() -> Vec<u8> {
@@ -1132,6 +1198,43 @@ mod tests {
         bytes.extend_from_slice(b"\x1b[?1049l");
         bytes.extend_from_slice(b"\x1b]0;~/src/term\x07");
         bytes
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        #[test]
+        fn arbitrary_byte_stream_chunking_is_stream_equivalent(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+            chunk_lengths in proptest::collection::vec(1usize..32, 0..128),
+        ) {
+            let mut whole = t(48, 16);
+            whole.process(&bytes);
+            assert_terminal_invariants(&whole);
+            let expected = snapshot(&whole);
+
+            let mut chunked = t(48, 16);
+            process_chunk_plan(&mut chunked, &bytes, &chunk_lengths);
+            assert_terminal_invariants(&chunked);
+
+            prop_assert_eq!(snapshot(&chunked), expected);
+        }
+
+        #[test]
+        fn random_terminal_action_sequences_preserve_invariants(
+            actions in proptest::collection::vec(random_action_strategy(), 0..128),
+        ) {
+            let mut term = t(48, 16);
+            for action in actions {
+                match action {
+                    RandomAction::Write(bytes) => term.process(&bytes),
+                    RandomAction::Resize { cols, rows } => term.resize(cols, rows),
+                    RandomAction::ScrollViewport(delta) => term.state.scroll_viewport(delta),
+                    RandomAction::SnapToBottom => term.state.snap_to_bottom(),
+                }
+                assert_terminal_invariants(&term);
+            }
+        }
     }
 
     // ── Basic character output ────────────────────────────────────────────────

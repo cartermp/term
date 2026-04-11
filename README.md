@@ -35,6 +35,18 @@ cargo run --release
 
 Builds four binaries: `term`, `tcat`, `tdiff`, `tjson`. No external tools or scripts needed.
 
+## Testing
+
+```sh
+cargo build --all-targets
+cargo test
+./scripts/manual-smoke.sh
+```
+
+Automated coverage includes inline unit tests, subprocess integration tests for `tcat` / `tdiff` / `tjson`, and property-style terminal tests that stress arbitrary byte streams plus mixed write/resize/scroll action sequences.
+
+`./scripts/manual-smoke.sh` creates a temporary fixture workspace with a sample Rust file, JSON fixture, URL fixture, and git diff, prints a macOS smoke checklist, then launches `term` in that workspace. Set `TERM_SMOKE_NO_LAUNCH=1` if you only want the workspace and checklist.
+
 ## Features
 
 - **GPU-accelerated rendering** — wgpu/Metal pipeline with batched instancing and a 1024×1024 glyph atlas

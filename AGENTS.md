@@ -27,7 +27,8 @@ After any change:
 1. `cargo build` must succeed with zero errors and zero warnings.
 2. `cargo test` must pass.
 3. `cargo run --release` must open a window and display a working zsh prompt.
-4. Manually verify: type commands, run `vim`, run `htop`, check colors with `echo -e "\e[31mred\e[0m"`.
+4. `./scripts/manual-smoke.sh` should prepare a smoke workspace and checklist; walk through the listed `tcat`/`tdiff`/`tjson`, tab, URL, clipboard, color, scrollback, and full-screen-app checks.
+5. Manually verify at least: type commands, run `vim`, run `htop` (or `top`), check colors with `echo -e "\e[31mred\e[0m"`.
 
 Unit tests live inline in each source file. Run a specific module with e.g. `cargo test --lib terminal`.
 
