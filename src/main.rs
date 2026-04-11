@@ -6,6 +6,7 @@ mod terminal;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,7 @@ enum SplitDir {
 
 // ── Selection ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
     // grid_row = visual_row as i64 - viewport_offset as i64.
     // Negative = rows in scrollback above the live grid; 0 = top of live grid.
@@ -92,7 +93,11 @@ struct Pane {
 impl Pane {
     /// Return URL spans for the current view, using the cached result when
     /// the terminal generation and viewport dimensions haven't changed.
-    fn urls_cached(&mut self, vis_rows: usize, vis_cols: usize) -> &[(usize, usize, usize, String)] {
+    fn urls_cached(
+        &mut self,
+        vis_rows: usize,
+        vis_cols: usize,
+    ) -> &[(usize, usize, usize, String)] {
         urls_with_cache(
             &mut self.url_cache,
             &mut self.url_cache_gen,
@@ -131,29 +136,52 @@ impl Pane {
 /// Used to recover the intended letter when Alt/Option produces a Unicode character (macOS).
 fn physical_key_to_ascii(kc: KeyCode) -> Option<u8> {
     match kc {
-        KeyCode::KeyA => Some(b'a'), KeyCode::KeyB => Some(b'b'),
-        KeyCode::KeyC => Some(b'c'), KeyCode::KeyD => Some(b'd'),
-        KeyCode::KeyE => Some(b'e'), KeyCode::KeyF => Some(b'f'),
-        KeyCode::KeyG => Some(b'g'), KeyCode::KeyH => Some(b'h'),
-        KeyCode::KeyI => Some(b'i'), KeyCode::KeyJ => Some(b'j'),
-        KeyCode::KeyK => Some(b'k'), KeyCode::KeyL => Some(b'l'),
-        KeyCode::KeyM => Some(b'm'), KeyCode::KeyN => Some(b'n'),
-        KeyCode::KeyO => Some(b'o'), KeyCode::KeyP => Some(b'p'),
-        KeyCode::KeyQ => Some(b'q'), KeyCode::KeyR => Some(b'r'),
-        KeyCode::KeyS => Some(b's'), KeyCode::KeyT => Some(b't'),
-        KeyCode::KeyU => Some(b'u'), KeyCode::KeyV => Some(b'v'),
-        KeyCode::KeyW => Some(b'w'), KeyCode::KeyX => Some(b'x'),
-        KeyCode::KeyY => Some(b'y'), KeyCode::KeyZ => Some(b'z'),
-        KeyCode::Digit0 => Some(b'0'), KeyCode::Digit1 => Some(b'1'),
-        KeyCode::Digit2 => Some(b'2'), KeyCode::Digit3 => Some(b'3'),
-        KeyCode::Digit4 => Some(b'4'), KeyCode::Digit5 => Some(b'5'),
-        KeyCode::Digit6 => Some(b'6'), KeyCode::Digit7 => Some(b'7'),
-        KeyCode::Digit8 => Some(b'8'), KeyCode::Digit9 => Some(b'9'),
-        KeyCode::Minus => Some(b'-'),    KeyCode::Equal => Some(b'='),
-        KeyCode::BracketLeft => Some(b'['), KeyCode::BracketRight => Some(b']'),
-        KeyCode::Backslash => Some(b'\\'), KeyCode::Semicolon => Some(b';'),
-        KeyCode::Quote => Some(b'\''),   KeyCode::Backquote => Some(b'`'),
-        KeyCode::Comma => Some(b','),    KeyCode::Period => Some(b'.'),
+        KeyCode::KeyA => Some(b'a'),
+        KeyCode::KeyB => Some(b'b'),
+        KeyCode::KeyC => Some(b'c'),
+        KeyCode::KeyD => Some(b'd'),
+        KeyCode::KeyE => Some(b'e'),
+        KeyCode::KeyF => Some(b'f'),
+        KeyCode::KeyG => Some(b'g'),
+        KeyCode::KeyH => Some(b'h'),
+        KeyCode::KeyI => Some(b'i'),
+        KeyCode::KeyJ => Some(b'j'),
+        KeyCode::KeyK => Some(b'k'),
+        KeyCode::KeyL => Some(b'l'),
+        KeyCode::KeyM => Some(b'm'),
+        KeyCode::KeyN => Some(b'n'),
+        KeyCode::KeyO => Some(b'o'),
+        KeyCode::KeyP => Some(b'p'),
+        KeyCode::KeyQ => Some(b'q'),
+        KeyCode::KeyR => Some(b'r'),
+        KeyCode::KeyS => Some(b's'),
+        KeyCode::KeyT => Some(b't'),
+        KeyCode::KeyU => Some(b'u'),
+        KeyCode::KeyV => Some(b'v'),
+        KeyCode::KeyW => Some(b'w'),
+        KeyCode::KeyX => Some(b'x'),
+        KeyCode::KeyY => Some(b'y'),
+        KeyCode::KeyZ => Some(b'z'),
+        KeyCode::Digit0 => Some(b'0'),
+        KeyCode::Digit1 => Some(b'1'),
+        KeyCode::Digit2 => Some(b'2'),
+        KeyCode::Digit3 => Some(b'3'),
+        KeyCode::Digit4 => Some(b'4'),
+        KeyCode::Digit5 => Some(b'5'),
+        KeyCode::Digit6 => Some(b'6'),
+        KeyCode::Digit7 => Some(b'7'),
+        KeyCode::Digit8 => Some(b'8'),
+        KeyCode::Digit9 => Some(b'9'),
+        KeyCode::Minus => Some(b'-'),
+        KeyCode::Equal => Some(b'='),
+        KeyCode::BracketLeft => Some(b'['),
+        KeyCode::BracketRight => Some(b']'),
+        KeyCode::Backslash => Some(b'\\'),
+        KeyCode::Semicolon => Some(b';'),
+        KeyCode::Quote => Some(b'\''),
+        KeyCode::Backquote => Some(b'`'),
+        KeyCode::Comma => Some(b','),
+        KeyCode::Period => Some(b'.'),
         KeyCode::Slash => Some(b'/'),
         _ => None,
     }
@@ -188,8 +216,9 @@ fn find_urls(
 ) -> Vec<(usize, usize, usize, String)> {
     let mut out = Vec::new();
     for row in 0..vis_rows {
-        let cells: Vec<char> =
-            (0..vis_cols).map(|col| state.visual_cell(row, col).c).collect();
+        let cells: Vec<char> = (0..vis_cols)
+            .map(|col| state.visual_cell(row, col).c)
+            .collect();
         let mut col = 0;
         while col < vis_cols {
             let https = col + 8 <= vis_cols
@@ -222,6 +251,119 @@ fn find_urls(
         }
     }
     out
+}
+
+fn should_open_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn wrap_bracketed_paste(payload: &[u8], bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return payload.to_vec();
+    }
+    let mut out = Vec::with_capacity(payload.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MouseWheelAction {
+    None,
+    LocalViewport(i32),
+    PtyWrites(Vec<Vec<u8>>),
+}
+
+fn mouse_wheel_lines(delta: &MouseScrollDelta, cell_height: usize, scroll_frac: &mut f64) -> i32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => {
+            *scroll_frac = 0.0;
+            (y * 4.5) as i32
+        }
+        MouseScrollDelta::PixelDelta(pos) => {
+            let ch = cell_height.max(1) as f64;
+            *scroll_frac += pos.y / ch * 3.0;
+            let whole = scroll_frac.trunc() as i32;
+            *scroll_frac -= whole as f64;
+            whole
+        }
+    }
+}
+
+fn mouse_wheel_action(
+    state: &terminal::TerminalState,
+    lines: i32,
+    cell: Option<(usize, usize)>,
+) -> MouseWheelAction {
+    if lines == 0 {
+        return MouseWheelAction::None;
+    }
+
+    if state.mouse_tracking {
+        let (row, col) = match cell {
+            Some(cell) => cell,
+            None => return MouseWheelAction::None,
+        };
+        let count = lines.unsigned_abs() as usize;
+        let button = if lines > 0 { 64u32 } else { 65u32 };
+        let col1 = col + 1;
+        let row1 = row + 1;
+        let seq = if state.mouse_sgr {
+            format!("\x1b[<{button};{col1};{row1}M").into_bytes()
+        } else {
+            let cb = (32 + button).min(255) as u8;
+            let cx = (32 + col1).min(255) as u8;
+            let cy = (32 + row1).min(255) as u8;
+            vec![0x1b, b'[', b'M', cb, cx, cy]
+        };
+        return MouseWheelAction::PtyWrites(std::iter::repeat(seq).take(count).collect());
+    }
+
+    if state.is_alt_screen() {
+        let seq = if lines > 0 {
+            b"\x1bOA".to_vec()
+        } else {
+            b"\x1bOB".to_vec()
+        };
+        return MouseWheelAction::PtyWrites(
+            std::iter::repeat(seq)
+                .take(lines.unsigned_abs() as usize)
+                .collect(),
+        );
+    }
+
+    MouseWheelAction::LocalViewport(lines)
+}
+
+fn update_cursor_blink(
+    cursor_visible: &mut bool,
+    last_blink: &mut Instant,
+    now: Instant,
+    period: Duration,
+) -> bool {
+    if now.duration_since(*last_blink) < period {
+        return false;
+    }
+    *cursor_visible = !*cursor_visible;
+    *last_blink = now;
+    true
+}
+
+fn osc52_response(payload: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{payload}\x07").into_bytes()
+}
+
+fn drain_terminal_host_responses(
+    state: &mut terminal::TerminalState,
+    clipboard_payload: &str,
+) -> Vec<Vec<u8>> {
+    let mut responses: Vec<Vec<u8>> = state.pending_responses.drain(..).collect();
+    if state.osc_52_query {
+        state.osc_52_query = false;
+        responses.push(osc52_response(clipboard_payload));
+    }
+    responses
 }
 
 // ── ns_view helper ────────────────────────────────────────────────────────────
@@ -276,7 +418,7 @@ struct TerminalWindow {
 impl TerminalWindow {
     fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
         let sz = self.window.inner_size();
-        let w = sz.width  as f32;
+        let w = sz.width as f32;
         let h = sz.height as f32;
         match (self.panes.len(), &self.split) {
             (2, Some(SplitDir::Vertical)) => {
@@ -293,10 +435,10 @@ impl TerminalWindow {
 
     fn divider_rects(&self) -> Vec<(f32, f32, f32, f32)> {
         let sz = self.window.inner_size();
-        let w = sz.width  as f32;
+        let w = sz.width as f32;
         let h = sz.height as f32;
         match (self.panes.len(), &self.split) {
-            (2, Some(SplitDir::Vertical))   => {
+            (2, Some(SplitDir::Vertical)) => {
                 let half = (w / 2.).floor();
                 vec![(half - 1., 0., 2., h)]
             }
@@ -400,14 +542,17 @@ impl TerminalWindow {
         let cw = self.renderer.cell_width as f64;
         let ch = self.renderer.cell_height as f64;
         for (i, &(ox, oy, pw, ph)) in rects.iter().enumerate() {
-            if mx >= ox as f64 && mx < (ox + pw) as f64
-                && my >= oy as f64 && my < (oy + ph) as f64
+            if mx >= ox as f64 && mx < (ox + pw) as f64 && my >= oy as f64 && my < (oy + ph) as f64
             {
                 let col = ((mx - ox as f64) / cw) as usize;
                 let row = ((my - oy as f64) / ch) as usize;
                 let cols = (pw as usize / self.renderer.cell_width).max(1);
                 let rows = (ph as usize / self.renderer.cell_height).max(1);
-                return Some((i, row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1))));
+                return Some((
+                    i,
+                    row.min(rows.saturating_sub(1)),
+                    col.min(cols.saturating_sub(1)),
+                ));
             }
         }
         None
@@ -426,18 +571,24 @@ impl TerminalWindow {
 
     fn update_cursor_icon(&mut self) {
         let icon = if self.modifiers.super_key() {
-            let is_url = self.pixel_to_pane_cell(self.cursor_pos.0, self.cursor_pos.1)
+            let is_url = self
+                .pixel_to_pane_cell(self.cursor_pos.0, self.cursor_pos.1)
                 .map(|(pi, row, col)| {
                     let rects = self.pane_rects();
                     let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
                     let vis_cols = (pw as usize / self.renderer.cell_width).max(1);
                     let vis_rows = (ph as usize / self.renderer.cell_height).max(1);
-                    self.panes[pi].urls_cached(vis_rows, vis_cols)
+                    self.panes[pi]
+                        .urls_cached(vis_rows, vis_cols)
                         .iter()
                         .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                 })
                 .unwrap_or(false);
-            if is_url { CursorIcon::Pointer } else { CursorIcon::Default }
+            if is_url {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
         } else {
             CursorIcon::Default
         };
@@ -458,18 +609,16 @@ impl TerminalWindow {
                 if std::fs::write(&path, &png).is_ok() {
                     let path_str = path.to_string_lossy().to_string();
                     let bracketed = self.active().terminal.state.bracketed_paste;
-                    if bracketed { self.pty_write(b"\x1b[200~"); }
-                    self.pty_write(path_str.as_bytes());
-                    if bracketed { self.pty_write(b"\x1b[201~"); }
+                    let payload = wrap_bracketed_paste(path_str.as_bytes(), bracketed);
+                    self.pty_write(&payload);
                 }
                 return;
             }
             if let Some(text) = platform::clipboard_text() {
                 if !text.is_empty() {
                     let bracketed = self.active().terminal.state.bracketed_paste;
-                    if bracketed { self.pty_write(b"\x1b[200~"); }
-                    self.pty_write(text.as_bytes());
-                    if bracketed { self.pty_write(b"\x1b[201~"); }
+                    let payload = wrap_bracketed_paste(text.as_bytes(), bracketed);
+                    self.pty_write(&payload);
                 }
                 return;
             }
@@ -479,9 +628,8 @@ impl TerminalWindow {
             let text = paste_from_clipboard();
             if !text.is_empty() {
                 let bracketed = self.active().terminal.state.bracketed_paste;
-                if bracketed { self.pty_write(b"\x1b[200~"); }
-                self.pty_write(text.as_bytes());
-                if bracketed { self.pty_write(b"\x1b[201~"); }
+                let payload = wrap_bracketed_paste(text.as_bytes(), bracketed);
+                self.pty_write(&payload);
             }
         }
     }
@@ -490,9 +638,11 @@ impl TerminalWindow {
         let window = self.window.clone();
         let sz = window.inner_size();
         let (w, h) = (sz.width, sz.height);
-        if w == 0 || h == 0 { return; }
+        if w == 0 || h == 0 {
+            return;
+        }
 
-        let rects    = self.pane_rects();
+        let rects = self.pane_rects();
         let dividers = self.divider_rects();
         let cw = self.renderer.cell_width;
         let ch = self.renderer.cell_height;
@@ -506,7 +656,8 @@ impl TerminalWindow {
                     let (_, _, pw, ph) = rects[i];
                     let vis_rows = (ph as usize / ch).max(1);
                     let vis_cols = (pw as usize / cw).max(1);
-                    let spans = self.panes[i].urls_cached(vis_rows, vis_cols)
+                    let spans = self.panes[i]
+                        .urls_cached(vis_rows, vis_cols)
                         .iter()
                         .map(|(r, c0, c1, _)| (*r, *c0, *c1))
                         .collect();
@@ -521,12 +672,18 @@ impl TerminalWindow {
         // Build PaneView slice
         let mut pane_views: Vec<PaneView<'_>> = Vec::new();
         for (i, pane) in self.panes.iter().enumerate() {
-            if i >= rects.len() { break; }
+            if i >= rects.len() {
+                break;
+            }
             let (ox, oy, pw, ph) = rects[i];
-            let sel = pane.selection.map(|s| s.to_viewport(pane.terminal.state.viewport_offset));
+            let sel = pane
+                .selection
+                .map(|s| s.to_viewport(pane.terminal.state.viewport_offset));
             pane_views.push(PaneView {
-                x: ox, y: oy,
-                width: pw, height: ph,
+                x: ox,
+                y: oy,
+                width: pw,
+                height: ph,
                 state: &pane.terminal.state,
                 show_cursor: (i == self.active_pane) && self.cursor_visible,
                 ghost: pane.ghost_text.as_deref(),
@@ -538,26 +695,37 @@ impl TerminalWindow {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.renderer.device, &self.surface_config);
+                self.surface
+                    .configure(&self.renderer.device, &self.surface_config);
                 return;
             }
-            Err(e) => { eprintln!("surface error: {e}"); return; }
+            Err(e) => {
+                eprintln!("surface error: {e}");
+                return;
+            }
         };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.render(&view, w, h, &pane_views, &dividers);
         output.present();
     }
 
     fn on_resize(&mut self, width: u32, height: u32) {
-        self.surface_config.width  = width.max(1);
+        self.surface_config.width = width.max(1);
         self.surface_config.height = height.max(1);
-        self.surface.configure(&self.renderer.device, &self.surface_config);
+        self.surface
+            .configure(&self.renderer.device, &self.surface_config);
 
         let rects = self.pane_rects();
         let cw = self.renderer.cell_width;
         let ch = self.renderer.cell_height;
         for (i, pane) in self.panes.iter_mut().enumerate() {
-            let (_, _, pw, ph) = if i < rects.len() { rects[i] } else { (0., 0., width as f32, height as f32) };
+            let (_, _, pw, ph) = if i < rects.len() {
+                rects[i]
+            } else {
+                (0., 0., width as f32, height as f32)
+            };
             let cols = (pw as usize / cw).max(1);
             let rows = (ph as usize / ch).max(1);
             pane.terminal.resize(cols, rows);
@@ -588,8 +756,7 @@ impl TerminalWindow {
         let shift = self.modifiers.shift_key();
 
         // Clear selection on any keypress (except Cmd+C and bare modifiers)
-        let is_cmd_c = sup
-            && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "c");
+        let is_cmd_c = sup && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "c");
         let is_modifier_only = matches!(
             &event.logical_key,
             Key::Named(
@@ -752,13 +919,15 @@ impl TerminalWindow {
         }
 
         // ── Printable text ────────────────────────────────────────────────────
-        if !ctrl && !alt
-            && let Some(text) = &event.text {
-                self.active_mut().ghost_text = None;
-                let bytes = text.as_str().as_bytes().to_vec();
-                self.active_mut().write(&bytes);
-                return KeyAction::None;
-            }
+        if !ctrl
+            && !alt
+            && let Some(text) = &event.text
+        {
+            self.active_mut().ghost_text = None;
+            let bytes = text.as_str().as_bytes().to_vec();
+            self.active_mut().write(&bytes);
+            return KeyAction::None;
+        }
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
@@ -966,10 +1135,15 @@ impl App {
         let existing_ns_view: Option<*mut std::ffi::c_void> = {
             #[cfg(target_os = "macos")]
             {
-                self.windows.values().next().and_then(|tw| ns_view_ptr(&tw.window))
+                self.windows
+                    .values()
+                    .next()
+                    .and_then(|tw| ns_view_ptr(&tw.window))
             }
             #[cfg(not(target_os = "macos"))]
-            { None }
+            {
+                None
+            }
         };
 
         let mut attrs = WindowAttributes::default()
@@ -1005,7 +1179,8 @@ impl App {
         }
 
         // Create wgpu surface
-        let surface: wgpu::Surface<'static> = wgpu.instance
+        let surface: wgpu::Surface<'static> = wgpu
+            .instance
             .create_surface(window.clone())
             .expect("create surface");
 
@@ -1018,14 +1193,23 @@ impl App {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&wgpu.device, &surface_config);
 
         let scale = window.scale_factor();
-        let renderer = Renderer::new(wgpu.device.clone(), wgpu.queue.clone(), surface_format, scale);
+        let renderer = Renderer::new(
+            wgpu.device.clone(),
+            wgpu.queue.clone(),
+            surface_format,
+            scale,
+        );
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
@@ -1064,7 +1248,11 @@ impl App {
 
         // Wire the "+" button after the window is fully set up.
         #[cfg(target_os = "macos")]
-        if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
+        if let Some(ns_view) = self
+            .windows
+            .get(&window_id)
+            .and_then(|tw| ns_view_ptr(&tw.window))
+        {
             platform::setup_add_tab_button(ns_view);
         }
 
@@ -1214,13 +1402,11 @@ impl ApplicationHandler<AppEvent> for App {
             .create_surface(window.clone())
             .expect("create wgpu surface");
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
         .expect("no suitable GPU adapter");
 
         let (device, queue) = pollster::block_on(adapter.request_device(
@@ -1234,7 +1420,7 @@ impl ApplicationHandler<AppEvent> for App {
         .expect("request_device");
 
         let device = Arc::new(device);
-        let queue  = Arc::new(queue);
+        let queue = Arc::new(queue);
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -1243,14 +1429,23 @@ impl ApplicationHandler<AppEvent> for App {
             .iter()
             .copied()
             .find(|f| !f.is_srgb())
-            .unwrap_or_else(|| caps.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
+            .unwrap_or_else(|| {
+                caps.formats
+                    .first()
+                    .copied()
+                    .unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
+            });
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1326,7 +1521,11 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Wire the "+" button after the window is fully set up.
         #[cfg(target_os = "macos")]
-        if let Some(ns_view) = self.windows.get(&window_id).and_then(|tw| ns_view_ptr(&tw.window)) {
+        if let Some(ns_view) = self
+            .windows
+            .get(&window_id)
+            .and_then(|tw| ns_view_ptr(&tw.window))
+        {
             platform::setup_add_tab_button(ns_view);
         }
 
@@ -1412,7 +1611,8 @@ impl ApplicationHandler<AppEvent> for App {
                             tw.window.request_redraw();
                         }
                     }
-                    KeyAction::PrevTab => {
+                    KeyAction::PrevTab =>
+                    {
                         #[cfg(target_os = "macos")]
                         if let Some(tw) = self.windows.get(&window_id) {
                             if let Some(ns_view) = ns_view_ptr(&tw.window) {
@@ -1420,7 +1620,8 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    KeyAction::NextTab => {
+                    KeyAction::NextTab =>
+                    {
                         #[cfg(target_os = "macos")]
                         if let Some(tw) = self.windows.get(&window_id) {
                             if let Some(ns_view) = ns_view_ptr(&tw.window) {
@@ -1428,7 +1629,8 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    KeyAction::SelectTab(n) => {
+                    KeyAction::SelectTab(n) =>
+                    {
                         #[cfg(target_os = "macos")]
                         if let Some(tw) = self.windows.get(&window_id) {
                             if let Some(ns_view) = ns_view_ptr(&tw.window) {
@@ -1458,17 +1660,23 @@ impl ApplicationHandler<AppEvent> for App {
 
                     if tw.selecting {
                         if let Some(anchor) = tw.sel_anchor {
-                            let cell = tw.pixel_to_grid_cell(position.x, position.y)
-                                .or_else(|| {
+                            let cell =
+                                tw.pixel_to_grid_cell(position.x, position.y).or_else(|| {
                                     // Clamp to nearest edge
                                     let rects = tw.pane_rects();
                                     let ai = tw.active_pane;
-                                    let (ox, oy, pw, ph) = rects.get(ai).copied().unwrap_or((0., 0., tw.window.inner_size().width as f32, tw.window.inner_size().height as f32));
+                                    let (ox, oy, pw, ph) = rects.get(ai).copied().unwrap_or((
+                                        0.,
+                                        0.,
+                                        tw.window.inner_size().width as f32,
+                                        tw.window.inner_size().height as f32,
+                                    ));
                                     let cw = tw.renderer.cell_width as f64;
                                     let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
                                     let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
                                     let vo = tw.panes[ai].terminal.state.viewport_offset as i64;
-                                    let col = ((position.x - ox as f64).max(0.) / cw as f64) as usize;
+                                    let col =
+                                        ((position.x - ox as f64).max(0.) / cw as f64) as usize;
                                     let col = col.min(vis_cols.saturating_sub(1));
                                     if position.y < oy as f64 {
                                         Some((ai, -vo, col))
@@ -1479,7 +1687,10 @@ impl ApplicationHandler<AppEvent> for App {
                             if let Some((_pi, grid_row, col)) = cell {
                                 let c = (grid_row, col);
                                 tw.panes[tw.active_pane].selection = if c != anchor {
-                                    Some(Selection { start: anchor, end: c })
+                                    Some(Selection {
+                                        start: anchor,
+                                        end: c,
+                                    })
                                 } else {
                                     None
                                 };
@@ -1488,7 +1699,8 @@ impl ApplicationHandler<AppEvent> for App {
                             // Auto-scroll detection
                             let ai = tw.active_pane;
                             let rects = tw.pane_rects();
-                            let (_ox, oy, _pw, ph) = rects.get(ai).copied().unwrap_or((0., 0., 0., 0.));
+                            let (_ox, oy, _pw, ph) =
+                                rects.get(ai).copied().unwrap_or((0., 0., 0., 0.));
                             let ch = tw.renderer.cell_height as f64;
                             let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
                             let term_bottom = oy as f64 + vis_rows as f64 * ch;
@@ -1541,7 +1753,8 @@ impl ApplicationHandler<AppEvent> for App {
                                 }
                             };
                             let url = osc8_url.or_else(|| {
-                                tw.panes[pi].urls_cached(vis_rows, vis_cols)
+                                tw.panes[pi]
+                                    .urls_cached(vis_rows, vis_cols)
                                     .iter()
                                     .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                                     .map(|(_, _, _, u)| u.clone())
@@ -1549,7 +1762,7 @@ impl ApplicationHandler<AppEvent> for App {
                             if let Some(u) = url {
                                 // Only open http/https URLs — defence in depth against
                                 // file:// or custom-scheme injection via terminal output.
-                                if u.starts_with("http://") || u.starts_with("https://") {
+                                if should_open_url(&u) {
                                     let _ = std::process::Command::new("open").arg(&u).spawn();
                                 }
                                 true
@@ -1598,62 +1811,29 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(tw) = self.windows.get_mut(&window_id) {
-                    let state = &tw.panes[tw.active_pane].terminal.state;
-                    // Forward scroll as arrow keys only in alt-screen mode (vim, htop, etc.),
-                    // unless mouse tracking is active — then the app receives raw mouse events.
-                    let mouse_tracking = state.mouse_tracking;
-                    let mouse_sgr = state.mouse_sgr;
-                    let app_scroll = state.is_alt_screen() && !mouse_tracking;
-                    let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => {
-                            tw.scroll_frac = 0.0;
-                            (y * 4.5) as i32
-                        }
-                        MouseScrollDelta::PixelDelta(pos) => {
-                            let ch = tw.renderer.cell_height as f64;
-                            tw.scroll_frac += pos.y / ch * 3.0;
-                            let whole = tw.scroll_frac.trunc() as i32;
-                            tw.scroll_frac -= whole as f64;
-                            whole
-                        }
+                    let lines =
+                        mouse_wheel_lines(&delta, tw.renderer.cell_height, &mut tw.scroll_frac);
+                    let cell = if lines != 0 {
+                        let (mx, my) = tw.cursor_pos;
+                        tw.pixel_to_pane_cell(mx, my)
+                            .map(|(_, row, col)| (row, col))
+                    } else {
+                        None
                     };
-                    if lines != 0 {
-                        if mouse_tracking {
-                            // Send mouse scroll events to the PTY so the app can handle them
-                            // in context (e.g. scroll a specific pane / list, not the history).
-                            // Button 64 = scroll up, 65 = scroll down (X10/SGR encoding).
-                            let (mx, my) = tw.cursor_pos;
-                            if let Some((_pi, row, col)) = tw.pixel_to_pane_cell(mx, my) {
-                                let count = lines.unsigned_abs();
-                                // Positive lines = scroll up (content moves up = wheel up).
-                                let button = if lines > 0 { 64u32 } else { 65u32 };
-                                let col1 = col + 1;
-                                let row1 = row + 1;
-                                if mouse_sgr {
-                                    let seq = format!("\x1b[<{button};{col1};{row1}M");
-                                    for _ in 0..count {
-                                        tw.panes[tw.active_pane].write(seq.as_bytes());
-                                    }
-                                } else {
-                                    // X10 format: ESC [ M Cb Cx Cy (capped at char 255)
-                                    let cb = (32 + button).min(255) as u8;
-                                    let cx = (32 + col1).min(255) as u8;
-                                    let cy = (32 + row1).min(255) as u8;
-                                    let seq = [0x1b, b'[', b'M', cb, cx, cy];
-                                    for _ in 0..count {
-                                        tw.panes[tw.active_pane].write(&seq);
-                                    }
-                                }
-                            }
-                        } else if app_scroll {
-                            // Alt screen without mouse tracking: forward as arrow keys (vim, htop).
-                            let seq = if lines > 0 { b"\x1bOA".as_ref() } else { b"\x1bOB".as_ref() };
-                            for _ in 0..lines.unsigned_abs() {
-                                tw.panes[tw.active_pane].write(seq);
-                            }
-                        } else {
+                    let action = {
+                        let state = &tw.panes[tw.active_pane].terminal.state;
+                        mouse_wheel_action(state, lines, cell)
+                    };
+                    match action {
+                        MouseWheelAction::None => {}
+                        MouseWheelAction::LocalViewport(lines) => {
                             tw.active_mut().terminal.state.scroll_viewport(lines);
                             tw.window.request_redraw();
+                        }
+                        MouseWheelAction::PtyWrites(writes) => {
+                            for seq in writes {
+                                tw.panes[tw.active_pane].write(&seq);
+                            }
                         }
                     }
                 }
@@ -1672,9 +1852,12 @@ impl ApplicationHandler<AppEvent> for App {
 
         for tw in self.windows.values_mut() {
             // Cursor blink
-            if now.duration_since(tw.last_blink) >= BLINK_PERIOD {
-                tw.cursor_visible = !tw.cursor_visible;
-                tw.last_blink = now;
+            if update_cursor_blink(
+                &mut tw.cursor_visible,
+                &mut tw.last_blink,
+                now,
+                BLINK_PERIOD,
+            ) {
                 tw.window.request_redraw();
             }
 
@@ -1693,10 +1876,17 @@ impl ApplicationHandler<AppEvent> for App {
                     let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
                     let col = ((mx.max(0.0)) / cw) as usize;
                     let col = col.min(vis_cols.saturating_sub(1));
-                    let edge_row = if dir > 0 { -vo } else { vis_rows as i64 - 1 - vo };
+                    let edge_row = if dir > 0 {
+                        -vo
+                    } else {
+                        vis_rows as i64 - 1 - vo
+                    };
                     let c = (edge_row, col);
                     tw.panes[ai].selection = if c != anchor {
-                        Some(Selection { start: anchor, end: c })
+                        Some(Selection {
+                            start: anchor,
+                            end: c,
+                        })
                     } else {
                         None
                     };
@@ -1734,17 +1924,17 @@ impl ApplicationHandler<AppEvent> for App {
                     if sync_before && !sync_after {
                         tw.window.request_redraw();
                     }
-                    let responses: Vec<Vec<u8>> =
-                        pane.terminal.state.pending_responses.drain(..).collect();
+                    let clipboard_payload = pane
+                        .terminal
+                        .state
+                        .osc_52_query
+                        .then(osc52_clipboard_payload);
+                    let responses = drain_terminal_host_responses(
+                        &mut pane.terminal.state,
+                        clipboard_payload.as_deref().unwrap_or(""),
+                    );
                     for r in responses {
                         let _ = pane.pty_writer.write_all(&r);
-                        let _ = pane.pty_writer.flush();
-                    }
-                    if pane.terminal.state.osc_52_query {
-                        pane.terminal.state.osc_52_query = false;
-                        let payload = osc52_clipboard_payload();
-                        let response = format!("\x1b]52;c;{payload}\x07");
-                        let _ = pane.pty_writer.write_all(response.as_bytes());
                         let _ = pane.pty_writer.flush();
                     }
                 }
@@ -1757,7 +1947,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // Only redraw immediately if synchronized-output mode is off.
                 // When ?2026h is active the application will clear it (?2026l)
                 // once it has finished writing, which triggers the redraw then.
-                if !tw.panes
+                if !tw
+                    .panes
                     .iter()
                     .find(|p| p.id == pane_id)
                     .map(|p| p.terminal.state.sync_output)
@@ -1877,7 +2068,9 @@ fn strip_tcat_gutter(text: &str) -> String {
                     continue;
                 }
                 let prefix = &chars[..i - 1];
-                if prefix.iter().all(|&c| c == ' ' || c == '\0' || c.is_ascii_digit())
+                if prefix
+                    .iter()
+                    .all(|&c| c == ' ' || c == '\0' || c.is_ascii_digit())
                     && prefix.iter().any(|c| c.is_ascii_digit())
                 {
                     return chars[i + 2..].iter().collect::<String>();
@@ -1906,58 +2099,62 @@ fn sh_sq_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-fn setup_shell_env(cmd: &mut CommandBuilder) {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ShellTools {
+    tcat: Option<PathBuf>,
+    tdiff: Option<PathBuf>,
+    tjson: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellBootstrapFiles {
+    zshenv: String,
+    zshrc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellEnvPlan {
+    files: ShellBootstrapFiles,
+    env: Vec<(String, String)>,
+}
+
+fn discover_shell_tools(exe_dir: Option<&Path>) -> ShellTools {
+    let Some(exe_dir) = exe_dir else {
+        return ShellTools::default();
     };
-    // Escape for safe embedding in POSIX single-quoted shell strings.
-    let home = sh_sq_escape(&home);
-
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let tcat = exe_dir
-        .as_ref()
-        .map(|d| d.join("tcat"))
-        .filter(|p| p.exists());
-    let tdiff = exe_dir
-        .as_ref()
-        .map(|d| d.join("tdiff"))
-        .filter(|p| p.exists());
-    let tjson = exe_dir
-        .as_ref()
-        .map(|d| d.join("tjson"))
-        .filter(|p| p.exists());
-
-    let zdotdir = std::env::temp_dir().join(format!("term_zsh_{}", std::process::id()));
-    if std::fs::create_dir_all(&zdotdir).is_err() {
-        return;
+    let tool = |name: &str| {
+        let path = exe_dir.join(name);
+        path.exists().then_some(path)
+    };
+    ShellTools {
+        tcat: tool("tcat"),
+        tdiff: tool("tdiff"),
+        tjson: tool("tjson"),
     }
+}
 
-    let _ = std::fs::write(
-        zdotdir.join(".zshenv"),
-        format!("[ -f '{home}/.zshenv' ] && source '{home}/.zshenv'\n"),
-    );
+fn build_shell_bootstrap_files(home: &str, tools: &ShellTools) -> ShellBootstrapFiles {
+    let home = sh_sq_escape(home);
+    let zshenv = format!("[ -f '{home}/.zshenv' ] && source '{home}/.zshenv'\n");
 
-    let cat_fn = match &tcat {
-        Some(p) => format!(
+    let cat_fn = match tools.tcat.as_ref() {
+        Some(path) => format!(
             "_TCAT='{}'\nfunction cat() {{\n  if [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
-            sh_sq_escape(&p.display().to_string())
+            sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
     };
-    let diff_fn = match &tdiff {
-        Some(p) => format!(
+    let diff_fn = match tools.tdiff.as_ref() {
+        Some(path) => format!(
             "export GIT_PAGER='{}'\nexport GIT_COLOR_UI=never\n",
-            sh_sq_escape(&p.display().to_string())
+            sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
     };
-    let json_fn = match &tjson {
-        Some(p) => format!(
+    let json_fn = match tools.tjson.as_ref() {
+        Some(path) => format!(
             "_TJSON='{}'\nfunction json() {{ \"$_TJSON\" \"$@\"; }}\n",
-            sh_sq_escape(&p.display().to_string())
+            sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
     };
@@ -1987,33 +2184,77 @@ _term_title_precmd
 autoload -Uz compinit && compinit -C
 zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
 "#;
-    // Prompt: ~/path [jj info] ❯  (Catppuccin Mocha blue dir, mauve chevron)
-    // \x1b embeds a literal ESC byte so zsh sees real ANSI sequences.
-    // %{...%} tells zsh these bytes are zero-width (for correct line-length math).
-    // _term_jj calls jj_prompt if the user defined it (e.g. in their .zshrc),
-    // and is a no-op otherwise. PROMPT_SUBST (set by zsh or user's .zshrc) makes
-    // $(...) re-evaluate on every prompt draw.
     let prompt_setup = concat!(
         "setopt PROMPT_SUBST\n",
         "_term_jj() { (( ${+functions[jj_prompt]} )) && jj_prompt; }\n",
         "PROMPT=\"%{\x1b[38;2;137;180;250m%}%~%{\x1b[0m%} $(_term_jj)%{\x1b[38;2;203;166;247m%}\u{276F}%{\x1b[0m%} \"\n",
     );
-
     let zshrc = format!(
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
          {cat_fn}{diff_fn}{json_fn}{zle_hooks}{prompt_setup}"
     );
-    let _ = std::fs::write(zdotdir.join(".zshrc"), &zshrc);
 
-    cmd.env("ZDOTDIR", &zdotdir);
-    cmd.env("TERM_PROGRAM", "ghostty");
-    if std::env::var("LANG").is_err() {
-        cmd.env("LANG", "en_US.UTF-8");
+    ShellBootstrapFiles { zshenv, zshrc }
+}
+
+fn build_shell_env_plan(
+    home: &str,
+    tools: &ShellTools,
+    zdotdir: &Path,
+    has_lang: bool,
+    has_lc_all: bool,
+) -> ShellEnvPlan {
+    let mut env = vec![
+        (
+            "ZDOTDIR".to_string(),
+            zdotdir.to_string_lossy().into_owned(),
+        ),
+        ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
+    ];
+    if !has_lang {
+        env.push(("LANG".to_string(), "en_US.UTF-8".to_string()));
     }
-    if std::env::var("LC_ALL").is_err() {
-        cmd.env("LC_ALL", "en_US.UTF-8");
+    if !has_lc_all {
+        env.push(("LC_ALL".to_string(), "en_US.UTF-8".to_string()));
+    }
+    ShellEnvPlan {
+        files: build_shell_bootstrap_files(home, tools),
+        env,
+    }
+}
+
+fn write_shell_bootstrap_files(zdotdir: &Path, files: &ShellBootstrapFiles) -> std::io::Result<()> {
+    std::fs::create_dir_all(zdotdir)?;
+    std::fs::write(zdotdir.join(".zshenv"), &files.zshenv)?;
+    std::fs::write(zdotdir.join(".zshrc"), &files.zshrc)?;
+    Ok(())
+}
+
+fn setup_shell_env(cmd: &mut CommandBuilder) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let tools = discover_shell_tools(exe_dir.as_deref());
+    let zdotdir = std::env::temp_dir().join(format!("term_zsh_{}", std::process::id()));
+    let plan = build_shell_env_plan(
+        &home,
+        &tools,
+        &zdotdir,
+        std::env::var("LANG").is_ok(),
+        std::env::var("LC_ALL").is_ok(),
+    );
+    if write_shell_bootstrap_files(&zdotdir, &plan.files).is_err() {
+        return;
+    }
+    for (key, value) in plan.env {
+        cmd.env(key, value);
     }
 }
 
@@ -2032,8 +2273,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, find_urls, sh_sq_escape, urls_with_cache};
+    use super::*;
     use crate::terminal::{Terminal, TerminalState};
+    use tempfile::TempDir;
 
     /// Write `text` into row 0 of a freshly-created state.
     fn make_state(text: &str) -> TerminalState {
@@ -2049,7 +2291,10 @@ mod tests {
     fn urls(text: &str) -> Vec<String> {
         let s = make_state(text);
         let cols = s.cols;
-        find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect()
+        find_urls(&s, 1, cols)
+            .into_iter()
+            .map(|(_, _, _, u)| u)
+            .collect()
     }
 
     // ── happy-path detection ──────────────────────────────────────────────────
@@ -2119,7 +2364,10 @@ mod tests {
 
     #[test]
     fn stops_at_space() {
-        assert_eq!(urls("https://a.com https://b.com"), vec!["https://a.com", "https://b.com"]);
+        assert_eq!(
+            urls("https://a.com https://b.com"),
+            vec!["https://a.com", "https://b.com"]
+        );
     }
 
     #[test]
@@ -2208,7 +2456,12 @@ mod tests {
         for len in 0..=9 {
             let data = vec![0xffu8; len];
             let encoded = base64_encode(&data);
-            assert_eq!(encoded.len() % 4, 0, "length {len} → encoded len {}", encoded.len());
+            assert_eq!(
+                encoded.len() % 4,
+                0,
+                "length {len} → encoded len {}",
+                encoded.len()
+            );
         }
     }
 
@@ -2289,10 +2542,16 @@ mod tests {
         // First call — populates cache.
         urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
         // Corrupt the state grid so a fresh scan would return nothing.
-        for cell in &mut state.grid[0] { cell.c = ' '; }
+        for cell in &mut state.grid[0] {
+            cell.c = ' ';
+        }
         // Second call with same generation + dims — must return cached value.
         let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
-        assert_eq!(result.len(), 1, "cache hit must return previously scanned URL");
+        assert_eq!(
+            result.len(),
+            1,
+            "cache hit must return previously scanned URL"
+        );
     }
 
     #[test]
@@ -2306,7 +2565,9 @@ mod tests {
         assert_eq!(cache.len(), 1);
         // Bump generation and clear the grid — rescan should return empty.
         state.generation = 2;
-        for cell in &mut state.grid[0] { cell.c = ' '; }
+        for cell in &mut state.grid[0] {
+            cell.c = ' ';
+        }
         let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
         assert_eq!(result.len(), 0, "stale generation must trigger rescan");
         assert_eq!(cache_gen, 2);
@@ -2359,9 +2620,17 @@ mod tests {
         let url = "file:///etc/passwd";
         let cols = url.len() + 2;
         let mut s = TerminalState::new(cols, 1);
-        for (i, c) in url.chars().enumerate() { s.grid[0][i].c = c; }
-        let urls: Vec<_> = find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect();
-        assert!(urls.is_empty(), "file:// must not be detected as a URL: {urls:?}");
+        for (i, c) in url.chars().enumerate() {
+            s.grid[0][i].c = c;
+        }
+        let urls: Vec<_> = find_urls(&s, 1, cols)
+            .into_iter()
+            .map(|(_, _, _, u)| u)
+            .collect();
+        assert!(
+            urls.is_empty(),
+            "file:// must not be detected as a URL: {urls:?}"
+        );
     }
 
     #[test]
@@ -2370,9 +2639,17 @@ mod tests {
             let url = format!("{scheme}evil");
             let cols = url.len() + 2;
             let mut s = TerminalState::new(cols, 1);
-            for (i, c) in url.chars().enumerate() { s.grid[0][i].c = c; }
-            let urls: Vec<_> = find_urls(&s, 1, cols).into_iter().map(|(_, _, _, u)| u).collect();
-            assert!(urls.is_empty(), "scheme '{scheme}' must not be detected: {urls:?}");
+            for (i, c) in url.chars().enumerate() {
+                s.grid[0][i].c = c;
+            }
+            let urls: Vec<_> = find_urls(&s, 1, cols)
+                .into_iter()
+                .map(|(_, _, _, u)| u)
+                .collect();
+            assert!(
+                urls.is_empty(),
+                "scheme '{scheme}' must not be detected: {urls:?}"
+            );
         }
     }
 
@@ -2380,10 +2657,228 @@ mod tests {
     fn find_urls_detects_http_and_https_only() {
         let mut s = TerminalState::new(80, 1);
         let line = "http://a.com https://b.com ftp://c.com";
-        for (i, c) in line.chars().enumerate() { s.grid[0][i].c = c; }
-        let urls: Vec<_> = find_urls(&s, 1, 80).into_iter().map(|(_, _, _, u)| u).collect();
+        for (i, c) in line.chars().enumerate() {
+            s.grid[0][i].c = c;
+        }
+        let urls: Vec<_> = find_urls(&s, 1, 80)
+            .into_iter()
+            .map(|(_, _, _, u)| u)
+            .collect();
         assert_eq!(urls.len(), 2, "only http and https should be detected");
         assert!(urls[0].starts_with("http://"));
         assert!(urls[1].starts_with("https://"));
+    }
+
+    // ── Bracketed paste ────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_bracketed_paste_passthrough_when_disabled() {
+        assert_eq!(wrap_bracketed_paste(b"hello", false), b"hello");
+    }
+
+    #[test]
+    fn wrap_bracketed_paste_adds_wrappers_when_enabled() {
+        assert_eq!(
+            wrap_bracketed_paste(b"hello", true),
+            b"\x1b[200~hello\x1b[201~"
+        );
+    }
+
+    // ── URL opening guard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn should_open_url_allows_only_http_and_https() {
+        assert!(should_open_url("http://example.com"));
+        assert!(should_open_url("https://example.com"));
+        assert!(!should_open_url("file:///etc/passwd"));
+        assert!(!should_open_url("javascript:alert(1)"));
+    }
+
+    // ── Mouse wheel helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn mouse_wheel_lines_accumulates_pixel_delta() {
+        let mut frac = 0.0;
+        let first = mouse_wheel_lines(
+            &MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 8.0)),
+            16,
+            &mut frac,
+        );
+        let second = mouse_wheel_lines(
+            &MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 8.0)),
+            16,
+            &mut frac,
+        );
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(frac, 0.0);
+    }
+
+    #[test]
+    fn mouse_wheel_action_local_viewport_scrolls_normal_screen() {
+        let term = Terminal::new(80, 24);
+        assert_eq!(
+            mouse_wheel_action(&term.state, 3, None),
+            MouseWheelAction::LocalViewport(3)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_action_alt_screen_uses_application_cursor_keys() {
+        let mut term = Terminal::new(80, 24);
+        term.process(b"\x1b[?1049h");
+        assert_eq!(
+            mouse_wheel_action(&term.state, -2, None),
+            MouseWheelAction::PtyWrites(vec![b"\x1bOB".to_vec(), b"\x1bOB".to_vec()])
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_action_mouse_tracking_sgr_encodes_scroll_reports() {
+        let mut term = Terminal::new(80, 24);
+        term.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            mouse_wheel_action(&term.state, -2, Some((3, 4))),
+            MouseWheelAction::PtyWrites(
+                vec![b"\x1b[<65;5;4M".to_vec(), b"\x1b[<65;5;4M".to_vec(),]
+            )
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_action_mouse_tracking_x10_caps_coordinates() {
+        let mut term = Terminal::new(80, 24);
+        term.process(b"\x1b[?1000h");
+        assert_eq!(
+            mouse_wheel_action(&term.state, 1, Some((500, 500))),
+            MouseWheelAction::PtyWrites(vec![vec![0x1b, b'[', b'M', 96, 255, 255]])
+        );
+    }
+
+    // ── Blink helpers ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_cursor_blink_toggles_only_after_period() {
+        let now = Instant::now();
+        let mut cursor_visible = true;
+        let mut last_blink = now;
+        assert!(!update_cursor_blink(
+            &mut cursor_visible,
+            &mut last_blink,
+            now + Duration::from_millis(100),
+            Duration::from_millis(530),
+        ));
+        assert!(cursor_visible);
+        assert!(update_cursor_blink(
+            &mut cursor_visible,
+            &mut last_blink,
+            now + Duration::from_millis(600),
+            Duration::from_millis(530),
+        ));
+        assert!(!cursor_visible);
+    }
+
+    // ── Host response helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn drain_terminal_host_responses_merges_pending_and_osc52() {
+        let mut state = TerminalState::new(80, 24);
+        state.pending_responses.push(b"\x1b[5;10R".to_vec());
+        state.osc_52_query = true;
+
+        let responses = drain_terminal_host_responses(&mut state, "aGVsbG8=");
+        assert_eq!(
+            responses,
+            vec![b"\x1b[5;10R".to_vec(), b"\x1b]52;c;aGVsbG8=\x07".to_vec()]
+        );
+        assert!(state.pending_responses.is_empty());
+        assert!(!state.osc_52_query);
+    }
+
+    // ── Shell bootstrap helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn discover_shell_tools_finds_existing_neighbors() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("tcat"), b"").unwrap();
+        std::fs::write(dir.path().join("tdiff"), b"").unwrap();
+
+        let tools = discover_shell_tools(Some(dir.path()));
+        assert_eq!(tools.tcat, Some(dir.path().join("tcat")));
+        assert_eq!(tools.tdiff, Some(dir.path().join("tdiff")));
+        assert_eq!(tools.tjson, None);
+    }
+
+    #[test]
+    fn build_shell_bootstrap_files_include_aliases_hooks_and_escaping() {
+        let tools = ShellTools {
+            tcat: Some(PathBuf::from("/tmp/O'Brien/bin/tcat")),
+            tdiff: Some(PathBuf::from("/tmp/O'Brien/bin/tdiff")),
+            tjson: Some(PathBuf::from("/tmp/O'Brien/bin/tjson")),
+        };
+
+        let files = build_shell_bootstrap_files("/Users/O'Brien", &tools);
+        assert!(files.zshenv.contains("[ -f '/Users/O'\\''Brien/.zshenv' ]"));
+        assert!(files.zshrc.contains("_TCAT='/tmp/O'\\''Brien/bin/tcat'"));
+        assert!(
+            files
+                .zshrc
+                .contains("export GIT_PAGER='/tmp/O'\\''Brien/bin/tdiff'")
+        );
+        assert!(files.zshrc.contains("_TJSON='/tmp/O'\\''Brien/bin/tjson'"));
+        assert!(files.zshrc.contains("function cat()"));
+        assert!(files.zshrc.contains("function json()"));
+        assert!(
+            files
+                .zshrc
+                .contains("add-zle-hook-widget zle-line-pre-redraw _term_buf_report")
+        );
+        assert!(
+            files
+                .zshrc
+                .contains("preexec_functions+=( _term_preexec_clear _term_title_preexec )")
+        );
+        assert!(files.zshrc.contains("autoload -Uz compinit && compinit -C"));
+        assert!(files.zshrc.contains("PROMPT=\"%{"));
+    }
+
+    #[test]
+    fn build_shell_env_plan_injects_only_missing_locale_vars() {
+        let plan = build_shell_env_plan(
+            "/Users/alice",
+            &ShellTools::default(),
+            Path::new("/tmp/term-zdotdir"),
+            false,
+            true,
+        );
+        assert!(
+            plan.env
+                .contains(&(String::from("ZDOTDIR"), String::from("/tmp/term-zdotdir")))
+        );
+        assert!(
+            plan.env
+                .contains(&(String::from("TERM_PROGRAM"), String::from("ghostty")))
+        );
+        assert!(
+            plan.env
+                .contains(&(String::from("LANG"), String::from("en_US.UTF-8")))
+        );
+        assert!(!plan.env.iter().any(|(k, _)| k == "LC_ALL"));
+    }
+
+    #[test]
+    fn write_shell_bootstrap_files_persists_expected_contents() {
+        let dir = TempDir::new().unwrap();
+        let files = build_shell_bootstrap_files("/Users/alice", &ShellTools::default());
+        write_shell_bootstrap_files(dir.path(), &files).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".zshenv")).unwrap(),
+            files.zshenv
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".zshrc")).unwrap(),
+            files.zshrc
+        );
     }
 }

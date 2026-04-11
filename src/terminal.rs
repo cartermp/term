@@ -490,18 +490,14 @@ impl TerminalState {
                     } else if g.len() >= 3 && g[1] == 5 {
                         self.attrs.fg = ansi_256_color(g[2] as u8);
                     // Legacy form: 38;2;r;g;b
-                    } else if i + 4 < groups.len()
-                        && groups[i + 1].first().copied() == Some(2)
-                    {
+                    } else if i + 4 < groups.len() && groups[i + 1].first().copied() == Some(2) {
                         let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
                         let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
                         self.attrs.fg = Color::new(r, g_, b);
                         i += 4;
                     // Legacy form: 38;5;n
-                    } else if i + 2 < groups.len()
-                        && groups[i + 1].first().copied() == Some(5)
-                    {
+                    } else if i + 2 < groups.len() && groups[i + 1].first().copied() == Some(5) {
                         let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         self.attrs.fg = ansi_256_color(n);
                         i += 2;
@@ -518,17 +514,13 @@ impl TerminalState {
                         );
                     } else if g.len() >= 3 && g[1] == 5 {
                         self.attrs.bg = ansi_256_color(g[2] as u8);
-                    } else if i + 4 < groups.len()
-                        && groups[i + 1].first().copied() == Some(2)
-                    {
+                    } else if i + 4 < groups.len() && groups[i + 1].first().copied() == Some(2) {
                         let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
                         let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
                         self.attrs.bg = Color::new(r, g_, b);
                         i += 4;
-                    } else if i + 2 < groups.len()
-                        && groups[i + 1].first().copied() == Some(5)
-                    {
+                    } else if i + 2 < groups.len() && groups[i + 1].first().copied() == Some(5) {
                         let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         self.attrs.bg = ansi_256_color(n);
                         i += 2;
@@ -545,17 +537,13 @@ impl TerminalState {
                         ));
                     } else if g.len() >= 3 && g[1] == 5 {
                         self.attrs.underline_color = Some(ansi_256_color(g[2] as u8));
-                    } else if i + 4 < groups.len()
-                        && groups[i + 1].first().copied() == Some(2)
-                    {
+                    } else if i + 4 < groups.len() && groups[i + 1].first().copied() == Some(2) {
                         let r = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         let g_ = groups[i + 3].first().copied().unwrap_or(0) as u8;
                         let b = groups[i + 4].first().copied().unwrap_or(0) as u8;
                         self.attrs.underline_color = Some(Color::new(r, g_, b));
                         i += 4;
-                    } else if i + 2 < groups.len()
-                        && groups[i + 1].first().copied() == Some(5)
-                    {
+                    } else if i + 2 < groups.len() && groups[i + 1].first().copied() == Some(5) {
                         let n = groups[i + 2].first().copied().unwrap_or(0) as u8;
                         self.attrs.underline_color = Some(ansi_256_color(n));
                         i += 2;
@@ -862,9 +850,10 @@ impl Perform for TerminalState {
         match params[0] {
             b"0" | b"2" => {
                 if params.len() >= 2
-                    && let Ok(s) = std::str::from_utf8(params[1]) {
-                        self.title = s.to_string();
-                    }
+                    && let Ok(s) = std::str::from_utf8(params[1])
+                {
+                    self.title = s.to_string();
+                }
             }
             b"7" => {
                 // OSC 7: shell reports current directory as file://hostname/path
@@ -965,6 +954,186 @@ mod tests {
         term.state.grid[row][col].c
     }
 
+    #[derive(Debug, PartialEq)]
+    struct CellSnapshot {
+        c: char,
+        combining: Vec<char>,
+        attrs: Attrs,
+        link_id: u16,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TerminalSnapshot {
+        grid: Vec<Vec<CellSnapshot>>,
+        scrollback: Vec<Vec<CellSnapshot>>,
+        alt_grid: Vec<Vec<CellSnapshot>>,
+        viewport_offset: usize,
+        cols: usize,
+        rows: usize,
+        cursor_row: usize,
+        cursor_col: usize,
+        attrs: Attrs,
+        scroll_top: usize,
+        scroll_bottom: usize,
+        title: String,
+        pending_responses: Vec<Vec<u8>>,
+        input_buffer: String,
+        input_cursor: usize,
+        current_dir: String,
+        osc_52_query: bool,
+        bracketed_paste: bool,
+        cursor_keys_app_mode: bool,
+        cursor_shape: u8,
+        focus_tracking: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+        sync_output: bool,
+        links: Vec<String>,
+        current_link_id: u16,
+        saved_cursor: (usize, usize),
+        saved_attrs: Attrs,
+        wrap_next: bool,
+        last_placed: (usize, usize),
+        last_was_regional_indicator: bool,
+        alt_screen: bool,
+        alt_saved_cursor: (usize, usize),
+    }
+
+    fn snapshot_cell(cell: Cell) -> CellSnapshot {
+        CellSnapshot {
+            c: cell.c,
+            combining: cell.combining_chars().to_vec(),
+            attrs: cell.attrs,
+            link_id: cell.link_id,
+        }
+    }
+
+    fn snapshot_rows(rows: &[Vec<Cell>]) -> Vec<Vec<CellSnapshot>> {
+        rows.iter()
+            .map(|row| row.iter().copied().map(snapshot_cell).collect())
+            .collect()
+    }
+
+    fn snapshot(term: &Terminal) -> TerminalSnapshot {
+        let state = &term.state;
+        TerminalSnapshot {
+            grid: snapshot_rows(&state.grid),
+            scrollback: state
+                .scrollback
+                .iter()
+                .map(|row| row.iter().copied().map(snapshot_cell).collect())
+                .collect(),
+            alt_grid: snapshot_rows(&state.alt_grid),
+            viewport_offset: state.viewport_offset,
+            cols: state.cols,
+            rows: state.rows,
+            cursor_row: state.cursor_row,
+            cursor_col: state.cursor_col,
+            attrs: state.attrs,
+            scroll_top: state.scroll_top,
+            scroll_bottom: state.scroll_bottom,
+            title: state.title.clone(),
+            pending_responses: state.pending_responses.clone(),
+            input_buffer: state.input_buffer.clone(),
+            input_cursor: state.input_cursor,
+            current_dir: state.current_dir.clone(),
+            osc_52_query: state.osc_52_query,
+            bracketed_paste: state.bracketed_paste,
+            cursor_keys_app_mode: state.cursor_keys_app_mode,
+            cursor_shape: state.cursor_shape,
+            focus_tracking: state.focus_tracking,
+            mouse_tracking: state.mouse_tracking,
+            mouse_sgr: state.mouse_sgr,
+            sync_output: state.sync_output,
+            links: state.links.clone(),
+            current_link_id: state.current_link_id,
+            saved_cursor: state.saved_cursor,
+            saved_attrs: state.saved_attrs,
+            wrap_next: state.wrap_next,
+            last_placed: state.last_placed,
+            last_was_regional_indicator: state.last_was_regional_indicator,
+            alt_screen: state.alt_screen,
+            alt_saved_cursor: state.alt_saved_cursor,
+        }
+    }
+
+    fn row_text(row: &[Cell]) -> String {
+        row.iter()
+            .map(|cell| cell.c)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn process_one_byte_at_a_time(term: &mut Terminal, bytes: &[u8]) {
+        for &byte in bytes {
+            term.process(std::slice::from_ref(&byte));
+        }
+    }
+
+    fn process_lcg_chunks(term: &mut Terminal, bytes: &[u8], seed: u32) {
+        let mut cursor = 0usize;
+        let mut state = seed;
+        while cursor < bytes.len() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let chunk_len = ((state >> 16) as usize % 9) + 1;
+            let end = (cursor + chunk_len).min(bytes.len());
+            term.process(&bytes[cursor..end]);
+            cursor = end;
+        }
+    }
+
+    fn assert_chunking_equivalence(cols: usize, rows: usize, bytes: &[u8]) {
+        let mut whole = t(cols, rows);
+        whole.process(bytes);
+        let expected = snapshot(&whole);
+
+        let mut single = t(cols, rows);
+        process_one_byte_at_a_time(&mut single, bytes);
+        assert_eq!(
+            snapshot(&single),
+            expected,
+            "single-byte chunking changed the final state"
+        );
+
+        let mut pseudo_random = t(cols, rows);
+        process_lcg_chunks(&mut pseudo_random, bytes, 0xC0FFEE);
+        assert_eq!(
+            snapshot(&pseudo_random),
+            expected,
+            "deterministic pseudo-random chunking changed the final state"
+        );
+    }
+
+    fn shell_session_transcript() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b]7;file://localhost/Users/alice/src/term\x07");
+        bytes.extend_from_slice(b"\x1b]0;~/src/term\x07");
+        bytes.extend_from_slice(b"\x1b]9001;git status\x07");
+        bytes.extend_from_slice(b"\x1b[?2004h");
+        bytes.extend_from_slice(b"~/src/term > git status");
+        bytes.extend_from_slice(b"\r\nOn branch main");
+        bytes.extend_from_slice(b"\r\nChanges not staged");
+        bytes.extend_from_slice(b"\r\n\x1b]8;;https://example.com\x07docs\x1b]8;;\x07");
+        bytes.extend_from_slice(b"\r\nready");
+        bytes.extend_from_slice(b"\x1b]9001;\x07");
+        bytes
+    }
+
+    fn alt_screen_program_transcript() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"shell");
+        bytes.extend_from_slice(b"\x1b[?1049h");
+        bytes.extend_from_slice(b"\x1b]0;vim src/main.rs\x07");
+        bytes.extend_from_slice(b"\x1b[?1000h\x1b[?1006h\x1b[?2026h");
+        bytes.extend_from_slice(b"\x1b[2 q");
+        bytes.extend_from_slice(b"~\r\n~\r\n:help");
+        bytes.extend_from_slice(b"\x1b[?2026l\x1b[?1006l\x1b[?1000l");
+        bytes.extend_from_slice(b"\x1b[?1049l");
+        bytes.extend_from_slice(b"\x1b]0;~/src/term\x07");
+        bytes
+    }
+
     // ── Basic character output ────────────────────────────────────────────────
 
     #[test]
@@ -992,7 +1161,10 @@ mod tests {
         t.process("e\u{0301}".as_bytes());
         assert_eq!(ch(&t, 0, 0), 'e');
         assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0301}']);
-        assert_eq!(t.state.cursor_col, 1, "cursor must not advance for combiner");
+        assert_eq!(
+            t.state.cursor_col, 1,
+            "cursor must not advance for combiner"
+        );
     }
 
     #[test]
@@ -1080,7 +1252,10 @@ mod tests {
         let mut t = t(80, 24);
         t.process("a\u{0325}\u{0303}".as_bytes());
         assert_eq!(ch(&t, 0, 0), 'a');
-        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0325}', '\u{0303}']);
+        assert_eq!(
+            t.state.grid[0][0].combining_chars(),
+            &['\u{0325}', '\u{0303}']
+        );
         assert_eq!(t.state.cursor_col, 1);
     }
 
@@ -1092,7 +1267,10 @@ mod tests {
         // U+0300–U+0303 = four combining graves/accents
         t.process("e\u{0300}\u{0301}\u{0302}\u{0303}".as_bytes());
         assert_eq!(ch(&t, 0, 0), 'e');
-        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0300}', '\u{0301}', '\u{0302}']);
+        assert_eq!(
+            t.state.grid[0][0].combining_chars(),
+            &['\u{0300}', '\u{0301}', '\u{0302}']
+        );
         // 4th combiner dropped; cursor still at 1
         assert_eq!(t.state.cursor_col, 1);
     }
@@ -1115,7 +1293,10 @@ mod tests {
         t.process("ABCD\u{0301}".as_bytes()); // 4 ASCII chars fill row 0; combiner follows
         assert_eq!(ch(&t, 0, 3), 'D');
         assert_eq!(t.state.grid[0][3].combining_chars(), &['\u{0301}']);
-        assert_eq!(t.state.cursor_row, 0, "wrap must not have fired for the combiner");
+        assert_eq!(
+            t.state.cursor_row, 0,
+            "wrap must not have fired for the combiner"
+        );
     }
 
     #[test]
@@ -1196,14 +1377,24 @@ mod tests {
     #[test]
     fn all_five_skin_tones_attached() {
         // Five separate base+modifier pairs on the same row.
-        let bases  = ['\u{1F44B}'; 5]; // 👋
-        let tones  = ['\u{1F3FB}', '\u{1F3FC}', '\u{1F3FD}', '\u{1F3FE}', '\u{1F3FF}'];
+        let bases = ['\u{1F44B}'; 5]; // 👋
+        let tones = [
+            '\u{1F3FB}',
+            '\u{1F3FC}',
+            '\u{1F3FD}',
+            '\u{1F3FE}',
+            '\u{1F3FF}',
+        ];
         let mut t = t(80, 24);
         for (col, (&base, &tone)) in bases.iter().zip(tones.iter()).enumerate() {
             let s = format!("{base}{tone}");
             t.process(s.as_bytes());
             assert_eq!(ch(&t, 0, col), base, "col {col} base");
-            assert_eq!(t.state.grid[0][col].combining_chars(), &[tone], "col {col} tone");
+            assert_eq!(
+                t.state.grid[0][col].combining_chars(),
+                &[tone],
+                "col {col} tone"
+            );
         }
         assert_eq!(t.state.cursor_col, 5);
     }
@@ -1286,7 +1477,10 @@ mod tests {
         let mut t = t(80, 24);
         t.process("\u{05E9}\u{05C1}\u{05BC}".as_bytes());
         assert_eq!(ch(&t, 0, 0), '\u{05E9}');
-        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{05C1}', '\u{05BC}']);
+        assert_eq!(
+            t.state.grid[0][0].combining_chars(),
+            &['\u{05C1}', '\u{05BC}']
+        );
         assert_eq!(t.state.cursor_col, 1);
     }
 
@@ -1336,7 +1530,10 @@ mod tests {
         let mut t = t(80, 24);
         t.process("\u{0628}\u{0651}\u{0650}".as_bytes());
         assert_eq!(ch(&t, 0, 0), '\u{0628}');
-        assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{0651}', '\u{0650}']);
+        assert_eq!(
+            t.state.grid[0][0].combining_chars(),
+            &['\u{0651}', '\u{0650}']
+        );
         assert_eq!(t.state.cursor_col, 1);
     }
 
@@ -1348,10 +1545,10 @@ mod tests {
         let word = "\u{0643}\u{0650}\u{062A}\u{064E}\u{0627}\u{0628}\u{064C}";
         let mut t = t(80, 24);
         t.process(word.as_bytes());
-        assert_eq!(ch(&t, 0, 0), '\u{0643}');  // kaf
-        assert_eq!(ch(&t, 0, 1), '\u{062A}');  // ta
-        assert_eq!(ch(&t, 0, 2), '\u{0627}');  // alef
-        assert_eq!(ch(&t, 0, 3), '\u{0628}');  // ba
+        assert_eq!(ch(&t, 0, 0), '\u{0643}'); // kaf
+        assert_eq!(ch(&t, 0, 1), '\u{062A}'); // ta
+        assert_eq!(ch(&t, 0, 2), '\u{0627}'); // alef
+        assert_eq!(ch(&t, 0, 3), '\u{0628}'); // ba
         assert_eq!(t.state.cursor_col, 4);
     }
 
@@ -1473,6 +1670,62 @@ mod tests {
             .trim_end_matches(' ')
             .to_string();
         assert_eq!(row, "line1");
+    }
+
+    #[test]
+    fn shell_session_transcript_is_chunk_boundary_stable() {
+        let transcript = shell_session_transcript();
+        assert_chunking_equivalence(40, 4, &transcript);
+    }
+
+    #[test]
+    fn shell_session_transcript_reaches_expected_state() {
+        let transcript = shell_session_transcript();
+        let mut t = t(40, 4);
+        t.process(&transcript);
+
+        assert_eq!(t.state.current_dir, "/Users/alice/src/term");
+        assert_eq!(t.state.title, "~/src/term");
+        assert_eq!(t.state.input_buffer, "");
+        assert_eq!(t.state.input_cursor, 0);
+        assert!(t.state.bracketed_paste);
+        assert_eq!(t.state.scrollback.len(), 1);
+        assert_eq!(row_text(&t.state.scrollback[0]), "~/src/term > git status");
+        assert_eq!(row_text(&t.state.grid[0]), "On branch main");
+        assert_eq!(row_text(&t.state.grid[1]), "Changes not staged");
+        assert_eq!(row_text(&t.state.grid[2]), "docs");
+        assert_eq!(row_text(&t.state.grid[3]), "ready");
+        assert_eq!(t.state.links, vec!["https://example.com"]);
+        for col in 0..4 {
+            assert_eq!(t.state.grid[2][col].link_id, 1, "col {col}");
+        }
+        assert_eq!(t.state.current_link_id, 0);
+    }
+
+    #[test]
+    fn alt_screen_program_transcript_is_chunk_boundary_stable() {
+        let transcript = alt_screen_program_transcript();
+        assert_chunking_equivalence(20, 4, &transcript);
+    }
+
+    #[test]
+    fn alt_screen_program_transcript_restores_normal_screen() {
+        let transcript = alt_screen_program_transcript();
+        let mut t = t(20, 4);
+        t.process(&transcript);
+
+        assert!(!t.state.is_alt_screen());
+        assert_eq!(t.state.title, "~/src/term");
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 5);
+        assert!(!t.state.mouse_tracking);
+        assert!(!t.state.mouse_sgr);
+        assert!(!t.state.sync_output);
+        assert_eq!(t.state.cursor_shape, 2);
+        assert_eq!(row_text(&t.state.grid[0]), "shell");
+        assert_eq!(row_text(&t.state.alt_grid[0]), "~");
+        assert_eq!(row_text(&t.state.alt_grid[1]), "~");
+        assert_eq!(row_text(&t.state.alt_grid[2]), ":help");
     }
 
     #[test]
@@ -1793,7 +2046,10 @@ mod tests {
         // Send a payload larger than 64 KiB — input_buffer must be unchanged.
         let huge = vec![b'x'; 65 * 1024];
         s.osc_dispatch(&[b"9001", &huge], false);
-        assert_eq!(s.input_buffer, "prior", "oversized OSC 9001 must not overwrite input_buffer");
+        assert_eq!(
+            s.input_buffer, "prior",
+            "oversized OSC 9001 must not overwrite input_buffer"
+        );
     }
 
     // ── Device status report ──────────────────────────────────────────────────
@@ -1948,7 +2204,11 @@ mod tests {
         let before = t.state.scrollback.len();
         // Force several scroll events on the alt screen
         t.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
-        assert_eq!(t.state.scrollback.len(), before, "alt-screen must not add to scrollback");
+        assert_eq!(
+            t.state.scrollback.len(),
+            before,
+            "alt-screen must not add to scrollback"
+        );
     }
 
     #[test]
@@ -2051,7 +2311,10 @@ mod tests {
         let mut t = t(80, 24);
         let default_fg = t.state.attrs.fg;
         t.process(b"\x1b[38;5m");
-        assert_eq!(t.state.attrs.fg, default_fg, "incomplete SGR 38;5 must not change fg");
+        assert_eq!(
+            t.state.attrs.fg, default_fg,
+            "incomplete SGR 38;5 must not change fg"
+        );
     }
 
     #[test]
@@ -2059,7 +2322,10 @@ mod tests {
         let mut t = t(80, 24);
         let default_bg = t.state.attrs.bg;
         t.process(b"\x1b[48;5m");
-        assert_eq!(t.state.attrs.bg, default_bg, "incomplete SGR 48;5 must not change bg");
+        assert_eq!(
+            t.state.attrs.bg, default_bg,
+            "incomplete SGR 48;5 must not change bg"
+        );
     }
 
     #[test]
@@ -2068,7 +2334,10 @@ mod tests {
         let mut t = t(80, 24);
         let default_fg = t.state.attrs.fg;
         t.process(b"\x1b[38;2;100m");
-        assert_eq!(t.state.attrs.fg, default_fg, "incomplete RGB (only R) must not change fg");
+        assert_eq!(
+            t.state.attrs.fg, default_fg,
+            "incomplete RGB (only R) must not change fg"
+        );
     }
 
     #[test]
@@ -2078,7 +2347,10 @@ mod tests {
         let mut t = t(80, 24);
         let default_fg = t.state.attrs.fg;
         t.process(b"\x1b[38;2;100;150m");
-        assert_eq!(t.state.attrs.fg, default_fg, "incomplete RGB (no B) must not change fg");
+        assert_eq!(
+            t.state.attrs.fg, default_fg,
+            "incomplete RGB (no B) must not change fg"
+        );
     }
 
     #[test]
@@ -2098,7 +2370,7 @@ mod tests {
         // A/B/C/D do not — consistent with xterm behaviour.
         let mut t = t(5, 5);
         t.process(b"\x1b[2;1H"); // cursor to row 1, col 0
-        t.process(b"ABCDE");      // fill 5-col row → wrap_next = true
+        t.process(b"ABCDE"); // fill 5-col row → wrap_next = true
         assert!(t.state.wrap_next);
 
         // CUP must clear it
@@ -2128,7 +2400,7 @@ mod tests {
     fn cursor_up_past_scroll_top_clamps_at_zero() {
         let mut t = t(80, 24);
         t.process(b"\x1b[10;1H"); // row 10 (1-indexed) = row 9
-        t.process(b"\x1b[100A");  // up 100 — should clamp at scroll_top (0)
+        t.process(b"\x1b[100A"); // up 100 — should clamp at scroll_top (0)
         assert_eq!(t.state.cursor_row, 0);
     }
 
@@ -2148,11 +2420,17 @@ mod tests {
         // the shrunken grid. The cursor must be clamped to the new bounds.
         let mut t = t(80, 24);
         t.process(b"\x1b[24;80H"); // last cell (row=23, col=79)
-        t.process(b"\x1b[s");       // save
+        t.process(b"\x1b[s"); // save
         t.resize(40, 12);
-        t.process(b"\x1b[u");       // restore — cursor clamped to (11, 39)
-        assert_eq!(t.state.cursor_row, 11, "cursor row must clamp to new rows-1");
-        assert_eq!(t.state.cursor_col, 39, "cursor col must clamp to new cols-1");
+        t.process(b"\x1b[u"); // restore — cursor clamped to (11, 39)
+        assert_eq!(
+            t.state.cursor_row, 11,
+            "cursor row must clamp to new rows-1"
+        );
+        assert_eq!(
+            t.state.cursor_col, 39,
+            "cursor col must clamp to new cols-1"
+        );
     }
 
     #[test]
@@ -2160,9 +2438,9 @@ mod tests {
         // Same as above but using ESC 7 / ESC 8 save/restore.
         let mut t = t(80, 24);
         t.process(b"\x1b[24;80H");
-        t.process(b"\x1b7");        // ESC 7: save
+        t.process(b"\x1b7"); // ESC 7: save
         t.resize(40, 12);
-        t.process(b"\x1b8");        // ESC 8: restore
+        t.process(b"\x1b8"); // ESC 8: restore
         assert_eq!(t.state.cursor_row, 11);
         assert_eq!(t.state.cursor_col, 39);
     }
@@ -2173,10 +2451,10 @@ mod tests {
         // by erase_line would index self.grid[23] and panic.
         let mut t = t(80, 24);
         t.process(b"\x1b[24;6H"); // row=23, col=5 (col is within 40-col bounds)
-        t.process(b"\x1b[s");      // save
+        t.process(b"\x1b[s"); // save
         t.resize(40, 12);
-        t.process(b"\x1b[u");      // restore — clamped to (11, 5)
-        t.process(b"\x1b[K");      // erase line — must not panic
+        t.process(b"\x1b[u"); // restore — clamped to (11, 5)
+        t.process(b"\x1b[K"); // erase line — must not panic
         assert_eq!(t.state.grid.len(), 12);
     }
 
@@ -2185,8 +2463,8 @@ mod tests {
     #[test]
     fn ech_large_count_clamps_to_row_end() {
         let mut t = t(10, 5);
-        t.process(b"ABCDEFGHIJ");  // fill row 0 (cols 0–9)
-        t.process(b"\x1b[1;6H");  // col 6 (1-indexed) → cursor at col 5
+        t.process(b"ABCDEFGHIJ"); // fill row 0 (cols 0–9)
+        t.process(b"\x1b[1;6H"); // col 6 (1-indexed) → cursor at col 5
         t.process(b"\x1b[1000X"); // erase 1000 chars — only cols 5–9 remain in range
         assert_eq!(ch(&t, 0, 4), 'E', "col before cursor must be untouched");
         assert_eq!(ch(&t, 0, 5), ' ', "col at cursor must be erased");
@@ -2204,7 +2482,7 @@ mod tests {
             t.process(seq.as_bytes());
         }
         t.process(b"\x1b[3;5r"); // set scroll region rows 3–5
-        t.process(b"\x1b[1S");   // SU: scroll up 1 within region
+        t.process(b"\x1b[1S"); // SU: scroll up 1 within region
 
         // Above region: untouched
         assert_eq!(ch(&t, 0, 0), 'A');
@@ -2227,7 +2505,7 @@ mod tests {
             t.process(seq.as_bytes());
         }
         t.process(b"\x1b[3;5r"); // scroll region rows 3–5
-        t.process(b"\x1b[1T");   // SD: scroll down 1 within region
+        t.process(b"\x1b[1T"); // SD: scroll down 1 within region
 
         assert_eq!(ch(&t, 0, 0), 'A');
         assert_eq!(ch(&t, 1, 0), 'B');
@@ -2248,8 +2526,8 @@ mod tests {
         t.process(b"\x1b[1;1HABCDE");
         t.process(b"\x1b[2;1HFGHIJ");
         t.process(b"\x1b[3;1HKLMNO");
-        t.process(b"\x1b[3;5H");  // cursor at last cell (row=2, col=4)
-        t.process(b"\x1b[0J");    // ED mode 0: erase from cursor to end
+        t.process(b"\x1b[3;5H"); // cursor at last cell (row=2, col=4)
+        t.process(b"\x1b[0J"); // ED mode 0: erase from cursor to end
 
         assert_eq!(ch(&t, 2, 3), 'N', "cell before cursor must be untouched");
         assert_eq!(ch(&t, 2, 4), ' ', "cursor cell must be erased");
@@ -2260,8 +2538,8 @@ mod tests {
     fn ed_mode1_from_first_cell_erases_only_cursor_cell() {
         let mut t = t(5, 3);
         t.process(b"\x1b[1;1HABCDE");
-        t.process(b"\x1b[1;1H");  // cursor at (0, 0)
-        t.process(b"\x1b[1J");    // ED mode 1: erase from start to cursor (inclusive)
+        t.process(b"\x1b[1;1H"); // cursor at (0, 0)
+        t.process(b"\x1b[1J"); // ED mode 1: erase from start to cursor (inclusive)
 
         assert_eq!(ch(&t, 0, 0), ' ', "cursor cell must be erased");
         assert_eq!(ch(&t, 0, 1), 'B', "cells after cursor must be untouched");
@@ -2278,14 +2556,22 @@ mod tests {
         }
         t.process(b"\x1b[3;6r"); // scroll region rows 3–6 (scroll_top=2, scroll_bottom=5)
         t.process(b"\x1b[3;1H"); // cursor to scroll_top
-        t.process(b"\x1b[1L");   // IL: insert 1 blank line
+        t.process(b"\x1b[1L"); // IL: insert 1 blank line
 
         assert_eq!(ch(&t, 0, 0), 'A', "above region unchanged");
         assert_eq!(ch(&t, 1, 0), 'B', "above region unchanged");
         assert_eq!(ch(&t, 2, 0), ' ', "blank inserted at cursor (scroll_top)");
-        assert_eq!(ch(&t, 3, 0), 'C', "previous scroll_top content shifted down");
+        assert_eq!(
+            ch(&t, 3, 0),
+            'C',
+            "previous scroll_top content shifted down"
+        );
         assert_eq!(ch(&t, 4, 0), 'D');
-        assert_eq!(ch(&t, 5, 0), 'E', "scroll_bottom now has what was one above");
+        assert_eq!(
+            ch(&t, 5, 0),
+            'E',
+            "scroll_bottom now has what was one above"
+        );
         assert_eq!(ch(&t, 6, 0), 'G', "below region unchanged");
         assert_eq!(ch(&t, 7, 0), 'H');
     }
@@ -2305,9 +2591,17 @@ mod tests {
     fn sgr_underline_on_off() {
         let mut t = t(10, 5);
         t.process(b"\x1b[4m");
-        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::Straight, "SGR 4 must set straight underline");
+        assert_eq!(
+            t.state.attrs.underline_style,
+            UnderlineStyle::Straight,
+            "SGR 4 must set straight underline"
+        );
         t.process(b"\x1b[24m");
-        assert_eq!(t.state.attrs.underline_style, UnderlineStyle::None, "SGR 24 must clear underline");
+        assert_eq!(
+            t.state.attrs.underline_style,
+            UnderlineStyle::None,
+            "SGR 24 must clear underline"
+        );
     }
 
     #[test]
@@ -2316,7 +2610,10 @@ mod tests {
         t.process(b"\x1b[31m"); // red fg
         assert_ne!(t.state.attrs.fg, DEFAULT_FG);
         t.process(b"\x1b[39m"); // reset fg
-        assert_eq!(t.state.attrs.fg, DEFAULT_FG, "SGR 39 must restore default fg");
+        assert_eq!(
+            t.state.attrs.fg, DEFAULT_FG,
+            "SGR 39 must restore default fg"
+        );
     }
 
     #[test]
@@ -2325,7 +2622,10 @@ mod tests {
         t.process(b"\x1b[41m"); // red bg
         assert_ne!(t.state.attrs.bg, DEFAULT_BG);
         t.process(b"\x1b[49m"); // reset bg
-        assert_eq!(t.state.attrs.bg, DEFAULT_BG, "SGR 49 must restore default bg");
+        assert_eq!(
+            t.state.attrs.bg, DEFAULT_BG,
+            "SGR 49 must restore default bg"
+        );
     }
 
     #[test]
@@ -2334,8 +2634,11 @@ mod tests {
         for n in 0u8..8 {
             t.process(format!("\x1b[{}m", 100 + n).as_bytes());
             assert_eq!(
-                t.state.attrs.bg, ANSI_COLORS[(n + 8) as usize],
-                "SGR {} must use ANSI_COLORS[{}]", 100 + n, n + 8
+                t.state.attrs.bg,
+                ANSI_COLORS[(n + 8) as usize],
+                "SGR {} must use ANSI_COLORS[{}]",
+                100 + n,
+                n + 8
             );
         }
     }
@@ -2346,7 +2649,7 @@ mod tests {
     fn cnl_moves_cursor_down_and_to_col_zero() {
         let mut t = t(10, 10);
         t.process(b"\x1b[5;5H"); // row 5, col 5
-        t.process(b"\x1b[2E");   // CNL 2 — down 2, col 0
+        t.process(b"\x1b[2E"); // CNL 2 — down 2, col 0
         assert_eq!(t.state.cursor_row, 6, "CNL 2 from row 4 must land at row 6");
         assert_eq!(t.state.cursor_col, 0, "CNL must reset col to 0");
     }
@@ -2355,7 +2658,7 @@ mod tests {
     fn cpl_moves_cursor_up_and_to_col_zero() {
         let mut t = t(10, 10);
         t.process(b"\x1b[5;5H"); // row 5, col 5
-        t.process(b"\x1b[2F");   // CPL 2 — up 2, col 0
+        t.process(b"\x1b[2F"); // CPL 2 — up 2, col 0
         assert_eq!(t.state.cursor_row, 2, "CPL 2 from row 4 must land at row 2");
         assert_eq!(t.state.cursor_col, 0, "CPL must reset col to 0");
     }
@@ -2382,7 +2685,7 @@ mod tests {
     fn vpa_default_goes_to_row_zero() {
         let mut t = t(10, 10);
         t.process(b"\x1b[5;1H"); // move away first
-        t.process(b"\x1b[1d");   // VPA 1 → row 0
+        t.process(b"\x1b[1d"); // VPA 1 → row 0
         assert_eq!(t.state.cursor_row, 0);
     }
 
@@ -2426,7 +2729,7 @@ mod tests {
         let mut t = t(5, 4);
         t.process(b"A\r\nB\r\nC\r\nD");
         t.process(b"\x1b[2;1H"); // cursor to row 1 (0-indexed)
-        t.process(b"\x1b[1M");   // DL 1
+        t.process(b"\x1b[1M"); // DL 1
         // Row "B" deleted; "C","D" shift up.
         assert_eq!(ch(&t, 0, 0), 'A');
         assert_eq!(ch(&t, 1, 0), 'C', "DL must shift remaining rows up");
@@ -2440,7 +2743,7 @@ mod tests {
     fn esc_d_index_advances_row() {
         let mut t = t(5, 5);
         t.process(b"\x1b[2;3H"); // row 1, col 2
-        t.process(b"\x1bD");     // IND — newline without CR
+        t.process(b"\x1bD"); // IND — newline without CR
         assert_eq!(t.state.cursor_row, 2, "ESC D must advance row");
         assert_eq!(t.state.cursor_col, 2, "ESC D must not change col");
     }
@@ -2449,7 +2752,7 @@ mod tests {
     fn esc_e_next_line_advances_row_and_resets_col() {
         let mut t = t(5, 5);
         t.process(b"\x1b[2;3H"); // row 1, col 2
-        t.process(b"\x1bE");     // NEL
+        t.process(b"\x1bE"); // NEL
         assert_eq!(t.state.cursor_row, 2, "ESC E must advance row");
         assert_eq!(t.state.cursor_col, 0, "ESC E must reset col to 0");
     }
@@ -2458,7 +2761,7 @@ mod tests {
     fn esc_m_reverse_index_moves_up() {
         let mut t = t(5, 5);
         t.process(b"\x1b[3;1H"); // row 2
-        t.process(b"\x1bM");     // RI — reverse index
+        t.process(b"\x1bM"); // RI — reverse index
         assert_eq!(t.state.cursor_row, 1, "ESC M must move cursor up");
     }
 
@@ -2479,13 +2782,16 @@ mod tests {
     fn esc_c_resets_to_fresh_state() {
         let mut t = t(10, 5);
         // Set some state.
-        t.process(b"\x1b[31m");       // red fg
-        t.process(b"\x1b[5;5H");      // move cursor
+        t.process(b"\x1b[31m"); // red fg
+        t.process(b"\x1b[5;5H"); // move cursor
         t.process(b"HELLO");
-        t.process(b"\x1bc");          // RIS — hard reset
+        t.process(b"\x1bc"); // RIS — hard reset
         assert_eq!(t.state.cursor_row, 0, "RIS must reset cursor to origin");
         assert_eq!(t.state.cursor_col, 0);
-        assert_eq!(t.state.attrs.fg, DEFAULT_FG, "RIS must reset SGR attributes");
+        assert_eq!(
+            t.state.attrs.fg, DEFAULT_FG,
+            "RIS must reset SGR attributes"
+        );
         assert_eq!(ch(&t, 0, 0), ' ', "RIS must clear screen");
     }
 
@@ -2500,7 +2806,10 @@ mod tests {
             "CSI c must queue a device attributes response"
         );
         let resp = &t.state.pending_responses[0];
-        assert_eq!(resp, b"\x1b[?1;2c", "device attributes response must be ESC[?1;2c");
+        assert_eq!(
+            resp, b"\x1b[?1;2c",
+            "device attributes response must be ESC[?1;2c"
+        );
     }
 
     // ── Cursor keys application mode ──────────────────────────────────────────
@@ -2571,7 +2880,7 @@ mod tests {
     fn cuf_with_count_moves_right_n_cols() {
         let mut t = t(20, 5);
         t.process(b"\x1b[1;1H"); // col 0
-        t.process(b"\x1b[5C");   // CUF 5
+        t.process(b"\x1b[5C"); // CUF 5
         assert_eq!(t.state.cursor_col, 5);
     }
 
@@ -2579,7 +2888,7 @@ mod tests {
     fn cub_with_count_moves_left_n_cols() {
         let mut t = t(20, 5);
         t.process(b"\x1b[1;10H"); // col 9
-        t.process(b"\x1b[3D");    // CUB 3
+        t.process(b"\x1b[3D"); // CUB 3
         assert_eq!(t.state.cursor_col, 6);
     }
 
@@ -2608,9 +2917,15 @@ mod tests {
         for i in 0..10 {
             t.process(format!("line{i}\r\n").as_bytes());
         }
-        assert!(!t.state.scrollback.is_empty(), "scrollback must be non-empty before ED 3");
+        assert!(
+            !t.state.scrollback.is_empty(),
+            "scrollback must be non-empty before ED 3"
+        );
         t.process(b"\x1b[3J");
-        assert!(t.state.scrollback.is_empty(), "ED 3 (CSI 3 J) must clear scrollback");
+        assert!(
+            t.state.scrollback.is_empty(),
+            "ED 3 (CSI 3 J) must clear scrollback"
+        );
     }
 
     // ── OSC 9001 boundary tests ───────────────────────────────────────────────
@@ -2621,7 +2936,11 @@ mod tests {
         let mut s = TerminalState::new(80, 24);
         let payload = vec![b'a'; 64 * 1024];
         s.osc_dispatch(&[b"9001", &payload], false);
-        assert_eq!(s.input_buffer.len(), 64 * 1024, "64 KiB payload must be accepted");
+        assert_eq!(
+            s.input_buffer.len(),
+            64 * 1024,
+            "64 KiB payload must be accepted"
+        );
     }
 
     #[test]
@@ -2631,7 +2950,10 @@ mod tests {
         assert_eq!(s.input_buffer, "seed");
         let over = vec![b'b'; 64 * 1024 + 1];
         s.osc_dispatch(&[b"9001", &over], false);
-        assert_eq!(s.input_buffer, "seed", "one byte over 64 KiB must be rejected");
+        assert_eq!(
+            s.input_buffer, "seed",
+            "one byte over 64 KiB must be rejected"
+        );
     }
 
     // ── generation counter ───────────────────────────────────────────────────
@@ -2671,7 +2993,10 @@ mod tests {
         let mut t = Terminal::new(80, 24);
         t.state.generation = u64::MAX;
         t.process(b"x");
-        assert_eq!(t.state.generation, 0, "generation must wrap via wrapping_add");
+        assert_eq!(
+            t.state.generation, 0,
+            "generation must wrap via wrapping_add"
+        );
     }
 
     // ── DECSCUSR ─────────────────────────────────────────────────────────────
@@ -2701,17 +3026,24 @@ mod tests {
     fn decstr_resets_attrs_and_scroll_region() {
         let mut t = t(20, 10);
         t.process(b"\x1b[1;3;4m"); // bold, italic, underline
-        t.process(b"\x1b[3;8r");   // scroll region rows 3-8
-        t.process(b"\x1b[2 q");    // steady block cursor
+        t.process(b"\x1b[3;8r"); // scroll region rows 3-8
+        t.process(b"\x1b[2 q"); // steady block cursor
         assert_ne!(t.state.attrs, Attrs::default());
         assert_eq!(t.state.scroll_top, 2);
         assert_eq!(t.state.scroll_bottom, 7);
         assert_eq!(t.state.cursor_shape, 2);
         // DECSTR: CSI ! p
         t.process(b"\x1b[!p");
-        assert_eq!(t.state.attrs, Attrs::default(), "DECSTR must reset SGR attrs");
+        assert_eq!(
+            t.state.attrs,
+            Attrs::default(),
+            "DECSTR must reset SGR attrs"
+        );
         assert_eq!(t.state.scroll_top, 0, "DECSTR must reset scroll region top");
-        assert_eq!(t.state.scroll_bottom, 9, "DECSTR must reset scroll region bottom");
+        assert_eq!(
+            t.state.scroll_bottom, 9,
+            "DECSTR must reset scroll region bottom"
+        );
         assert_eq!(t.state.cursor_shape, 0, "DECSTR must reset cursor shape");
     }
 
@@ -2721,7 +3053,10 @@ mod tests {
         t.process(b"hello");
         t.process(b"\x1b[!p"); // soft reset
         let row: String = t.state.grid[0].iter().map(|c| c.c).collect();
-        assert!(row.starts_with("hello"), "DECSTR must not clear screen content");
+        assert!(
+            row.starts_with("hello"),
+            "DECSTR must not clear screen content"
+        );
     }
 
     // ── Focus tracking (?1004h) ───────────────────────────────────────────────
@@ -2781,7 +3116,8 @@ mod tests {
             let mut t = t(10, 5);
             t.process(seq);
             assert_eq!(
-                t.state.attrs.underline_style, *expected,
+                t.state.attrs.underline_style,
+                *expected,
                 "sequence {:?} should give {expected:?}",
                 std::str::from_utf8(seq).unwrap_or("?")
             );
@@ -2863,7 +3199,10 @@ mod tests {
         t.process(b"plain");
         // Cells 0-3 in row 0 should carry link_id = 1
         for col in 0..4 {
-            assert_eq!(t.state.grid[0][col].link_id, 1, "col {col} should have link_id 1");
+            assert_eq!(
+                t.state.grid[0][col].link_id, 1,
+                "col {col} should have link_id 1"
+            );
         }
         // Cell 4 onward should have link_id 0
         assert_eq!(t.state.grid[0][4].link_id, 0, "col 4 should have no link");
@@ -2902,7 +3241,10 @@ mod tests {
             let mut t = t(10, 5);
             let seq = format!("\x1b[{} q", shape);
             t.process(seq.as_bytes());
-            assert_eq!(t.state.cursor_shape, shape, "shape {shape} must be stored as-is");
+            assert_eq!(
+                t.state.cursor_shape, shape,
+                "shape {shape} must be stored as-is"
+            );
         }
     }
 
@@ -2936,7 +3278,11 @@ mod tests {
         let sb_len = t.state.scrollback.len();
         assert!(sb_len > 0, "scrollback must be non-empty before DECSTR");
         t.process(b"\x1b[!p");
-        assert_eq!(t.state.scrollback.len(), sb_len, "DECSTR must not clear scrollback");
+        assert_eq!(
+            t.state.scrollback.len(),
+            sb_len,
+            "DECSTR must not clear scrollback"
+        );
     }
 
     #[test]
@@ -2945,7 +3291,10 @@ mod tests {
         t.process(b"\x1b[?1h"); // enable DECCKM
         assert!(t.state.cursor_keys_app_mode);
         t.process(b"\x1b[!p");
-        assert!(!t.state.cursor_keys_app_mode, "DECSTR must reset cursor key mode");
+        assert!(
+            !t.state.cursor_keys_app_mode,
+            "DECSTR must reset cursor key mode"
+        );
     }
 
     #[test]
@@ -2953,7 +3302,10 @@ mod tests {
         // Fill a row to trigger wrap_next, then DECSTR should clear it.
         let mut t = t(5, 5);
         t.process(b"ABCDE"); // fills row 0, wrap_next=true on last char
-        assert!(t.state.wrap_next, "wrap_next should be set after filling a row");
+        assert!(
+            t.state.wrap_next,
+            "wrap_next should be set after filling a row"
+        );
         t.process(b"\x1b[!p");
         assert!(!t.state.wrap_next, "DECSTR must clear wrap_next");
     }
@@ -2966,9 +3318,15 @@ mod tests {
         t.process(b"X");
         let cell = t.state.grid[0][0];
         assert!(!cell.attrs.bold, "DECSTR must reset bold before next print");
-        assert!(!cell.attrs.italic, "DECSTR must reset italic before next print");
-        assert_eq!(cell.attrs.underline_style, UnderlineStyle::None,
-            "DECSTR must reset underline_style before next print");
+        assert!(
+            !cell.attrs.italic,
+            "DECSTR must reset italic before next print"
+        );
+        assert_eq!(
+            cell.attrs.underline_style,
+            UnderlineStyle::None,
+            "DECSTR must reset underline_style before next print"
+        );
     }
 
     // ── Focus tracking comprehensive ──────────────────────────────────────────
@@ -2978,14 +3336,20 @@ mod tests {
         let mut t = t(80, 24);
         t.process(b"\x1b[?1004h");
         t.process(b"\x1b[?1004h");
-        assert!(t.state.focus_tracking, "double-enable must still leave focus_tracking on");
+        assert!(
+            t.state.focus_tracking,
+            "double-enable must still leave focus_tracking on"
+        );
     }
 
     #[test]
     fn focus_tracking_double_disable_is_safe() {
         let mut t = t(80, 24);
         t.process(b"\x1b[?1004l"); // disable when already off
-        assert!(!t.state.focus_tracking, "disable when already off must not panic");
+        assert!(
+            !t.state.focus_tracking,
+            "disable when already off must not panic"
+        );
     }
 
     #[test]
@@ -2994,7 +3358,10 @@ mod tests {
         t.process(b"\x1b[?1004h");
         t.process(b"\x1b[?1004l");
         t.process(b"\x1b[?1004h");
-        assert!(t.state.focus_tracking, "re-enabling after disable must work");
+        assert!(
+            t.state.focus_tracking,
+            "re-enabling after disable must work"
+        );
     }
 
     // ── Synchronized output comprehensive ─────────────────────────────────────
@@ -3023,7 +3390,10 @@ mod tests {
         t.process(b"\x1b[?2026h");
         assert!(t.state.sync_output);
         t.process(b"\x1b[?2026l");
-        assert!(!t.state.sync_output, "sync_output must be false after ?2026l");
+        assert!(
+            !t.state.sync_output,
+            "sync_output must be false after ?2026l"
+        );
     }
 
     // ── SGR underline styles comprehensive ───────────────────────────────────
@@ -3038,9 +3408,12 @@ mod tests {
     fn sgr_4_does_not_clear_existing_underline_color() {
         let mut t = t(10, 5);
         t.process(b"\x1b[58:2:255:0:0m"); // set red underline color
-        t.process(b"\x1b[4m");             // set underline style
-        assert_eq!(t.state.attrs.underline_color, Some(Color::new(255, 0, 0)),
-            "SGR 4 must not clear existing underline color");
+        t.process(b"\x1b[4m"); // set underline style
+        assert_eq!(
+            t.state.attrs.underline_color,
+            Some(Color::new(255, 0, 0)),
+            "SGR 4 must not clear existing underline color"
+        );
     }
 
     #[test]
@@ -3048,7 +3421,10 @@ mod tests {
         // 58;2;r;g;b — legacy form using semicolons, not sub-params
         let mut t = t(10, 5);
         t.process(b"\x1b[58;2;100;150;200m");
-        assert_eq!(t.state.attrs.underline_color, Some(Color::new(100, 150, 200)));
+        assert_eq!(
+            t.state.attrs.underline_color,
+            Some(Color::new(100, 150, 200))
+        );
     }
 
     #[test]
@@ -3064,8 +3440,11 @@ mod tests {
         let mut t = t(10, 5);
         t.process(b"\x1b[4:3m"); // curly
         t.process(b"A");
-        assert_eq!(t.state.grid[0][0].attrs.underline_style, UnderlineStyle::Curly,
-            "printed cell must carry the active underline style");
+        assert_eq!(
+            t.state.grid[0][0].attrs.underline_style,
+            UnderlineStyle::Curly,
+            "printed cell must carry the active underline style"
+        );
     }
 
     #[test]
@@ -3083,8 +3462,8 @@ mod tests {
     #[test]
     fn cell_after_underline_clear_has_no_underline() {
         let mut t = t(10, 5);
-        t.process(b"\x1b[4:3m");  // curly underline
-        t.process(b"\x1b[24m");   // clear underline
+        t.process(b"\x1b[4:3m"); // curly underline
+        t.process(b"\x1b[24m"); // clear underline
         t.process(b"A");
         assert_eq!(
             t.state.grid[0][0].attrs.underline_style,
@@ -3112,8 +3491,10 @@ mod tests {
         t.process(b"\x1b]8;;\x07"); // close
         t.process(b"plain text");
         for col in 4..14 {
-            assert_eq!(t.state.grid[0][col].link_id, 0,
-                "col {col} after link close must have link_id 0");
+            assert_eq!(
+                t.state.grid[0][col].link_id, 0,
+                "col {col} after link close must have link_id 0"
+            );
         }
     }
 
@@ -3156,7 +3537,10 @@ mod tests {
         // OSC 8 allows optional params like id=foo before the URI
         let mut s = TerminalState::new(80, 5);
         s.osc_dispatch(&[b"8", b"id=foo", b"https://example.com"], false);
-        assert_eq!(s.current_link_id, 1, "non-empty params field must not affect link id");
+        assert_eq!(
+            s.current_link_id, 1,
+            "non-empty params field must not affect link id"
+        );
         assert_eq!(s.links[0], "https://example.com");
     }
 
