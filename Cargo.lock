@@ -1973,6 +1973,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "fontdue",
+ "libc",
  "objc2",
  "pollster",
  "portable-pty",

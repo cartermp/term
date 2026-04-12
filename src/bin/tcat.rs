@@ -1,8 +1,10 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthChar;
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
@@ -25,6 +27,141 @@ const SUBTEXT0: (u8, u8, u8) = (0xa6, 0xad, 0xc8); // language badge
 const OVERLAY0: (u8, u8, u8) = (0x6c, 0x70, 0x86); // line numbers + gutter
 const SURFACE1: (u8, u8, u8) = (0x45, 0x47, 0x5a); // subtle separator
 const GREEN: (u8, u8, u8) = (0xa6, 0xe3, 0xa1); // language highlight
+
+fn gutter_prefix_width(gutter_width: usize) -> usize {
+    gutter_width + 5
+}
+
+fn configured_columns() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&cols| cols > 0)
+        .or_else(stdout_columns)
+}
+
+fn stdout_columns() -> Option<usize> {
+    let stdout = io::stdout();
+    if !stdout.is_terminal() {
+        return None;
+    }
+
+    let fd = stdout.as_raw_fd();
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `fd` comes from stdout, `ws` is a valid mutable winsize buffer,
+    // and TIOCGWINSZ only writes to that buffer.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 {
+        Some(ws.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+fn content_wrap_width(gutter_width: usize) -> Option<usize> {
+    configured_columns().map(|cols| {
+        cols.saturating_sub(gutter_prefix_width(gutter_width))
+            .max(1)
+    })
+}
+
+fn strip_line_endings(text: &str) -> &str {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    text.strip_suffix('\r').unwrap_or(text)
+}
+
+fn fitting_prefix_len(text: &str, available_width: usize, at_line_start: bool) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let mut width = 0usize;
+    let mut end = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > available_width {
+            if idx == 0 && at_line_start {
+                return ch.len_utf8();
+            }
+            return end;
+        }
+        width += ch_width;
+        end = idx + ch.len_utf8();
+    }
+    end
+}
+
+fn print_gutter(
+    out: &mut impl Write,
+    lineno: Option<usize>,
+    gutter_width: usize,
+) -> io::Result<()> {
+    let (or_, og, ob) = OVERLAY0;
+    let (sfr, sfg, sfb) = SURFACE1;
+
+    out.write_all(b"  ")?;
+    fg(out, or_, og, ob)?;
+    match lineno {
+        Some(n) => write!(out, "{:>width$}", n, width = gutter_width)?,
+        None => write!(out, "{:>width$}", "", width = gutter_width)?,
+    }
+    out.write_all(b" ")?;
+    fg(out, sfr, sfg, sfb)?;
+    out.write_all("│".as_bytes())?;
+    fg(out, or_, og, ob)?;
+    out.write_all(b" ")?;
+    reset(out)
+}
+
+fn write_highlighted_line(
+    out: &mut impl Write,
+    lineno: usize,
+    gutter_width: usize,
+    wrap_width: Option<usize>,
+    ranges: &[(Style, &str)],
+) -> io::Result<()> {
+    print_gutter(out, Some(lineno), gutter_width)?;
+
+    let mut used_width = 0usize;
+    for (style, text) in ranges {
+        let mut rest = strip_line_endings(text);
+        while !rest.is_empty() {
+            if let Some(limit) = wrap_width {
+                let available = limit.saturating_sub(used_width);
+                let split_at = fitting_prefix_len(rest, available, used_width == 0);
+                if split_at == 0 {
+                    writeln!(out)?;
+                    print_gutter(out, None, gutter_width)?;
+                    used_width = 0;
+                    continue;
+                }
+
+                let chunk = &rest[..split_at];
+                write_span(out, *style, chunk)?;
+                used_width += chunk
+                    .chars()
+                    .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+                    .sum::<usize>();
+                rest = &rest[split_at..];
+                if !rest.is_empty() {
+                    writeln!(out)?;
+                    print_gutter(out, None, gutter_width)?;
+                    used_width = 0;
+                }
+            } else {
+                write_span(out, *style, rest)?;
+                rest = "";
+            }
+        }
+    }
+
+    writeln!(out)
+}
 
 // ── Render a single highlighted span ─────────────────────────────────────────
 
@@ -206,10 +343,11 @@ fn highlight_file(
 
     let total_lines = LinesWithEndings::from(&content).count();
     // Gutter width based on the last visible line number.
-    let last_visible = range.map(|(_, e)| e.min(total_lines)).unwrap_or(total_lines);
+    let last_visible = range
+        .map(|(_, e)| e.min(total_lines))
+        .unwrap_or(total_lines);
     let gutter_width = last_visible.to_string().len().max(2);
-    let (or_, og, ob) = OVERLAY0;
-    let (sfr, sfg, sfb) = SURFACE1;
+    let wrap_width = content_wrap_width(gutter_width);
 
     for (i, line) in LinesWithEndings::from(&content).enumerate() {
         let lineno = i + 1;
@@ -225,29 +363,8 @@ fn highlight_file(
             }
         }
 
-        // Gutter: "  N │ "
-        out.write_all(b"  ")?;
-        fg(&mut out, or_, og, ob)?;
-        write!(out, "{:>width$}", lineno, width = gutter_width)?;
-        out.write_all(b" ")?;
-        fg(&mut out, sfr, sfg, sfb)?;
-        out.write_all("│".as_bytes())?;
-        fg(&mut out, or_, og, ob)?;
-        out.write_all(b" ")?;
-        reset(&mut out)?;
-
-        // Highlighted content
         let ranges = h.highlight_line(line, ps).unwrap_or_default();
-        for (style, text) in &ranges {
-            // Strip trailing line ending (\n or \r\n) so reset doesn't leave
-            // colour on the blank line, and \r doesn't overwrite the gutter.
-            let t = text.strip_suffix('\n').unwrap_or(text);
-            let t = t.strip_suffix('\r').unwrap_or(t);
-            if !t.is_empty() {
-                write_span(&mut out, *style, t)?;
-            }
-        }
-        writeln!(&mut out)?;
+        write_highlighted_line(&mut out, lineno, gutter_width, wrap_width, &ranges)?;
     }
 
     print_footer(&mut out)?;
@@ -317,6 +434,41 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek().copied() {
+                    Some(']') => {
+                        chars.next();
+                        while let Some(nc) = chars.next() {
+                            if nc == '\x07' {
+                                break;
+                            }
+                            if nc == '\x1b' {
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        for nc in chars.by_ref() {
+                            if nc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     // ── ANSI helpers ──────────────────────────────────────────────────────────
 
     #[test]
@@ -344,7 +496,10 @@ mod tests {
         let style = plain_style(100, 200, 50);
         let out = capture(|b| write_span(b, style, "hello"));
         // fg + text + reset
-        assert!(out.starts_with("\x1b[38;2;100;200;50m"), "missing fg: {out:?}");
+        assert!(
+            out.starts_with("\x1b[38;2;100;200;50m"),
+            "missing fg: {out:?}"
+        );
         assert!(out.contains("hello"), "missing text: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "missing reset: {out:?}");
     }
@@ -407,13 +562,19 @@ mod tests {
     #[test]
     fn test_print_header_plain_text_lang_hidden() {
         let out = capture(|b| print_header(b, "notes.txt", "Plain Text", None));
-        assert!(!out.contains("Plain Text"), "plain text lang leaked: {out:?}");
+        assert!(
+            !out.contains("Plain Text"),
+            "plain text lang leaked: {out:?}"
+        );
     }
 
     #[test]
     fn test_print_header_empty_lang_hidden() {
         let out = capture(|b| print_header(b, "notes", "", None));
-        assert!(!out.contains("·"), "separator shown for empty lang: {out:?}");
+        assert!(
+            !out.contains("·"),
+            "separator shown for empty lang: {out:?}"
+        );
     }
 
     #[test]
@@ -450,7 +611,10 @@ mod tests {
 
     #[test]
     fn test_parse_range_single_line() {
-        assert_eq!(parse_path_range("src/main.rs:42"), ("src/main.rs", Some((42, 42))));
+        assert_eq!(
+            parse_path_range("src/main.rs:42"),
+            ("src/main.rs", Some((42, 42)))
+        );
     }
 
     #[test]
@@ -481,8 +645,12 @@ mod tests {
         let mut count = 0;
         for lineno in 1..=total {
             if let Some((start, end)) = range {
-                if lineno < start { continue; }
-                if lineno > end   { break; }
+                if lineno < start {
+                    continue;
+                }
+                if lineno > end {
+                    break;
+                }
             }
             count += 1;
         }
@@ -513,7 +681,11 @@ mod tests {
         // validation; the filter then skips lines where lineno < 1 but
         // immediately breaks when lineno > 0 — zero lines shown.
         let (_, range) = parse_path_range("foo.rs:0");
-        assert_eq!(range, Some((0, 0)), "line 0 must be parsed (not rejected at parse stage)");
+        assert_eq!(
+            range,
+            Some((0, 0)),
+            "line 0 must be parsed (not rejected at parse stage)"
+        );
         assert_eq!(
             count_filtered_lines(100, range),
             0,
@@ -539,31 +711,50 @@ mod tests {
         assert!(out.contains("╰─"), "footer corner missing: {out:?}");
     }
 
+    // ── Wrapping helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fitting_prefix_len_respects_visible_width() {
+        assert_eq!(fitting_prefix_len("abcdef", 4, true), 4);
+        assert_eq!(fitting_prefix_len("界ab", 2, true), "界".len());
+        assert_eq!(fitting_prefix_len("界ab", 1, true), "界".len());
+        assert_eq!(fitting_prefix_len("界ab", 1, false), 0);
+    }
+
+    #[test]
+    fn test_write_highlighted_line_wraps_with_blank_continuation_gutter() {
+        let style = plain_style(100, 200, 50);
+        let ranges = vec![(style, "abcdefghij")];
+        let out = capture(|b| write_highlighted_line(b, 12, 2, Some(6), &ranges));
+        let clean = strip_ansi(&out);
+        let lines: Vec<&str> = clean.lines().collect();
+        assert_eq!(lines, vec!["  12 │ abcdef", "     │ ghij"]);
+    }
+
+    #[test]
+    fn test_write_highlighted_line_preserves_next_real_line_number_after_wrap() {
+        let style = plain_style(100, 200, 50);
+        let first = capture(|b| write_highlighted_line(b, 8, 2, Some(5), &[(style, "abcdefgh")]));
+        let second = capture(|b| write_highlighted_line(b, 9, 2, Some(5), &[(style, "xyz")]));
+        let clean = format!("{}{}", strip_ansi(&first), strip_ansi(&second));
+        let lines: Vec<&str> = clean.lines().collect();
+        assert_eq!(lines, vec!["   8 │ abcde", "     │ fgh", "   9 │ xyz"]);
+    }
+
     // ── CRLF handling ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_crlf_stripping_leaves_no_cr() {
-        // Simulate what the render loop does for a CRLF span.
-        let text = "hello\r\n";
-        let t = text.strip_suffix('\n').unwrap_or(text);
-        let t = t.strip_suffix('\r').unwrap_or(t);
-        assert_eq!(t, "hello", "CR not stripped: {t:?}");
+        assert_eq!(strip_line_endings("hello\r\n"), "hello");
     }
 
     #[test]
     fn test_lf_only_stripping() {
-        let text = "hello\n";
-        let t = text.strip_suffix('\n').unwrap_or(text);
-        let t = t.strip_suffix('\r').unwrap_or(t);
-        assert_eq!(t, "hello");
+        assert_eq!(strip_line_endings("hello\n"), "hello");
     }
 
     #[test]
     fn test_no_newline_span_unchanged() {
-        // Last span on a line might have no newline at all
-        let text = "world";
-        let t = text.strip_suffix('\n').unwrap_or(text);
-        let t = t.strip_suffix('\r').unwrap_or(t);
-        assert_eq!(t, "world");
+        assert_eq!(strip_line_endings("world"), "world");
     }
 }

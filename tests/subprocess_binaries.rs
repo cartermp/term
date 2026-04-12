@@ -119,6 +119,33 @@ fn tcat_highlights_requested_range() {
 }
 
 #[test]
+fn tcat_wraps_long_lines_with_blank_continuation_gutter() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "sample.rs",
+        "let alphabet = \"abcdefghijklmnopqrstuvwxyz\";\nnext();\n",
+    );
+
+    let output = run_bin_with_env(
+        "tcat",
+        &[path.to_str().unwrap()],
+        None,
+        None,
+        &[("COLUMNS", "26")],
+    );
+    let clean = clean_stdout(&output);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(clean.contains("1 │ let alphabet ="));
+    assert!(
+        clean.lines().any(|line| line.starts_with("     │ ")),
+        "expected a wrapped continuation gutter in output: {clean:?}"
+    );
+    assert!(clean.contains("2 │ next();"));
+}
+
+#[test]
 fn tcat_with_flags_falls_back_to_system_cat() {
     let dir = TempDir::new().unwrap();
     let path = write_file(&dir, "plain.txt", "one\ntwo\n");
