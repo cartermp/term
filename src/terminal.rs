@@ -955,7 +955,7 @@ mod tests {
         term.state.grid[row][col].c
     }
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct CellSnapshot {
         c: char,
         combining: Vec<char>,
@@ -963,7 +963,7 @@ mod tests {
         link_id: u16,
     }
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct TerminalSnapshot {
         grid: Vec<Vec<CellSnapshot>>,
         scrollback: Vec<Vec<CellSnapshot>>,
@@ -1084,6 +1084,17 @@ mod tests {
         }
     }
 
+    fn process_lcg_chunks_with_state(term: &mut Terminal, bytes: &[u8], state: &mut u32) {
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let chunk_len = ((*state >> 16) as usize % 9) + 1;
+            let end = (cursor + chunk_len).min(bytes.len());
+            term.process(&bytes[cursor..end]);
+            cursor = end;
+        }
+    }
+
     fn process_chunk_plan(term: &mut Terminal, bytes: &[u8], chunk_lengths: &[usize]) {
         let mut cursor = 0usize;
         for &len in chunk_lengths {
@@ -1127,8 +1138,18 @@ mod tests {
         assert_eq!(state.alt_grid.len(), state.rows);
         assert!(state.rows > 0);
         assert!(state.cols > 0);
-        assert!(state.cursor_row < state.rows, "cursor_row={} rows={}", state.cursor_row, state.rows);
-        assert!(state.cursor_col < state.cols, "cursor_col={} cols={}", state.cursor_col, state.cols);
+        assert!(
+            state.cursor_row < state.rows,
+            "cursor_row={} rows={}",
+            state.cursor_row,
+            state.rows
+        );
+        assert!(
+            state.cursor_col < state.cols,
+            "cursor_col={} cols={}",
+            state.cursor_col,
+            state.cols
+        );
         assert!(state.scroll_top <= state.scroll_bottom);
         assert!(state.scroll_bottom < state.rows);
         assert!(state.viewport_offset <= state.scrollback.len());
@@ -1161,11 +1182,87 @@ mod tests {
         SnapToBottom,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TranscriptDelivery {
+        Whole,
+        OneByte,
+        PseudoRandom,
+    }
+
+    #[derive(Clone, Debug)]
+    enum TranscriptStep {
+        Write(Vec<u8>),
+        Resize { cols: usize, rows: usize },
+    }
+
+    #[derive(Clone, Debug)]
+    struct TranscriptCase {
+        name: &'static str,
+        cols: usize,
+        rows: usize,
+        steps: Vec<TranscriptStep>,
+    }
+
+    fn write_step(bytes: &[u8]) -> TranscriptStep {
+        TranscriptStep::Write(bytes.to_vec())
+    }
+
+    fn resize_step(cols: usize, rows: usize) -> TranscriptStep {
+        TranscriptStep::Resize { cols, rows }
+    }
+
+    fn run_transcript_steps(
+        term: &mut Terminal,
+        steps: &[TranscriptStep],
+        delivery: TranscriptDelivery,
+    ) {
+        let mut lcg_state = 0x5EED_5EED;
+        for step in steps {
+            match step {
+                TranscriptStep::Write(bytes) => match delivery {
+                    TranscriptDelivery::Whole => term.process(bytes),
+                    TranscriptDelivery::OneByte => process_one_byte_at_a_time(term, bytes),
+                    TranscriptDelivery::PseudoRandom => {
+                        process_lcg_chunks_with_state(term, bytes, &mut lcg_state)
+                    }
+                },
+                TranscriptStep::Resize { cols, rows } => term.resize(*cols, *rows),
+            }
+            assert_terminal_invariants(term);
+        }
+    }
+
+    fn run_transcript_case(case: &TranscriptCase, delivery: TranscriptDelivery) -> Terminal {
+        let mut term = t(case.cols, case.rows);
+        run_transcript_steps(&mut term, &case.steps, delivery);
+        term
+    }
+
+    fn assert_transcript_case_chunk_boundary_stable(case: &TranscriptCase) {
+        let whole = run_transcript_case(case, TranscriptDelivery::Whole);
+        let expected = snapshot(&whole);
+
+        let single = run_transcript_case(case, TranscriptDelivery::OneByte);
+        assert_eq!(
+            snapshot(&single),
+            expected.clone(),
+            "{} single-byte replay changed the final state",
+            case.name
+        );
+
+        let pseudo_random = run_transcript_case(case, TranscriptDelivery::PseudoRandom);
+        assert_eq!(
+            snapshot(&pseudo_random),
+            expected,
+            "{} pseudo-random replay changed the final state",
+            case.name
+        );
+    }
+
     fn random_action_strategy() -> impl Strategy<Value = RandomAction> {
         prop_oneof![
             proptest::collection::vec(any::<u8>(), 0..64).prop_map(RandomAction::Write),
-            (1usize..80, 1usize..32)
-                .prop_map(|(cols, rows)| RandomAction::Resize { cols, rows }),
+            (1usize..80, 1usize..32).prop_map(|(cols, rows)| RandomAction::Resize { cols, rows }),
             (-200i32..=200).prop_map(RandomAction::ScrollViewport),
             Just(RandomAction::SnapToBottom),
         ]
@@ -1198,6 +1295,197 @@ mod tests {
         bytes.extend_from_slice(b"\x1b[?1049l");
         bytes.extend_from_slice(b"\x1b]0;~/src/term\x07");
         bytes
+    }
+
+    fn zsh_startup_transcript_case() -> TranscriptCase {
+        TranscriptCase {
+            name: "zsh_startup_and_bracketed_paste",
+            cols: 52,
+            rows: 6,
+            steps: vec![write_step(
+                concat!(
+                    "\x1b]7;file://localhost/Users/alice/src/term\x07",
+                    "\x1b]0;~/src/term\x07",
+                    "Last login: Sat Apr 11 23:52:00 on ttys001\r\n",
+                    "\x1b[?2004h",
+                    "\x1b]9001;git diff --stat\x07",
+                    "\x1b]0;git diff --stat\x07",
+                    "~/src/term > git diff --stat\r\n",
+                    " src/terminal.rs | 12 ++++++----\r\n",
+                    " src/main.rs     |  3 ++-\r\n",
+                    " README.md       |  5 ++++-\r\n",
+                    " 3 files changed, 11 insertions(+), 9 deletions(-)\r\n",
+                    "\x1b]9001;\x07",
+                    "\x1b]0;~/src/term\x07",
+                    "~/src/term > ",
+                )
+                .as_bytes(),
+            )],
+        }
+    }
+
+    fn less_git_diff_transcript_case() -> TranscriptCase {
+        TranscriptCase {
+            name: "less_git_diff_pager",
+            cols: 70,
+            rows: 9,
+            steps: vec![
+                write_step(
+                    concat!(
+                        "\x1b]7;file://localhost/Users/alice/src/term\x07",
+                        "\x1b]0;~/src/term\x07",
+                        "~/src/term > git diff src/terminal.rs\r\n",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(
+                    concat!(
+                        "\x1b[?1049h",
+                        "\x1b]0;git diff src/terminal.rs\x07",
+                        "\x1b[?1h",
+                        "\x1b[H\x1b[2J",
+                        "diff --git a/src/terminal.rs b/src/terminal.rs\r\n",
+                        "index 1111111..2222222 100644\r\n",
+                        "--- a/src/terminal.rs\r\n",
+                        "+++ b/src/terminal.rs\r\n",
+                        "@@ -276,3 +276,4 @@\r\n",
+                        "\x1b[31m-        self.wrap_next = false;\x1b[0m\r\n",
+                        "\x1b[32m+        self.wrap_next = false;\x1b[0m\r\n",
+                        "\x1b[32m+        self.viewport_offset = 0;\x1b[0m\r\n",
+                        "(END)",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(b"\x1b[?1l\x1b[?1049l\x1b]0;~/src/term\x07~/src/term > "),
+            ],
+        }
+    }
+
+    fn vim_resize_storm_transcript_case() -> TranscriptCase {
+        TranscriptCase {
+            name: "vim_resize_storm",
+            cols: 48,
+            rows: 7,
+            steps: vec![
+                write_step(
+                    concat!(
+                        "\x1b]7;file://localhost/Users/alice/src/term\x07",
+                        "\x1b]0;~/src/term\x07",
+                        "~/src/term > vim src/terminal.rs\r\n",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(
+                    concat!(
+                        "\x1b[?1049h",
+                        "\x1b]0;vim src/terminal.rs\x07",
+                        "\x1b[?1002h\x1b[?1006h\x1b[?2026h",
+                        "\x1b[6 q",
+                        "\x1b[H\x1b[2J",
+                        "fn main() {\r\n",
+                        "    println!(\"hi\");\r\n",
+                        "}\r\n",
+                        "~\r\n",
+                        "~\r\n",
+                        "\"src/terminal.rs\" 3L, 24B",
+                    )
+                    .as_bytes(),
+                ),
+                resize_step(60, 9),
+                write_step(
+                    concat!(
+                        "\x1b[H\x1b[2J",
+                        "fn main() {\r\n",
+                        "    println!(\"hello, terminal\");\r\n",
+                        "}\r\n",
+                        "\r\n",
+                        "~\r\n",
+                        "~\r\n",
+                        "~\r\n",
+                        "\"src/terminal.rs\" 3L, 32B    1,1",
+                    )
+                    .as_bytes(),
+                ),
+                resize_step(42, 6),
+                write_step(
+                    concat!(
+                        "\x1b[H\x1b[2J",
+                        "fn main() {\r\n",
+                        "    println!(\"resize\");\r\n",
+                        "}\r\n",
+                        "~\r\n",
+                        "\"src/terminal.rs\" 1,1",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(
+                    b"\x1b[?2026l\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b]0;~/src/term\x07~/src/term > ",
+                ),
+            ],
+        }
+    }
+
+    fn htop_resize_storm_transcript_case() -> TranscriptCase {
+        TranscriptCase {
+            name: "htop_resize_storm",
+            cols: 70,
+            rows: 10,
+            steps: vec![
+                write_step(
+                    concat!(
+                        "\x1b]7;file://localhost/Users/alice/src/term\x07",
+                        "\x1b]0;~/src/term\x07",
+                        "~/src/term > htop\r\n",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(
+                    concat!(
+                        "\x1b[?1049h",
+                        "\x1b]0;htop\x07",
+                        "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2026h",
+                        "\x1b[H\x1b[2J",
+                        " 1  [|||| 12.3%] Tasks: 112, 309 thr; 2 running\r\n",
+                        " Mem[|||||||     3.12G/8.00G]\r\n",
+                        " Swp[          0K/0K]\r\n",
+                        " PID USER      CPU% MEM% COMMAND\r\n",
+                        " 123 alice      5.0  1.2 /bin/zsh\r\n",
+                        " 456 root       1.0  0.4 launchd",
+                    )
+                    .as_bytes(),
+                ),
+                resize_step(90, 12),
+                write_step(
+                    concat!(
+                        "\x1b[H\x1b[2J",
+                        " 1  [|||||| 28.0%] Tasks: 120, 318 thr; 3 running\r\n",
+                        " Load average: 2.31 2.12 2.05\r\n",
+                        " Mem[||||||||| 4.10G/8.00G]\r\n",
+                        " Swp[         0K/0K]\r\n",
+                        " PID USER      CPU% MEM%   TIME+  Command\r\n",
+                        " 123 alice      7.0  1.2  0:03.10 zsh\r\n",
+                        " 987 alice     42.0  3.3  1:10.22 vim src/terminal.rs",
+                    )
+                    .as_bytes(),
+                ),
+                resize_step(64, 8),
+                write_step(
+                    concat!(
+                        "\x1b[H\x1b[2J",
+                        "CPU[|||| 14%] Mem[|||||| 4.2G/8G]\r\n",
+                        "Tasks: 118, 2 running\r\n",
+                        "PID USER   CPU% MEM% COMMAND\r\n",
+                        "123 alice   6.9 1.2 zsh\r\n",
+                        "987 alice  39.0 3.3 vim\r\n",
+                        "(press q to quit)",
+                    )
+                    .as_bytes(),
+                ),
+                write_step(
+                    b"\x1b[?2026l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b]0;~/src/term\x07~/src/term > ",
+                ),
+            ],
+        }
     }
 
     proptest! {
@@ -1829,6 +2117,154 @@ mod tests {
         assert_eq!(row_text(&t.state.alt_grid[0]), "~");
         assert_eq!(row_text(&t.state.alt_grid[1]), "~");
         assert_eq!(row_text(&t.state.alt_grid[2]), ":help");
+    }
+
+    #[test]
+    fn zsh_startup_transcript_case_is_chunk_boundary_stable() {
+        let case = zsh_startup_transcript_case();
+        assert_transcript_case_chunk_boundary_stable(&case);
+    }
+
+    #[test]
+    fn zsh_startup_transcript_case_reaches_expected_state() {
+        let case = zsh_startup_transcript_case();
+        let t = run_transcript_case(&case, TranscriptDelivery::Whole);
+
+        assert_eq!(t.state.current_dir, "/Users/alice/src/term");
+        assert_eq!(t.state.title, "~/src/term");
+        assert_eq!(t.state.input_buffer, "");
+        assert_eq!(t.state.input_cursor, 0);
+        assert!(t.state.bracketed_paste);
+        assert_eq!(t.state.scrollback.len(), 1);
+        assert_eq!(
+            row_text(&t.state.scrollback[0]),
+            "Last login: Sat Apr 11 23:52:00 on ttys001"
+        );
+        assert_eq!(row_text(&t.state.grid[0]), "~/src/term > git diff --stat");
+        assert_eq!(
+            row_text(&t.state.grid[1]),
+            " src/terminal.rs | 12 ++++++----"
+        );
+        assert_eq!(row_text(&t.state.grid[2]), " src/main.rs     |  3 ++-");
+        assert_eq!(row_text(&t.state.grid[3]), " README.md       |  5 ++++-");
+        assert_eq!(
+            row_text(&t.state.grid[4]),
+            " 3 files changed, 11 insertions(+), 9 deletions(-)"
+        );
+        assert_eq!(row_text(&t.state.grid[5]), "~/src/term >");
+    }
+
+    #[test]
+    fn less_git_diff_transcript_case_is_chunk_boundary_stable() {
+        let case = less_git_diff_transcript_case();
+        assert_transcript_case_chunk_boundary_stable(&case);
+    }
+
+    #[test]
+    fn less_git_diff_transcript_case_restores_prompt_and_pager_contents() {
+        let case = less_git_diff_transcript_case();
+        let t = run_transcript_case(&case, TranscriptDelivery::Whole);
+
+        assert!(!t.state.is_alt_screen());
+        assert_eq!(t.state.current_dir, "/Users/alice/src/term");
+        assert_eq!(t.state.title, "~/src/term");
+        assert!(!t.state.cursor_keys_app_mode);
+        assert_eq!(
+            row_text(&t.state.grid[0]),
+            "~/src/term > git diff src/terminal.rs"
+        );
+        assert_eq!(row_text(&t.state.grid[1]), "~/src/term >");
+        assert_eq!(
+            row_text(&t.state.alt_grid[0]),
+            "diff --git a/src/terminal.rs b/src/terminal.rs"
+        );
+        assert_eq!(
+            row_text(&t.state.alt_grid[1]),
+            "index 1111111..2222222 100644"
+        );
+        assert_eq!(row_text(&t.state.alt_grid[2]), "--- a/src/terminal.rs");
+        assert_eq!(row_text(&t.state.alt_grid[3]), "+++ b/src/terminal.rs");
+        assert_eq!(row_text(&t.state.alt_grid[4]), "@@ -276,3 +276,4 @@");
+        assert_eq!(
+            row_text(&t.state.alt_grid[5]),
+            "-        self.wrap_next = false;"
+        );
+        assert_eq!(
+            row_text(&t.state.alt_grid[6]),
+            "+        self.wrap_next = false;"
+        );
+        assert_eq!(
+            row_text(&t.state.alt_grid[7]),
+            "+        self.viewport_offset = 0;"
+        );
+        assert_eq!(row_text(&t.state.alt_grid[8]), "(END)");
+    }
+
+    #[test]
+    fn vim_resize_storm_transcript_case_is_chunk_boundary_stable() {
+        let case = vim_resize_storm_transcript_case();
+        assert_transcript_case_chunk_boundary_stable(&case);
+    }
+
+    #[test]
+    fn vim_resize_storm_transcript_case_restores_shell_and_modes() {
+        let case = vim_resize_storm_transcript_case();
+        let t = run_transcript_case(&case, TranscriptDelivery::Whole);
+
+        assert!(!t.state.is_alt_screen());
+        assert_eq!(t.state.current_dir, "/Users/alice/src/term");
+        assert_eq!(t.state.title, "~/src/term");
+        assert_eq!(t.state.cols, 42);
+        assert_eq!(t.state.rows, 6);
+        assert_eq!(t.state.cursor_shape, 6);
+        assert!(!t.state.mouse_tracking);
+        assert!(!t.state.mouse_sgr);
+        assert!(!t.state.sync_output);
+        assert_eq!(
+            row_text(&t.state.grid[0]),
+            "~/src/term > vim src/terminal.rs"
+        );
+        assert_eq!(row_text(&t.state.grid[1]), "~/src/term >");
+        assert_eq!(row_text(&t.state.alt_grid[0]), "fn main() {");
+        assert_eq!(row_text(&t.state.alt_grid[1]), "    println!(\"resize\");");
+        assert_eq!(row_text(&t.state.alt_grid[2]), "}");
+        assert_eq!(row_text(&t.state.alt_grid[3]), "~");
+        assert_eq!(row_text(&t.state.alt_grid[4]), "\"src/terminal.rs\" 1,1");
+    }
+
+    #[test]
+    fn htop_resize_storm_transcript_case_is_chunk_boundary_stable() {
+        let case = htop_resize_storm_transcript_case();
+        assert_transcript_case_chunk_boundary_stable(&case);
+    }
+
+    #[test]
+    fn htop_resize_storm_transcript_case_restores_shell_and_modes() {
+        let case = htop_resize_storm_transcript_case();
+        let t = run_transcript_case(&case, TranscriptDelivery::Whole);
+
+        assert!(!t.state.is_alt_screen());
+        assert_eq!(t.state.current_dir, "/Users/alice/src/term");
+        assert_eq!(t.state.title, "~/src/term");
+        assert_eq!(t.state.cols, 64);
+        assert_eq!(t.state.rows, 8);
+        assert!(!t.state.mouse_tracking);
+        assert!(!t.state.mouse_sgr);
+        assert!(!t.state.sync_output);
+        assert_eq!(row_text(&t.state.grid[0]), "~/src/term > htop");
+        assert_eq!(row_text(&t.state.grid[1]), "~/src/term >");
+        assert_eq!(
+            row_text(&t.state.alt_grid[0]),
+            "CPU[|||| 14%] Mem[|||||| 4.2G/8G]"
+        );
+        assert_eq!(row_text(&t.state.alt_grid[1]), "Tasks: 118, 2 running");
+        assert_eq!(
+            row_text(&t.state.alt_grid[2]),
+            "PID USER   CPU% MEM% COMMAND"
+        );
+        assert_eq!(row_text(&t.state.alt_grid[3]), "123 alice   6.9 1.2 zsh");
+        assert_eq!(row_text(&t.state.alt_grid[4]), "987 alice  39.0 3.3 vim");
+        assert_eq!(row_text(&t.state.alt_grid[5]), "(press q to quit)");
     }
 
     #[test]
