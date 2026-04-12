@@ -1,0 +1,68 @@
+# Codebase Critique: `term`
+
+This is a high-quality personal project with several advanced features (GPU rendering via `wgpu`, ligature shaping via `rustybuzz`, and a clean event-driven architecture). However, looking through an "extremely critical lens," there are several architectural and implementation bottlenecks that prevent it from being a truly "extremely well-done" terminal emulator.
+
+## 1. Grid Storage & Scrolling Performance
+The current implementation of the terminal grid is a `Vec<Vec<Cell>>`.
+
+**Status:** Partially addressed. The hot scrolling/line-edit paths no longer use `Vec::remove`/`Vec::insert` churn in the common case; they now rotate/reuse existing row buffers in place. The grid is still `Vec<Vec<Cell>>`, so a fully flattened circular buffer remains future work if profiling shows the remaining structure is still a bottleneck.
+
+*   **Critique:** This causes $N$ heap allocations for a grid of $N$ rows. More importantly, scrolling up involves `grid.remove(0)` and `grid.insert(idx, blank)`. These are $O(rows)$ operations that involve shifting every `Vec` pointer in the outer `Vec` and frequent reallocations.
+*   **Recommendation:** Flatten the grid into a single `Vec<Cell>` and use a circular buffer (tracking a `start_row` index) to make scrolling an $O(1)$ operation.
+
+## 2. Unicode & CJK Support
+The terminal currently assumes that every character occupies exactly one column.
+
+**Status:** Mostly addressed. The terminal now uses `unicode-width` to treat wide characters as two-column cells with explicit continuation placeholders, and erase/overwrite paths were updated so those placeholders stay coherent. The hand-maintained grapheme-extension list is still present, so a future move to a fuller grapheme-segmentation model remains worthwhile.
+
+*   **Critique:** East Asian (CJK) characters are "wide" and should occupy two columns. Printing a wide character currently results in it overlapping the next character, or breaking alignment for all subsequent text on that line. The `is_grapheme_extend` list is also a manual maintenance burden.
+*   **Recommendation:** Integrate the `unicode-width` crate to correctly handle character widths and the `unicode-segmentation` crate for robust grapheme cluster detection. Use a "placeholder" cell (e.g., a special `Cell` type or flag) to represent the second half of a wide character.
+
+## 3. Rendering Pipeline Efficiency
+Each frame, the renderer performs text shaping for every visible row via `rustybuzz`.
+
+**Status:** Addressed. The renderer now caches per-row glyph-op results keyed by the visible row signature, so unchanged rows reuse prior shaping work instead of re-running HarfBuzz every frame.
+
+*   **Critique:** Shaping is relatively expensive. In a 100-row terminal, we are shaping ~20,000 cells every frame (~60-120 times per second), even if the content is static.
+*   **Recommendation:** Implement a dirty-row mechanism or a shaping cache. Only re-shape rows that have changed since the last frame.
+
+## 4. PTY Processing & Main Thread Blocking
+PTY data processing happens on the main thread inside the `winit` event loop.
+
+**Status:** Deferred. This pass did not move VT processing off the main thread because doing that safely would require a larger ownership/snapshot redesign across `Terminal`, `Renderer`, and the event loop.
+
+*   **Critique:** If a command produces a massive burst of output (e.g., `cat`ing a large file), the main thread will spend significant time in `Terminal::process`, causing the UI to stutter or drop frames.
+*   **Recommendation:** Move the VT state machine (`vte` processing) to a background thread. The main thread should only consume "snapshots" of the grid or a list of dirty regions for rendering.
+
+## 5. Atlas Management
+The glyph atlas is fully cleared when it overflows.
+
+**Status:** Deferred. The atlas behavior is unchanged in this pass; the new row-shape cache reduces CPU-side repeat work, but atlas eviction is still all-or-nothing.
+
+*   **Critique:** While rare for standard English text, a terminal displaying many unique Unicode characters (or different font sizes if that were added) would frequently trigger a full clear, leading to visible stutters as every glyph is re-uploaded.
+*   **Recommendation:** Implement an LRU (Least Recently Used) eviction policy for the atlas, or at least a multi-stage atlas that grows/compacts more gracefully.
+
+## 6. PTY Data Passing
+Data from the PTY reader thread is sent to the main thread via `Vec<u8>` for every `read()` call.
+
+**Status:** Deferred. The current PTY event payload path is unchanged; reducing allocation pressure there is coupled to the broader threading redesign in item 4.
+
+*   **Critique:** This creates high allocation pressure (thousands of small `Vec`s per second during high output).
+*   **Recommendation:** Use a lock-free ring buffer or a pool of pre-allocated buffers to pass data between the PTY thread and the processing thread.
+
+---
+
+# Next Steps
+
+1.  **Refactor Grid Storage:**
+    *   Flatten `Vec<Vec<Cell>>` into `Vec<Cell>`.
+    *   Implement circular buffer indexing for $O(1)$ scrolling.
+2.  **Robust Unicode Support:**
+    *   Add `unicode-width` and `unicode-segmentation`.
+    *   Handle double-width characters in `put_char` and `visual_cell`.
+3.  **Optimize Renderer:**
+    *   Add a `generation` or `dirty` flag per row.
+    *   Cache shaped results (`GlyphOp` vectors) to avoid redundant HarfBuzz calls.
+4.  **PTY Throughput Improvements:**
+    *   Profile the impact of moving `vte` processing to a background thread.
+    *   Reduce allocations in the PTY data path.

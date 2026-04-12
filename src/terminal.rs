@@ -1,5 +1,6 @@
 use crate::config::*;
 use std::collections::VecDeque;
+use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 const SCROLLBACK_MAX: usize = 10_000;
@@ -52,6 +53,8 @@ pub struct Cell {
     pub attrs: Attrs,
     /// OSC 8 hyperlink: index into `TerminalState::links` (1-based, 0 = none).
     pub link_id: u16,
+    /// When true, this cell occupies this column and the next one.
+    pub wide: bool,
 }
 
 impl Default for Cell {
@@ -62,6 +65,7 @@ impl Default for Cell {
             combining_len: 0,
             attrs: Attrs::default(),
             link_id: 0,
+            wide: false,
         }
     }
 }
@@ -78,6 +82,21 @@ impl Cell {
     /// The combining / extending codepoints that follow the base character.
     pub fn combining_chars(&self) -> &[char] {
         &self.combining[..self.combining_len as usize]
+    }
+
+    pub fn is_wide_continuation(&self) -> bool {
+        self.c == '\0'
+    }
+
+    fn wide_continuation_for(lead: Cell) -> Self {
+        Self {
+            c: '\0',
+            combining: ['\0'; 3],
+            combining_len: 0,
+            attrs: lead.attrs,
+            link_id: lead.link_id,
+            wide: false,
+        }
     }
 }
 
@@ -276,10 +295,12 @@ impl TerminalState {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         for row in &mut self.grid {
             row.resize(cols, Cell::default());
+            Self::normalize_row_cells(row);
         }
         self.grid.resize(rows, vec![Cell::default(); cols]);
         for row in &mut self.alt_grid {
             row.resize(cols, Cell::default());
+            Self::normalize_row_cells(row);
         }
         self.alt_grid.resize(rows, vec![Cell::default(); cols]);
         self.cols = cols;
@@ -293,10 +314,15 @@ impl TerminalState {
 
     fn scroll_up(&mut self, n: usize) {
         for _ in 0..n {
-            let row = self.grid.remove(self.scroll_top);
+            if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
+                break;
+            }
+            let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
+            let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+            let mut row = std::mem::take(&mut self.grid[top]);
             // Capture into scrollback only for full-screen scrolls on the normal screen
-            if self.scroll_top == 0 && !self.alt_screen {
-                self.scrollback.push_back(row);
+            if top == 0 && !self.alt_screen {
+                self.scrollback.push_back(row.clone());
                 if self.scrollback.len() > SCROLLBACK_MAX {
                     self.scrollback.pop_front();
                 }
@@ -305,18 +331,23 @@ impl TerminalState {
                     self.viewport_offset = (self.viewport_offset + 1).min(self.scrollback.len());
                 }
             }
-            let blank = vec![Cell::default(); self.cols];
-            let insert_at = self.scroll_bottom.min(self.grid.len());
-            self.grid.insert(insert_at, blank);
+            self.grid[top..=bottom].rotate_left(1);
+            row.fill(Cell::default());
+            self.grid[bottom] = row;
         }
     }
 
     fn scroll_down(&mut self, n: usize) {
         for _ in 0..n {
-            let remove_at = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-            self.grid.remove(remove_at);
-            let blank = vec![Cell::default(); self.cols];
-            self.grid.insert(self.scroll_top, blank);
+            if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
+                break;
+            }
+            let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
+            let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+            let mut row = std::mem::take(&mut self.grid[bottom]);
+            self.grid[top..=bottom].rotate_right(1);
+            row.fill(Cell::default());
+            self.grid[top] = row;
         }
     }
 
@@ -326,16 +357,35 @@ impl TerminalState {
             self.cursor_col = 0;
             self.do_newline();
         }
+        let width = self.cell_width_for(c);
+        if width == 2 && self.cursor_col + 1 >= self.cols {
+            self.cursor_col = 0;
+            self.do_newline();
+        }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
+            let blank = self.blank_cell();
+            self.clear_cell_span(self.cursor_row, self.cursor_col, blank);
+            if width == 2 && self.cursor_col + 1 < self.cols {
+                self.clear_cell_span(self.cursor_row, self.cursor_col + 1, blank);
+            }
             self.last_placed = (self.cursor_row, self.cursor_col);
-            self.grid[self.cursor_row][self.cursor_col] = Cell {
+            let lead = Cell {
                 c,
                 combining: ['\0'; 3],
                 combining_len: 0,
                 attrs: self.attrs,
                 link_id: self.current_link_id,
+                wide: width == 2,
             };
-            if self.cursor_col + 1 >= self.cols {
+            self.grid[self.cursor_row][self.cursor_col] = lead;
+            if width == 2 {
+                self.grid[self.cursor_row][self.cursor_col + 1] = Cell::wide_continuation_for(lead);
+                if self.cursor_col + 2 >= self.cols {
+                    self.wrap_next = true;
+                } else {
+                    self.cursor_col += 2;
+                }
+            } else if self.cursor_col + 1 >= self.cols {
                 self.wrap_next = true;
             } else {
                 self.cursor_col += 1;
@@ -371,6 +421,62 @@ impl TerminalState {
                 ..Default::default()
             },
             link_id: 0,
+            wide: false,
+        }
+    }
+
+    fn cell_width_for(&self, c: char) -> usize {
+        UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .clamp(1, 2)
+            .min(self.cols.max(1))
+    }
+
+    fn clear_cell_span(&mut self, row: usize, col: usize, blank: Cell) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+
+        if self.grid[row][col].wide {
+            self.grid[row][col] = blank;
+            if col + 1 < self.cols {
+                self.grid[row][col + 1] = blank;
+            }
+            return;
+        }
+
+        if self.grid[row][col].is_wide_continuation() {
+            if col > 0 && self.grid[row][col - 1].wide {
+                self.grid[row][col - 1] = blank;
+            }
+            self.grid[row][col] = blank;
+            return;
+        }
+
+        self.grid[row][col] = blank;
+    }
+
+    fn normalize_row_cells(row: &mut [Cell]) {
+        let mut col = 0usize;
+        while col < row.len() {
+            if row[col].wide {
+                if col + 1 >= row.len() {
+                    row[col].wide = false;
+                    col += 1;
+                    continue;
+                }
+                row[col + 1] = Cell::wide_continuation_for(row[col]);
+                col += 2;
+                continue;
+            }
+
+            if row[col].is_wide_continuation() {
+                if col == 0 || !row[col - 1].wide {
+                    row[col] = Cell::default();
+                }
+            }
+
+            col += 1;
         }
     }
 
@@ -381,20 +487,23 @@ impl TerminalState {
         match mode {
             0 => {
                 for c in col..self.cols {
-                    self.grid[row][c] = blank;
+                    self.clear_cell_span(row, c, blank);
                 }
             }
             1 => {
                 for c in 0..=col.min(self.cols.saturating_sub(1)) {
-                    self.grid[row][c] = blank;
+                    self.clear_cell_span(row, c, blank);
                 }
             }
             2 => {
                 for c in 0..self.cols {
-                    self.grid[row][c] = blank;
+                    self.clear_cell_span(row, c, blank);
                 }
             }
             _ => {}
+        }
+        if row < self.rows {
+            Self::normalize_row_cells(&mut self.grid[row]);
         }
     }
 
@@ -404,11 +513,11 @@ impl TerminalState {
             0 => {
                 let (row, col) = (self.cursor_row, self.cursor_col);
                 for c in col..self.cols {
-                    self.grid[row][c] = blank;
+                    self.clear_cell_span(row, c, blank);
                 }
                 for r in (row + 1)..self.rows {
                     for c in 0..self.cols {
-                        self.grid[r][c] = blank;
+                        self.clear_cell_span(r, c, blank);
                     }
                 }
             }
@@ -416,17 +525,17 @@ impl TerminalState {
                 let (row, col) = (self.cursor_row, self.cursor_col);
                 for r in 0..row {
                     for c in 0..self.cols {
-                        self.grid[r][c] = blank;
+                        self.clear_cell_span(r, c, blank);
                     }
                 }
                 for c in 0..=col.min(self.cols.saturating_sub(1)) {
-                    self.grid[row][c] = blank;
+                    self.clear_cell_span(row, c, blank);
                 }
             }
             2 => {
                 for r in 0..self.rows {
                     for c in 0..self.cols {
-                        self.grid[r][c] = blank;
+                        self.clear_cell_span(r, c, blank);
                     }
                 }
             }
@@ -434,13 +543,16 @@ impl TerminalState {
                 // ED 3: erase display and clear scrollback (xterm extension).
                 for r in 0..self.rows {
                     for c in 0..self.cols {
-                        self.grid[r][c] = blank;
+                        self.clear_cell_span(r, c, blank);
                     }
                 }
                 self.scrollback.clear();
                 self.viewport_offset = 0;
             }
             _ => {}
+        }
+        for row in &mut self.grid {
+            Self::normalize_row_cells(row);
         }
     }
 
@@ -686,19 +798,25 @@ impl Perform for TerminalState {
             (0, 'L') => {
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
-                    let remove = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-                    self.grid.remove(remove);
-                    self.grid
-                        .insert(self.cursor_row, vec![Cell::default(); self.cols]);
+                    if self.grid.is_empty() || self.cursor_row > self.scroll_bottom {
+                        break;
+                    }
+                    let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+                    let mut row = std::mem::take(&mut self.grid[bottom]);
+                    self.grid[self.cursor_row..=bottom].rotate_right(1);
+                    row.fill(Cell::default());
+                    self.grid[self.cursor_row] = row;
                 }
             }
             (0, 'M') => {
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
                     if self.cursor_row < self.grid.len() {
-                        self.grid.remove(self.cursor_row);
-                        let ins = self.scroll_bottom.min(self.grid.len());
-                        self.grid.insert(ins, vec![Cell::default(); self.cols]);
+                        let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+                        let mut row = std::mem::take(&mut self.grid[self.cursor_row]);
+                        self.grid[self.cursor_row..=bottom].rotate_left(1);
+                        row.fill(Cell::default());
+                        self.grid[bottom] = row;
                     }
                 }
             }
@@ -709,10 +827,13 @@ impl Perform for TerminalState {
                 if row < self.rows {
                     for _ in 0..n {
                         if col < self.grid[row].len() {
-                            self.grid[row].remove(col);
-                            self.grid[row].push(Cell::default());
+                            self.grid[row][col..].rotate_left(1);
+                            if let Some(last) = self.grid[row].last_mut() {
+                                *last = Cell::default();
+                            }
                         }
                     }
+                    Self::normalize_row_cells(&mut self.grid[row]);
                 }
             }
             (0, '@') => {
@@ -720,12 +841,13 @@ impl Perform for TerminalState {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
                 for _ in 0..n {
-                    if col < self.cols {
-                        self.grid[row].insert(col, Cell::default());
-                        if self.grid[row].len() > self.cols {
-                            self.grid[row].pop();
-                        }
+                    if row < self.rows && col < self.cols {
+                        self.grid[row][col..].rotate_right(1);
+                        self.grid[row][col] = Cell::default();
                     }
+                }
+                if row < self.rows {
+                    Self::normalize_row_cells(&mut self.grid[row]);
                 }
             }
             (0, 'S') => self.scroll_up(p0.max(1) as usize),
@@ -736,7 +858,10 @@ impl Perform for TerminalState {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
                 for i in col..(col + n).min(self.cols) {
-                    self.grid[row][i] = blank;
+                    self.clear_cell_span(row, i, blank);
+                }
+                if row < self.rows {
+                    Self::normalize_row_cells(&mut self.grid[row]);
                 }
             }
             (0, 'd') => {
@@ -961,6 +1086,7 @@ mod tests {
         combining: Vec<char>,
         attrs: Attrs,
         link_id: u16,
+        wide: bool,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -1006,6 +1132,7 @@ mod tests {
             combining: cell.combining_chars().to_vec(),
             attrs: cell.attrs,
             link_id: cell.link_id,
+            wide: cell.wide,
         }
     }
 
@@ -1061,6 +1188,7 @@ mod tests {
     fn row_text(row: &[Cell]) -> String {
         row.iter()
             .map(|cell| cell.c)
+            .filter(|&c| c != '\0')
             .collect::<String>()
             .trim_end()
             .to_string()
@@ -1133,6 +1261,26 @@ mod tests {
     }
 
     fn assert_terminal_invariants(term: &Terminal) {
+        fn assert_row_invariants(row: &[Cell], links_len: usize) {
+            for (col, cell) in row.iter().enumerate() {
+                assert!(cell.link_id as usize <= links_len);
+                if cell.wide {
+                    assert!(col + 1 < row.len(), "wide cell at final column {col}");
+                    assert!(
+                        row[col + 1].is_wide_continuation(),
+                        "wide cell at col {col} must be followed by a continuation cell"
+                    );
+                }
+                if cell.is_wide_continuation() {
+                    assert!(col > 0, "wide continuation cannot live in column 0");
+                    assert!(
+                        row[col - 1].wide,
+                        "wide continuation at col {col} must follow a wide lead cell"
+                    );
+                }
+            }
+        }
+
         let state = &term.state;
         assert_eq!(state.grid.len(), state.rows);
         assert_eq!(state.alt_grid.len(), state.rows);
@@ -1157,20 +1305,14 @@ mod tests {
 
         for row in &state.grid {
             assert_eq!(row.len(), state.cols);
-            for cell in row {
-                assert!(cell.link_id as usize <= state.links.len());
-            }
+            assert_row_invariants(row, state.links.len());
         }
         for row in &state.alt_grid {
             assert_eq!(row.len(), state.cols);
-            for cell in row {
-                assert!(cell.link_id as usize <= state.links.len());
-            }
+            assert_row_invariants(row, state.links.len());
         }
         for row in &state.scrollback {
-            for cell in row {
-                assert!(cell.link_id as usize <= state.links.len());
-            }
+            assert_row_invariants(row, state.links.len());
         }
     }
 
@@ -1543,6 +1685,50 @@ mod tests {
         assert_eq!(ch(&t, 0, 1), 'B');
     }
 
+    #[test]
+    fn wide_cjk_char_occupies_two_cells() {
+        let mut t = t(8, 4);
+        t.process("界".as_bytes());
+        assert_eq!(ch(&t, 0, 0), '界');
+        assert!(t.state.grid[0][0].wide);
+        assert_eq!(t.state.grid[0][1].c, '\0');
+        assert!(t.state.grid[0][1].is_wide_continuation());
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn wide_char_wraps_before_printing_when_only_one_column_remains() {
+        let mut t = t(3, 3);
+        t.process("AB界".as_bytes());
+        assert_eq!(row_text(&t.state.grid[0]), "AB");
+        assert_eq!(ch(&t, 1, 0), '界');
+        assert!(t.state.grid[1][0].wide);
+        assert_eq!(t.state.grid[1][1].c, '\0');
+        assert_eq!(t.state.cursor_row, 1);
+        assert_eq!(t.state.cursor_col, 2);
+    }
+
+    #[test]
+    fn overwriting_wide_char_clears_its_continuation_cell() {
+        let mut t = t(4, 2);
+        t.process("界".as_bytes());
+        t.process(b"\rA");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert!(!t.state.grid[0][0].wide);
+        assert_eq!(t.state.grid[0][1].c, ' ');
+        assert_eq!(t.state.cursor_col, 1);
+    }
+
+    #[test]
+    fn erase_character_clears_both_halves_of_wide_char() {
+        let mut t = t(4, 2);
+        t.process("界A".as_bytes());
+        t.process(b"\r\x1b[X");
+        assert_eq!(t.state.grid[0][0].c, ' ');
+        assert_eq!(t.state.grid[0][1].c, ' ');
+        assert_eq!(t.state.grid[0][2].c, 'A');
+    }
+
     // ── Grapheme clustering ───────────────────────────────────────────────────
 
     #[test]
@@ -1575,7 +1761,7 @@ mod tests {
         t.process("\u{1F44B}\u{1F3FE}".as_bytes()); // 👋🏾
         assert_eq!(ch(&t, 0, 0), '\u{1F44B}');
         assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{1F3FE}']);
-        assert_eq!(t.state.cursor_col, 1);
+        assert_eq!(t.state.cursor_col, 2);
     }
 
     #[test]
@@ -1616,7 +1802,7 @@ mod tests {
         t.process("\u{1F468}\u{200D}".as_bytes()); // man + ZWJ
         assert_eq!(ch(&t, 0, 0), '\u{1F468}');
         assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{200D}']);
-        assert_eq!(t.state.cursor_col, 1);
+        assert_eq!(t.state.cursor_col, 2);
     }
 
     #[test]
@@ -1731,7 +1917,7 @@ mod tests {
         t.process("\u{845B}\u{E0100}".as_bytes()); // 葛󠄀 (Unified CJK + IVS)
         assert_eq!(ch(&t, 0, 0), '\u{845B}');
         assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{E0100}']);
-        assert_eq!(t.state.cursor_col, 1);
+        assert_eq!(t.state.cursor_col, 2);
     }
 
     // --- Zero Width Joiner ---------------------------------------------------
@@ -1748,9 +1934,9 @@ mod tests {
         // man emoji in col 0, ZWJ stored as combiner
         assert_eq!(ch(&t, 0, 0), '\u{1F468}');
         assert_eq!(t.state.grid[0][0].combining_chars(), &['\u{200D}']);
-        // laptop emoji in col 1 (non-zero-width codepoint after ZWJ)
-        assert_eq!(ch(&t, 0, 1), '\u{1F4BB}');
-        assert_eq!(t.state.cursor_col, 2);
+        // laptop emoji in col 2 (the base emoji already occupies two columns)
+        assert_eq!(ch(&t, 0, 2), '\u{1F4BB}');
+        assert_eq!(t.state.cursor_col, 4);
     }
 
     #[test]
@@ -1777,7 +1963,8 @@ mod tests {
             '\u{1F3FF}',
         ];
         let mut t = t(80, 24);
-        for (col, (&base, &tone)) in bases.iter().zip(tones.iter()).enumerate() {
+        for (i, (&base, &tone)) in bases.iter().zip(tones.iter()).enumerate() {
+            let col = i * 2;
             let s = format!("{base}{tone}");
             t.process(s.as_bytes());
             assert_eq!(ch(&t, 0, col), base, "col {col} base");
@@ -1787,7 +1974,7 @@ mod tests {
                 "col {col} tone"
             );
         }
-        assert_eq!(t.state.cursor_col, 5);
+        assert_eq!(t.state.cursor_col, 10);
     }
 
     #[test]
@@ -1856,8 +2043,8 @@ mod tests {
         // First three tag chars stored (cell holds max 3 combiners)
         assert_eq!(t.state.grid[0][0].combining_chars().len(), 3);
         assert_eq!(t.state.grid[0][0].combining_chars()[0], '\u{E0067}');
-        // All tag chars are combiners → cursor at col 1
-        assert_eq!(t.state.cursor_col, 1);
+        // All tag chars are combiners; the black-flag base still occupies two columns.
+        assert_eq!(t.state.cursor_col, 2);
     }
 
     // --- Hebrew --------------------------------------------------------------
@@ -1998,8 +2185,8 @@ mod tests {
         t.process("\u{1F355}\u{1F680}".as_bytes()); // 🍕🚀
         assert_eq!(ch(&t, 0, 0), '\u{1F355}');
         assert_eq!(t.state.grid[0][0].combining_chars().len(), 0);
-        assert_eq!(ch(&t, 0, 1), '\u{1F680}');
-        assert_eq!(t.state.cursor_col, 2);
+        assert_eq!(ch(&t, 0, 2), '\u{1F680}');
+        assert_eq!(t.state.cursor_col, 4);
     }
 
     #[test]

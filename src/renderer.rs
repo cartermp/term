@@ -22,9 +22,10 @@ fn tcat_gutter_end(state: &TerminalState, row: usize, vis_cols: usize) -> usize 
             continue;
         }
         let mut prefix = 0..c - 1;
-        let has_digit = prefix.clone().any(|i| state.visual_cell(row, i).c.is_ascii_digit());
-        let all_ok = prefix
-            .all(|i| matches!(state.visual_cell(row, i).c, ' ' | '\0' | '0'..='9'));
+        let has_digit = prefix
+            .clone()
+            .any(|i| state.visual_cell(row, i).c.is_ascii_digit());
+        let all_ok = prefix.all(|i| matches!(state.visual_cell(row, i).c, ' ' | '\0' | '0'..='9'));
         if has_digit && all_ok {
             return c + 2;
         }
@@ -93,8 +94,8 @@ struct Out {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct RectInst {
-    pub pos:   [f32; 2],
-    pub sz:    [f32; 2],
+    pub pos: [f32; 2],
+    pub sz: [f32; 2],
     pub color: [f32; 4],
 }
 
@@ -127,11 +128,11 @@ impl RectInst {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct GlyphInst {
-    pos:    [f32; 2],
-    sz:     [f32; 2],
+    pos: [f32; 2],
+    sz: [f32; 2],
     uv_pos: [f32; 2],
-    uv_sz:  [f32; 2],
-    fg:     [f32; 4],
+    uv_sz: [f32; 2],
+    fg: [f32; 4],
 }
 
 impl GlyphInst {
@@ -200,7 +201,7 @@ struct ShapedGlyph {
 }
 
 /// Per-cell render decision computed before the draw loop.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum GlyphOp {
     /// Nothing to draw (space, null, or a cell consumed by a multi-cell ligature).
     Skip,
@@ -209,6 +210,32 @@ enum GlyphOp {
     /// Draw glyph `id` from the atlas at this cell's pixel origin.
     Glyph(u16),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RowGlyphKeyCell {
+    c: char,
+    fg: Color,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RowGlyphKey {
+    cells: Vec<RowGlyphKeyCell>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RowGlyphCacheSlot {
+    state_ptr: usize,
+    row: usize,
+    vis_cols: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RowGlyphCacheEntry {
+    key: RowGlyphKey,
+    ops: Vec<GlyphOp>,
+}
+
+const ROW_GLYPH_CACHE_MAX_ENTRIES: usize = 4096;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -228,7 +255,11 @@ pub fn rgb_f(r: u8, g: u8, b: u8) -> [f32; 4] {
 
 pub fn push_rect(v: &mut Vec<RectInst>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
     if w > 0. && h > 0. {
-        v.push(RectInst { pos: [x, y], sz: [w, h], color });
+        v.push(RectInst {
+            pos: [x, y],
+            sz: [w, h],
+            color,
+        });
     }
 }
 
@@ -342,7 +373,11 @@ fn compute_row_glyph_ops_impl(
         }
 
         // Effective fg (after inverse) — run boundary changes on fg change.
-        let fg_color = if cell.attrs.inverse { cell.attrs.bg } else { cell.attrs.fg };
+        let fg_color = if cell.attrs.inverse {
+            cell.attrs.bg
+        } else {
+            cell.attrs.fg
+        };
 
         // Extend the run as far as chars share the same fg and are printable.
         let run_start = col;
@@ -353,7 +388,11 @@ fn compute_row_glyph_ops_impl(
             if nc_c == ' ' || nc_c == '\0' || is_block_char(nc_c) {
                 break;
             }
-            let nc_fg = if nc.attrs.inverse { nc.attrs.bg } else { nc.attrs.fg };
+            let nc_fg = if nc.attrs.inverse {
+                nc.attrs.bg
+            } else {
+                nc.attrs.fg
+            };
             if nc_fg != fg_color {
                 break;
             }
@@ -382,6 +421,56 @@ fn compute_row_glyph_ops_impl(
         col = run_end;
     }
 
+    ops
+}
+
+fn effective_fg(cell: crate::terminal::Cell) -> Color {
+    if cell.attrs.inverse {
+        cell.attrs.bg
+    } else {
+        cell.attrs.fg
+    }
+}
+
+fn build_row_glyph_key(state: &TerminalState, row: usize, vis_cols: usize) -> RowGlyphKey {
+    let cells = (0..vis_cols)
+        .map(|col| {
+            let cell = state.visual_cell(row, col);
+            RowGlyphKeyCell {
+                c: cell.c,
+                fg: effective_fg(cell),
+            }
+        })
+        .collect();
+    RowGlyphKey { cells }
+}
+
+fn lookup_cached_row_ops<F>(
+    cache: &mut HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
+    slot: RowGlyphCacheSlot,
+    key: RowGlyphKey,
+    compute: F,
+) -> Vec<GlyphOp>
+where
+    F: FnOnce() -> Vec<GlyphOp>,
+{
+    if let Some(entry) = cache.get(&slot) {
+        if entry.key == key {
+            return entry.ops.clone();
+        }
+    }
+
+    let ops = compute();
+    if cache.len() >= ROW_GLYPH_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        RowGlyphCacheEntry {
+            key,
+            ops: ops.clone(),
+        },
+    );
     ops
 }
 
@@ -424,6 +513,7 @@ pub struct Renderer {
     /// Atlas cache keyed by OpenType glyph ID (not char) so shaped ligature
     /// glyphs share entries with their constituent characters when applicable.
     atlas_cache: HashMap<u16, Option<AtlasEntry>>,
+    row_glyph_cache: HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
     atlas_x: u32,
     atlas_y: u32,
     atlas_row_h: u32,
@@ -469,8 +559,7 @@ impl Renderer {
             },
         )
         .expect("font load");
-        let rb_face = rustybuzz::Face::from_slice(FONT_BYTES, 0)
-            .expect("rustybuzz face load");
+        let rb_face = rustybuzz::Face::from_slice(FONT_BYTES, 0).expect("rustybuzz face load");
 
         let (m, _) = font.rasterize('M', font_size);
         let cell_width = m.advance_width.ceil() as usize;
@@ -478,8 +567,7 @@ impl Renderer {
         let ascent = lm.ascent.ceil() as i32;
         let descent = (-lm.descent).ceil() as i32;
         let gap = lm.line_gap.ceil() as i32;
-        let cell_height =
-            (ascent + descent + gap).max(font_size as i32 + 4) as usize;
+        let cell_height = (ascent + descent + gap).max(font_size as i32 + 4) as usize;
 
         // ── Uniform buffer (resolution) ───────────────────────────────────────
         let uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -526,8 +614,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let atlas_view =
-            atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_smp"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -541,9 +628,7 @@ impl Renderer {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float {
-                            filterable: true,
-                        },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -552,9 +637,7 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(
-                        wgpu::SamplerBindingType::Filtering,
-                    ),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -575,17 +658,9 @@ impl Renderer {
         });
 
         // ── Pipelines ─────────────────────────────────────────────────────────
-        let rect_pipeline = Self::make_rect_pipeline(
-            &device,
-            surface_format,
-            &uni_bgl,
-        );
-        let glyph_pipeline = Self::make_glyph_pipeline(
-            &device,
-            surface_format,
-            &uni_bgl,
-            &atlas_bgl,
-        );
+        let rect_pipeline = Self::make_rect_pipeline(&device, surface_format, &uni_bgl);
+        let glyph_pipeline =
+            Self::make_glyph_pipeline(&device, surface_format, &uni_bgl, &atlas_bgl);
 
         // ── Instance buffers (pre-allocate for typical terminal) ───────────────
         let init_rect = 8192usize;
@@ -616,6 +691,7 @@ impl Renderer {
             atlas_bg,
             _atlas_bgl: atlas_bgl,
             atlas_cache: HashMap::new(),
+            row_glyph_cache: HashMap::new(),
             atlas_x: 0,
             atlas_y: 0,
             atlas_row_h: 0,
@@ -775,7 +851,11 @@ impl Renderer {
                 bytes_per_row: Some(gw),
                 rows_per_image: Some(gh),
             },
-            wgpu::Extent3d { width: gw, height: gh, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: gw,
+                height: gh,
+                depth_or_array_layers: 1,
+            },
         );
 
         self.atlas_x += gw + 1;
@@ -803,13 +883,7 @@ impl Renderer {
 
     // ── Glyph emit helpers ────────────────────────────────────────────────────
 
-    fn emit_glyph_id(
-        &mut self,
-        id: u16,
-        px: f32,
-        py: f32,
-        fg: [f32; 4],
-    ) {
+    fn emit_glyph_id(&mut self, id: u16, px: f32, py: f32, fg: [f32; 4]) {
         if let Some(e) = self.ensure_glyph_id(id) {
             self.glyphs.push(GlyphInst {
                 pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
@@ -821,13 +895,7 @@ impl Renderer {
         }
     }
 
-    fn emit_char(
-        &mut self,
-        c: char,
-        px: f32,
-        py: f32,
-        fg: [f32; 4],
-    ) {
+    fn emit_char(&mut self, c: char, px: f32, py: f32, fg: [f32; 4]) {
         let id = self.font.lookup_glyph_index(c);
         self.emit_glyph_id(id, px, py, fg);
     }
@@ -841,12 +909,20 @@ impl Renderer {
     /// `GlyphOp::Glyph` at the first cell and `GlyphOp::Skip` at subsequent
     /// covered cells.
     fn compute_row_glyph_ops(
-        &self,
+        &mut self,
         state: &TerminalState,
         row: usize,
         vis_cols: usize,
     ) -> Vec<GlyphOp> {
-        compute_row_glyph_ops_impl(&self.rb_face, state, row, vis_cols)
+        let slot = RowGlyphCacheSlot {
+            state_ptr: state as *const TerminalState as usize,
+            row,
+            vis_cols,
+        };
+        let key = build_row_glyph_key(state, row, vis_cols);
+        lookup_cached_row_ops(&mut self.row_glyph_cache, slot, key, || {
+            compute_row_glyph_ops_impl(&self.rb_face, state, row, vis_cols)
+        })
     }
 
     // ── Block character rects ─────────────────────────────────────────────────
@@ -1014,7 +1090,8 @@ impl Renderer {
         let ch = self.cell_height as f32;
 
         let res: [f32; 4] = [bw, bh, 0., 0.];
-        self.queue.write_buffer(&self.uni_buf, 0, bytemuck::cast_slice(&res));
+        self.queue
+            .write_buffer(&self.uni_buf, 0, bytemuck::cast_slice(&res));
 
         self.bg_rects.clear();
         self.block_rects.clear();
@@ -1027,7 +1104,7 @@ impl Renderer {
             let ox = pane.x;
             let oy = pane.y;
             let vis_rows = ((pane.height / ch) as usize).min(pane.state.rows);
-            let vis_cols = ((pane.width  / cw) as usize).min(pane.state.cols);
+            let vis_cols = ((pane.width / cw) as usize).min(pane.state.cols);
 
             // ── Cell grid ─────────────────────────────────────────────────────────
             for row in 0..vis_rows {
@@ -1037,9 +1114,8 @@ impl Renderer {
                     0
                 };
 
-                // Pre-compute ligature-aware glyph ops for the row.
-                // This is a pure shaping step (no atlas mutation) so it can
-                // borrow &self while the draw loop later uses &mut self.
+                // Pre-compute ligature-aware glyph ops for the row, reusing
+                // cached shaping results when the visible row signature matches.
                 let glyph_ops = self.compute_row_glyph_ops(pane.state, row, vis_cols);
 
                 for col in 0..vis_cols {
@@ -1066,7 +1142,11 @@ impl Renderer {
                     let bg = if selected {
                         sel_bg
                     } else {
-                        let a = if bg_color == DEFAULT_BG { BG_ALPHA as f32 / 255. } else { 1. };
+                        let a = if bg_color == DEFAULT_BG {
+                            BG_ALPHA as f32 / 255.
+                        } else {
+                            1.
+                        };
                         c2fa(bg_color, a)
                     };
                     push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
@@ -1095,9 +1175,7 @@ impl Renderer {
                     // ── Per-cell underlines (SGR style + OSC 8 links) ─────────
                     let ul_style = cell.attrs.underline_style;
                     if ul_style != crate::terminal::UnderlineStyle::None {
-                        let ul_color = cell.attrs.underline_color
-                            .map(c2f)
-                            .unwrap_or(c2f(fg_color));
+                        let ul_color = cell.attrs.underline_color.map(c2f).unwrap_or(c2f(fg_color));
                         self.emit_underline(px, py, cw, ch, ul_style, ul_color);
                     } else if cell.link_id != 0 {
                         // OSC 8 hyperlink — use same blue as URL underlines.
@@ -1111,7 +1189,9 @@ impl Renderer {
             if !pane.url_underlines.is_empty() {
                 let u_col = rgb_f(0x58, 0x9a, 0xdd);
                 for &(row, c0, c1) in pane.url_underlines {
-                    if row >= vis_rows { continue; }
+                    if row >= vis_rows {
+                        continue;
+                    }
                     let uy = oy + row as f32 * ch + ch - 2.;
                     let x0 = ox + c0 as f32 * cw;
                     let x1 = ox + c1.min(vis_cols) as f32 * cw;
@@ -1125,7 +1205,9 @@ impl Renderer {
                     let py = oy + pane.state.cursor_row as f32 * ch;
                     for (i, c) in g.chars().enumerate() {
                         let col = pane.state.cursor_col + i;
-                        if col >= vis_cols { break; }
+                        if col >= vis_cols {
+                            break;
+                        }
                         self.emit_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
                     }
                 }
@@ -1146,7 +1228,14 @@ impl Renderer {
                     }
                     3 | 4 => {
                         // Underline cursor: thin bar at cell bottom
-                        push_rect(&mut self.fg_rects, px, py + ch - 2., cw, 2., c2f(CURSOR_COLOR));
+                        push_rect(
+                            &mut self.fg_rects,
+                            px,
+                            py + ch - 2.,
+                            cw,
+                            2.,
+                            c2f(CURSOR_COLOR),
+                        );
                     }
                     _ => {
                         // Bar cursor (default, 0, 5, 6): thin vertical bar at left
@@ -1158,20 +1247,27 @@ impl Renderer {
             // ── Scrollbar ─────────────────────────────────────────────────────────
             let sb_total = pane.state.scrollback.len();
             if sb_total > 0 {
-                let total    = sb_total + pane.state.rows;
-                let ph_u     = pane.height as usize;
-                let thumb_h  = ((ph_u * vis_rows) / total).max(8).min(ph_u);
+                let total = sb_total + pane.state.rows;
+                let ph_u = pane.height as usize;
+                let thumb_h = ((ph_u * vis_rows) / total).max(8).min(ph_u);
                 let view_top = sb_total.saturating_sub(pane.state.viewport_offset);
-                let thumb_y  = oy + (view_top * (ph_u - thumb_h)) as f32 / total.max(1) as f32;
-                let bar_x    = ox + pane.width - 3.;
-                let track    = rgb_f(0x2a, 0x2a, 0x2a);
-                let thumb    = if pane.state.is_scrolled_back() {
+                let thumb_y = oy + (view_top * (ph_u - thumb_h)) as f32 / total.max(1) as f32;
+                let bar_x = ox + pane.width - 3.;
+                let track = rgb_f(0x2a, 0x2a, 0x2a);
+                let thumb = if pane.state.is_scrolled_back() {
                     rgb_f(0x66, 0x66, 0x66)
                 } else {
                     rgb_f(0x44, 0x44, 0x44)
                 };
                 push_rect(&mut self.fg_rects, bar_x, oy, 2., pane.height, track);
-                push_rect(&mut self.fg_rects, bar_x, thumb_y, 2., thumb_h as f32, thumb);
+                push_rect(
+                    &mut self.fg_rects,
+                    bar_x,
+                    thumb_y,
+                    2.,
+                    thumb_h as f32,
+                    thumb,
+                );
             }
         }
 
@@ -1182,9 +1278,9 @@ impl Renderer {
         }
 
         // ── Upload ────────────────────────────────────────────────────────────────
-        let bg_count    = self.bg_rects.len();
+        let bg_count = self.bg_rects.len();
         let block_count = self.block_rects.len();
-        let fg_count    = self.fg_rects.len();
+        let fg_count = self.fg_rects.len();
         let total_rects = bg_count + block_count + fg_count;
 
         self.ensure_rect_buf(total_rects.max(1));
@@ -1195,7 +1291,8 @@ impl Renderer {
         let gi_size = std::mem::size_of::<GlyphInst>();
 
         if !self.bg_rects.is_empty() {
-            self.queue.write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&self.bg_rects));
+            self.queue
+                .write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&self.bg_rects));
         }
         if !self.block_rects.is_empty() {
             self.queue.write_buffer(
@@ -1212,13 +1309,16 @@ impl Renderer {
             );
         }
         if !self.glyphs.is_empty() {
-            self.queue.write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&self.glyphs));
+            self.queue
+                .write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&self.glyphs));
         }
 
         // ── Render pass ───────────────────────────────────────────────────────────
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("term_pass"),
@@ -1249,7 +1349,7 @@ impl Renderer {
             }
             if block_count > 0 {
                 let start = (bg_count * ri_size) as u64;
-                let end   = start + (block_count * ri_size) as u64;
+                let end = start + (block_count * ri_size) as u64;
                 pass.set_vertex_buffer(0, self.rect_buf.slice(start..end));
                 pass.draw(0..4, 0..block_count as u32);
             }
@@ -1263,7 +1363,7 @@ impl Renderer {
                 pass.set_pipeline(&self.rect_pipeline);
                 pass.set_bind_group(0, &self.uni_bg, &[]);
                 let start = ((bg_count + block_count) * ri_size) as u64;
-                let end   = start + (fg_count * ri_size) as u64;
+                let end = start + (fg_count * ri_size) as u64;
                 pass.set_vertex_buffer(0, self.rect_buf.slice(start..end));
                 pass.draw(0..4, 0..fg_count as u32);
             }
@@ -1346,7 +1446,7 @@ mod tests {
         push_rect(&mut v, 400., 0., 2., 600., rgb_f(0x3a, 0x3a, 0x3a));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].pos, [400., 0.]);
-        assert_eq!(v[0].sz,  [2., 600.]);
+        assert_eq!(v[0].sz, [2., 600.]);
     }
 
     #[test]
@@ -1390,37 +1490,58 @@ mod tests {
 
     #[test]
     fn is_block_char_lower_block_boundary() {
-        assert!(is_block_char('\u{2580}'), "U+2580 UPPER HALF BLOCK must be a block char");
+        assert!(
+            is_block_char('\u{2580}'),
+            "U+2580 UPPER HALF BLOCK must be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_upper_block_boundary() {
-        assert!(is_block_char('\u{259F}'), "U+259F QUADRANT LOWER-RIGHT must be a block char");
+        assert!(
+            is_block_char('\u{259F}'),
+            "U+259F QUADRANT LOWER-RIGHT must be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_just_before_block_range_is_false() {
-        assert!(!is_block_char('\u{257F}'), "U+257F must not be a block char");
+        assert!(
+            !is_block_char('\u{257F}'),
+            "U+257F must not be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_just_after_block_range_is_false() {
-        assert!(!is_block_char('\u{25A0}'), "U+25A0 BLACK SQUARE must not be a block char");
+        assert!(
+            !is_block_char('\u{25A0}'),
+            "U+25A0 BLACK SQUARE must not be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_braille_lower_boundary() {
-        assert!(is_block_char('\u{2800}'), "U+2800 BRAILLE BLANK must be a block char");
+        assert!(
+            is_block_char('\u{2800}'),
+            "U+2800 BRAILLE BLANK must be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_braille_upper_boundary() {
-        assert!(is_block_char('\u{28FF}'), "U+28FF BRAILLE 8-DOT must be a block char");
+        assert!(
+            is_block_char('\u{28FF}'),
+            "U+28FF BRAILLE 8-DOT must be a block char"
+        );
     }
 
     #[test]
     fn is_block_char_just_after_braille_range_is_false() {
-        assert!(!is_block_char('\u{2900}'), "U+2900 must not be a block char");
+        assert!(
+            !is_block_char('\u{2900}'),
+            "U+2900 must not be a block char"
+        );
     }
 
     #[test]
@@ -1451,7 +1572,10 @@ mod tests {
         let result = shape_run_impl(&face, &['A']);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].char_idx, 0);
-        assert_ne!(result[0].glyph_id, 0, "A must have a real glyph in JetBrains Mono");
+        assert_ne!(
+            result[0].glyph_id, 0,
+            "A must have a real glyph in JetBrains Mono"
+        );
     }
 
     #[test]
@@ -1462,7 +1586,11 @@ mod tests {
         assert!(!result.is_empty());
         // All char_idxes must be in-range.
         for sg in &result {
-            assert!(sg.char_idx < chars.len(), "char_idx {} out of range", sg.char_idx);
+            assert!(
+                sg.char_idx < chars.len(),
+                "char_idx {} out of range",
+                sg.char_idx
+            );
         }
     }
 
@@ -1476,7 +1604,8 @@ mod tests {
             assert!(
                 sg.char_idx >= prev,
                 "char_idx went backwards: {} < {}",
-                sg.char_idx, prev
+                sg.char_idx,
+                prev
             );
             prev = sg.char_idx;
         }
@@ -1491,7 +1620,8 @@ mod tests {
         assert!(
             result.len() <= chars.len(),
             "shaped output ({}) must not exceed input ({}) chars",
-            result.len(), chars.len()
+            result.len(),
+            chars.len()
         );
     }
 
@@ -1517,7 +1647,10 @@ mod tests {
         let chars = vec!['\u{00E9}'];
         let result = shape_run_impl(&face, &chars);
         assert!(!result.is_empty());
-        assert_eq!(result[0].char_idx, 0, "char_idx for single multibyte char must be 0");
+        assert_eq!(
+            result[0].char_idx, 0,
+            "char_idx for single multibyte char must be 0"
+        );
     }
 
     #[test]
@@ -1602,8 +1735,14 @@ mod tests {
         term.process(b"\x1b[32m>");
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
         // Both cols must be Glyph (independent runs, not ligature-merged Skip).
-        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 '-' red must be Glyph");
-        assert!(matches!(ops[1], GlyphOp::Glyph(_)), "col 1 '>' green must be Glyph");
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "col 0 '-' red must be Glyph"
+        );
+        assert!(
+            matches!(ops[1], GlyphOp::Glyph(_)),
+            "col 1 '>' green must be Glyph"
+        );
     }
 
     #[test]
@@ -1616,7 +1755,10 @@ mod tests {
         let mut term = make_term(10, 5);
         term.process(b"->");
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
-        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "first char must be Glyph");
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "first char must be Glyph"
+        );
         assert!(
             matches!(ops[1], GlyphOp::Glyph(_) | GlyphOp::Skip),
             "second char must be Glyph or Skip (ligature)"
@@ -1631,9 +1773,15 @@ mod tests {
         let mut term = make_term(10, 5);
         term.process(b"a b");
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
-        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 'a' must be Glyph");
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "col 0 'a' must be Glyph"
+        );
         assert!(matches!(ops[1], GlyphOp::Skip), "col 1 ' ' must be Skip");
-        assert!(matches!(ops[2], GlyphOp::Glyph(_)), "col 2 'b' must be Glyph");
+        assert!(
+            matches!(ops[2], GlyphOp::Glyph(_)),
+            "col 2 'b' must be Glyph"
+        );
     }
 
     #[test]
@@ -1643,9 +1791,18 @@ mod tests {
         let mut term = make_term(10, 5);
         term.process("a\u{2588}b".as_bytes());
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
-        assert!(matches!(ops[0], GlyphOp::Glyph(_)), "col 0 'a' must be Glyph");
-        assert!(matches!(ops[1], GlyphOp::Block), "col 1 U+2588 must be Block");
-        assert!(matches!(ops[2], GlyphOp::Glyph(_)), "col 2 'b' must be Glyph");
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "col 0 'a' must be Glyph"
+        );
+        assert!(
+            matches!(ops[1], GlyphOp::Block),
+            "col 1 U+2588 must be Block"
+        );
+        assert!(
+            matches!(ops[2], GlyphOp::Glyph(_)),
+            "col 2 'b' must be Glyph"
+        );
     }
 
     #[test]
@@ -1664,6 +1821,93 @@ mod tests {
         let term = make_term(5, 3);
         let ops = compute_row_glyph_ops_impl(&face, &term.state, 10, 5);
         assert!(ops.iter().all(|o| matches!(o, GlyphOp::Skip)));
+    }
+
+    #[test]
+    fn glyph_ops_wide_continuation_column_is_skip() {
+        let face = test_face();
+        let mut term = make_term(6, 2);
+        term.process("界".as_bytes());
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 6);
+        assert!(matches!(ops[0], GlyphOp::Glyph(_) | GlyphOp::Skip));
+        assert!(matches!(ops[1], GlyphOp::Skip));
+    }
+
+    #[test]
+    fn row_glyph_key_changes_when_chars_change() {
+        let mut term = make_term(4, 2);
+        term.process(b"A");
+        let first = build_row_glyph_key(&term.state, 0, 4);
+        term.process(b"\rB");
+        let second = build_row_glyph_key(&term.state, 0, 4);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn row_glyph_key_changes_when_effective_fg_changes() {
+        let mut term = make_term(4, 2);
+        term.process(b"\x1b[31mA");
+        let first = build_row_glyph_key(&term.state, 0, 4);
+        term = make_term(4, 2);
+        term.process(b"\x1b[32mA");
+        let second = build_row_glyph_key(&term.state, 0, 4);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn row_glyph_key_ignores_background_when_effective_fg_is_unchanged() {
+        let mut term = make_term(4, 2);
+        term.process(b"\x1b[41mA");
+        let first = build_row_glyph_key(&term.state, 0, 4);
+        term = make_term(4, 2);
+        term.process(b"\x1b[44mA");
+        let second = build_row_glyph_key(&term.state, 0, 4);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn lookup_cached_row_ops_reuses_matching_entry() {
+        let mut cache = HashMap::new();
+        let slot = RowGlyphCacheSlot {
+            state_ptr: 1,
+            row: 0,
+            vis_cols: 2,
+        };
+        let key = RowGlyphKey {
+            cells: vec![RowGlyphKeyCell {
+                c: 'A',
+                fg: DEFAULT_FG,
+            }],
+        };
+        let mut compute_calls = 0;
+
+        let first = lookup_cached_row_ops(&mut cache, slot, key.clone(), || {
+            compute_calls += 1;
+            vec![GlyphOp::Glyph(7)]
+        });
+        let second = lookup_cached_row_ops(&mut cache, slot, key.clone(), || {
+            compute_calls += 1;
+            vec![GlyphOp::Glyph(8)]
+        });
+        let third = lookup_cached_row_ops(
+            &mut cache,
+            slot,
+            RowGlyphKey {
+                cells: vec![RowGlyphKeyCell {
+                    c: 'B',
+                    fg: DEFAULT_FG,
+                }],
+            },
+            || {
+                compute_calls += 1;
+                vec![GlyphOp::Glyph(9)]
+            },
+        );
+
+        assert_eq!(compute_calls, 2);
+        assert_eq!(first, vec![GlyphOp::Glyph(7)]);
+        assert_eq!(second, vec![GlyphOp::Glyph(7)]);
+        assert_eq!(third, vec![GlyphOp::Glyph(9)]);
     }
 
     // ── emit_underline_rects ──────────────────────────────────────────────────
@@ -1696,9 +1940,15 @@ mod tests {
         use crate::terminal::UnderlineStyle;
         let v = underline_rects(UnderlineStyle::Straight);
         let expected_y = CH - 2.;
-        assert_eq!(v[0].pos[1], expected_y, "straight underline must be at y = ch - 2");
+        assert_eq!(
+            v[0].pos[1], expected_y,
+            "straight underline must be at y = ch - 2"
+        );
         assert_eq!(v[0].sz[1], 1., "straight underline must be 1px tall");
-        assert_eq!(v[0].sz[0], CW, "straight underline must span full cell width");
+        assert_eq!(
+            v[0].sz[0], CW,
+            "straight underline must span full cell width"
+        );
     }
 
     #[test]
@@ -1721,14 +1971,22 @@ mod tests {
         let v = underline_rects(UnderlineStyle::Double);
         let y0 = v[0].pos[1];
         let y1 = v[1].pos[1];
-        assert_eq!((y1 - y0).abs(), 2., "double underline lines must be 2px apart");
+        assert_eq!(
+            (y1 - y0).abs(),
+            2.,
+            "double underline lines must be 2px apart"
+        );
     }
 
     #[test]
     fn underline_curly_pushes_multiple_rects() {
         use crate::terminal::UnderlineStyle;
         let v = underline_rects(UnderlineStyle::Curly);
-        assert!(v.len() >= 2, "curly underline must push at least 2 rects, got {}", v.len());
+        assert!(
+            v.len() >= 2,
+            "curly underline must push at least 2 rects, got {}",
+            v.len()
+        );
     }
 
     #[test]
@@ -1747,7 +2005,10 @@ mod tests {
         use crate::terminal::UnderlineStyle;
         let v = underline_rects(UnderlineStyle::Curly);
         if v.len() >= 2 {
-            assert_ne!(v[0].pos[1], v[1].pos[1], "adjacent curly segments must alternate y");
+            assert_ne!(
+                v[0].pos[1], v[1].pos[1],
+                "adjacent curly segments must alternate y"
+            );
         }
     }
 
@@ -1792,7 +2053,10 @@ mod tests {
         let dashed = underline_rects(UnderlineStyle::Dashed);
         let dot_w = dotted[0].sz[0];
         let dash_w = dashed[0].sz[0];
-        assert!(dash_w > dot_w, "dashed segments ({dash_w}px) must be wider than dotted ({dot_w}px)");
+        assert!(
+            dash_w > dot_w,
+            "dashed segments ({dash_w}px) must be wider than dotted ({dot_w}px)"
+        );
     }
 
     #[test]
@@ -1800,7 +2064,10 @@ mod tests {
         use crate::terminal::UnderlineStyle;
         let mut v = Vec::new();
         emit_underline_rects(&mut v, 50., 100., CW, CH, UnderlineStyle::Straight, RED);
-        assert_eq!(v[0].pos[0], 50., "underline x must follow the given x offset");
+        assert_eq!(
+            v[0].pos[0], 50.,
+            "underline x must follow the given x offset"
+        );
     }
 
     #[test]
