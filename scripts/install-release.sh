@@ -31,7 +31,7 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-echo "→ Installing Term $VERSION"
+echo "→ Installing Term ${VERSION}"
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
@@ -51,11 +51,11 @@ xattr -cr "$TMP/Term.app"
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
-echo "→ Installing to $APP_DST…"
+echo "→ Installing to ${APP_DST}…"
 rm -rf "$APP_DST"
 cp -R "$TMP/Term.app" "$APP_DST"
 
-echo "→ Symlinking binaries into $BIN_DIR…"
+echo "→ Symlinking binaries into ${BIN_DIR}…"
 sudo mkdir -p "$BIN_DIR"
 for bin in term tcat tdiff tjson; do
   sudo ln -sf "$APP_DST/Contents/MacOS/$bin" "$BIN_DIR/$bin"
@@ -65,6 +65,6 @@ done
   -f "$APP_DST" 2>/dev/null || true
 
 echo ""
-echo "✓ Term $VERSION installed to $APP_DST"
+echo "✓ Term ${VERSION} installed to ${APP_DST}"
 echo "  • Double-click it in Finder, or run 'term' from any terminal."
 echo "  • To update: re-run this script."
