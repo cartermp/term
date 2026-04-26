@@ -247,6 +247,23 @@ fn c2fa(c: Color, a: f32) -> [f32; 4] {
     [c.r as f32 / 255., c.g as f32 / 255., c.b as f32 / 255., a]
 }
 
+fn default_background_fill(appearance: BackgroundAppearance, cell_bg: Color) -> [f32; 4] {
+    if cell_bg == DEFAULT_BG {
+        c2fa(appearance.color, appearance.alpha_f32())
+    } else {
+        c2f(cell_bg)
+    }
+}
+
+fn background_clear_color(appearance: BackgroundAppearance) -> wgpu::Color {
+    wgpu::Color {
+        r: appearance.color.r as f64 / 255.,
+        g: appearance.color.g as f64 / 255.,
+        b: appearance.color.b as f64 / 255.,
+        a: appearance.alpha_f64(),
+    }
+}
+
 pub fn rgb_f(r: u8, g: u8, b: u8) -> [f32; 4] {
     [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.]
 }
@@ -539,6 +556,7 @@ pub struct Renderer {
     pub baseline: i32,
     font_size: f32,
     pub surface_format: wgpu::TextureFormat,
+    background: BackgroundAppearance,
 }
 
 impl Renderer {
@@ -547,6 +565,7 @@ impl Renderer {
         queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
         scale_factor: f64,
+        background: BackgroundAppearance,
     ) -> Self {
         // ── Font ──────────────────────────────────────────────────────────────
         let font_size = (FONT_SIZE_PT * scale_factor as f32).round();
@@ -710,7 +729,12 @@ impl Renderer {
             baseline: ascent,
             font_size,
             surface_format,
+            background,
         }
+    }
+
+    pub fn set_background(&mut self, background: BackgroundAppearance) {
+        self.background = background;
     }
 
     // ── Pipeline constructors ─────────────────────────────────────────────────
@@ -1142,12 +1166,7 @@ impl Renderer {
                     let bg = if selected {
                         sel_bg
                     } else {
-                        let a = if bg_color == DEFAULT_BG {
-                            BG_ALPHA as f32 / 255.
-                        } else {
-                            1.
-                        };
-                        c2fa(bg_color, a)
+                        default_background_fill(self.background, bg_color)
                     };
                     push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
 
@@ -1326,12 +1345,7 @@ impl Renderer {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: DEFAULT_BG.r as f64 / 255.,
-                            g: DEFAULT_BG.g as f64 / 255.,
-                            b: DEFAULT_BG.b as f64 / 255.,
-                            a: 1.,
-                        }),
+                        load: wgpu::LoadOp::Clear(background_clear_color(self.background)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1908,6 +1922,24 @@ mod tests {
         assert_eq!(first, vec![GlyphOp::Glyph(7)]);
         assert_eq!(second, vec![GlyphOp::Glyph(7)]);
         assert_eq!(third, vec![GlyphOp::Glyph(9)]);
+    }
+
+    #[test]
+    fn default_background_fill_uses_custom_color_and_alpha() {
+        let appearance = BackgroundAppearance::new(Color::new(10, 20, 30), 128);
+        assert_eq!(
+            default_background_fill(appearance, DEFAULT_BG),
+            [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 128.0 / 255.0]
+        );
+    }
+
+    #[test]
+    fn default_background_fill_keeps_explicit_cell_background_opaque() {
+        let appearance = BackgroundAppearance::new(Color::new(10, 20, 30), 64);
+        assert_eq!(
+            default_background_fill(appearance, Color::new(40, 50, 60)),
+            [40.0 / 255.0, 50.0 / 255.0, 60.0 / 255.0, 1.0]
+        );
     }
 
     // ── emit_underline_rects ──────────────────────────────────────────────────

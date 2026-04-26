@@ -1,18 +1,27 @@
 /// Platform-specific helpers.
-
-// ── New-tab callback (drives the native + button) ─────────────────────────────
-
+// ── Native callbacks + menu actions ────────────────────────────────────────────
+use crate::config::{BackgroundAppearance, Color};
 use std::sync::OnceLock;
 
 static NEW_TAB_CB: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static SHOW_BACKGROUND_PANEL_CB: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static BACKGROUND_CHANGED_CB: OnceLock<Box<dyn Fn(BackgroundAppearance) + Send + Sync>> =
+    OnceLock::new();
 
 /// Register the function to call when the native tab bar "+" button is clicked.
-/// Must be called before `setup_add_tab_button`.  Can only be set once.
+/// Must be called before `setup_add_tab_button`. Can only be set once.
 pub fn set_new_tab_callback(f: impl Fn() + Send + Sync + 'static) {
     let _ = NEW_TAB_CB.set(Box::new(f));
 }
 
-// ObjC method: handles the `newWindowForTab:` action sent by the native "+" button.
+pub fn set_show_background_panel_callback(f: impl Fn() + Send + Sync + 'static) {
+    let _ = SHOW_BACKGROUND_PANEL_CB.set(Box::new(f));
+}
+
+pub fn set_background_changed_callback(f: impl Fn(BackgroundAppearance) + Send + Sync + 'static) {
+    let _ = BACKGROUND_CHANGED_CB.set(Box::new(f));
+}
+
 extern "C" fn new_tab_action(
     _this: *mut objc2::runtime::AnyObject,
     _cmd: objc2::runtime::Sel,
@@ -23,14 +32,33 @@ extern "C" fn new_tab_action(
     }
 }
 
-fn tab_target_class() -> Option<&'static objc2::runtime::AnyClass> {
+extern "C" fn show_background_panel_action(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
+) {
+    if let Some(cb) = SHOW_BACKGROUND_PANEL_CB.get() {
+        cb();
+    }
+}
+
+extern "C" fn background_changed_action(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    sender: *mut objc2::runtime::AnyObject,
+) {
+    if let (Some(cb), Some(background)) = (BACKGROUND_CHANGED_CB.get(), panel_background(sender)) {
+        cb(background);
+    }
+}
+
+fn action_target_class() -> Option<&'static objc2::runtime::AnyClass> {
     use objc2::runtime::{AnyClass, AnyObject, ClassBuilder};
     use objc2::sel;
     static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
     *CLASS.get_or_init(|| {
-        // Subclass NSResponder so we can be inserted into the responder chain.
         let superclass = objc2::class!(NSResponder);
-        match ClassBuilder::new("TermTabTarget", superclass) {
+        match ClassBuilder::new("TermActionTarget", superclass) {
             Some(mut builder) => {
                 unsafe {
                     builder.add_method(
@@ -38,23 +66,141 @@ fn tab_target_class() -> Option<&'static objc2::runtime::AnyClass> {
                         new_tab_action
                             as extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject),
                     );
+                    builder.add_method(
+                        sel!(openBackgroundAppearancePanel:),
+                        show_background_panel_action
+                            as extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject),
+                    );
+                    builder.add_method(
+                        sel!(changeColor:),
+                        background_changed_action
+                            as extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject),
+                    );
                 }
                 Some(builder.register())
             }
-            None => AnyClass::get("TermTabTarget"),
+            None => AnyClass::get("TermActionTarget"),
         }
     })
 }
 
-/// Insert a TermTabTarget NSResponder into this window's responder chain so that
+#[cfg(target_os = "macos")]
+fn make_action_target() -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::{msg_send, runtime::AnyObject};
+    let cls = action_target_class()?;
+    unsafe {
+        let obj: *mut AnyObject = msg_send![cls, alloc];
+        let obj: *mut AnyObject = msg_send![obj, init];
+        if obj.is_null() {
+            return None;
+        }
+        let _: *mut AnyObject = msg_send![obj, retain];
+        Some(obj)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn shared_action_target() -> Option<*mut objc2::runtime::AnyObject> {
+    static TARGET: OnceLock<Option<usize>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| make_action_target().map(|obj| obj as usize))
+        .map(|ptr| ptr as *mut objc2::runtime::AnyObject)
+}
+
+#[cfg(target_os = "macos")]
+fn ns_string(text: &str) -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    use std::ffi::CString;
+    let c_text = CString::new(text).ok()?;
+    unsafe {
+        let s: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: c_text.as_ptr()];
+        (!s.is_null()).then_some(s)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ns_string_value(obj: *mut objc2::runtime::AnyObject) -> Option<String> {
+    use objc2::{msg_send, runtime::AnyObject};
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+    if obj.is_null() {
+        return None;
+    }
+    unsafe {
+        let s: *mut AnyObject = msg_send![obj, title];
+        if s.is_null() {
+            return None;
+        }
+        let c_str: *const c_char = msg_send![s, UTF8String];
+        if c_str.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(c_str).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn find_menu_item(
+    menu: *mut objc2::runtime::AnyObject,
+    title: &str,
+) -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::{msg_send, runtime::AnyObject};
+    if menu.is_null() {
+        return None;
+    }
+    unsafe {
+        let count: usize = msg_send![menu, numberOfItems];
+        for i in 0..count {
+            let item: *mut AnyObject = msg_send![menu, itemAtIndex: i];
+            if ns_string_value(item).as_deref() == Some(title) {
+                return Some(item);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn panel_background(sender: *mut objc2::runtime::AnyObject) -> Option<BackgroundAppearance> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        if sender.is_null() {
+            return None;
+        }
+        let color: *mut AnyObject = msg_send![sender, color];
+        if color.is_null() {
+            return None;
+        }
+        let srgb_space: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        let converted: *mut AnyObject = msg_send![color, colorUsingColorSpace: srgb_space];
+        let color = if converted.is_null() {
+            color
+        } else {
+            converted
+        };
+        let r: f64 = msg_send![color, redComponent];
+        let g: f64 = msg_send![color, greenComponent];
+        let b: f64 = msg_send![color, blueComponent];
+        let a: f64 = msg_send![color, alphaComponent];
+        Some(BackgroundAppearance::new(
+            Color::new(
+                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ),
+            (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ))
+    }
+}
+
+/// Insert a TermActionTarget NSResponder into this window's responder chain so that
 /// the native tab bar "+" button's `newWindowForTab:` action reaches our callback.
 /// Called once per window after the window is fully set up.
 #[cfg(target_os = "macos")]
 pub fn setup_add_tab_button(ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
-    let cls = match tab_target_class() {
-        Some(c) => c,
-        None => return,
+    let Some(obj) = make_action_target() else {
+        return;
     };
     unsafe {
         let view = ns_view as *mut AnyObject;
@@ -62,17 +208,131 @@ pub fn setup_add_tab_button(ns_view: *mut std::ffi::c_void) {
         if win.is_null() {
             return;
         }
-        // Allocate a fresh NSResponder for this window and retain it permanently.
-        let obj: *mut AnyObject = msg_send![cls, alloc];
-        let obj: *mut AnyObject = msg_send![obj, init];
-        if obj.is_null() {
-            return;
-        }
-        let _: *mut AnyObject = msg_send![obj, retain];
-        // Splice into the chain: win → obj → old_next_responder.
         let old_next: *mut AnyObject = msg_send![win, nextResponder];
         let _: () = msg_send![obj, setNextResponder: old_next];
         let _: () = msg_send![win, setNextResponder: obj];
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn configure_window_background(ns_view: *mut std::ffi::c_void) {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() {
+            return;
+        }
+        let _: () = msg_send![win, setOpaque: false];
+        let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+        if !clear.is_null() {
+            let _: () = msg_send![win, setBackgroundColor: clear];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_background_menu_item() {
+    use objc2::{class, msg_send, runtime::AnyObject, sel};
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
+        if main_menu.is_null() {
+            return;
+        }
+
+        let appearance_title = match ns_string("Appearance") {
+            Some(s) => s,
+            None => return,
+        };
+        let background_title = match ns_string("Background...") {
+            Some(s) => s,
+            None => return,
+        };
+        let empty = match ns_string("") {
+            Some(s) => s,
+            None => return,
+        };
+
+        let appearance_item = if let Some(existing) = find_menu_item(main_menu, "Appearance") {
+            existing
+        } else {
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: appearance_title
+                action: std::ptr::null::<std::ffi::c_void>()
+                keyEquivalent: empty
+            ];
+            if item.is_null() {
+                return;
+            }
+            let submenu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+            let submenu: *mut AnyObject = msg_send![submenu, initWithTitle: appearance_title];
+            if submenu.is_null() {
+                return;
+            }
+            let _: () = msg_send![item, setSubmenu: submenu];
+            let _: () = msg_send![main_menu, addItem: item];
+            item
+        };
+
+        let submenu: *mut AnyObject = msg_send![appearance_item, submenu];
+        if submenu.is_null() || find_menu_item(submenu, "Background...").is_some() {
+            return;
+        }
+
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
+            item,
+            initWithTitle: background_title
+            action: sel!(openBackgroundAppearancePanel:)
+            keyEquivalent: empty
+        ];
+        if item.is_null() {
+            return;
+        }
+        let Some(target) = shared_action_target() else {
+            return;
+        };
+        let _: () = msg_send![item, setTarget: target];
+        let _: () = msg_send![submenu, addItem: item];
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn show_background_panel(background: BackgroundAppearance) {
+    use objc2::{class, msg_send, runtime::AnyObject, sel};
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+        if panel.is_null() {
+            return;
+        }
+        let Some(target) = shared_action_target() else {
+            return;
+        };
+        let color: *mut AnyObject = msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: background.color.r as f64 / 255.0
+            green: background.color.g as f64 / 255.0
+            blue: background.color.b as f64 / 255.0
+            alpha: background.alpha as f64 / 255.0
+        ];
+        if !color.is_null() {
+            let _: () = msg_send![panel, setColor: color];
+        }
+        let _: () = msg_send![panel, setShowsAlpha: true];
+        let _: () = msg_send![panel, setTarget: target];
+        let _: () = msg_send![panel, setAction: sel!(changeColor:)];
+        let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
 }
 
@@ -167,7 +427,11 @@ pub fn clipboard_text() -> Option<String> {
         if c_str.is_null() {
             return None;
         }
-        Some(std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned())
+        Some(
+            std::ffi::CStr::from_ptr(c_str)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -176,14 +440,19 @@ pub fn clipboard_text() -> Option<String> {
 /// Safe to call immediately after window creation.
 /// The new tab is always appended at the end of the tab bar.
 #[cfg(target_os = "macos")]
-pub fn add_window_as_tab(existing_ns_view: *mut std::ffi::c_void, new_ns_view: *mut std::ffi::c_void) {
+pub fn add_window_as_tab(
+    existing_ns_view: *mut std::ffi::c_void,
+    new_ns_view: *mut std::ffi::c_void,
+) {
     use objc2::{msg_send, runtime::AnyObject};
     unsafe {
         let ev = existing_ns_view as *mut AnyObject;
-        let nv = new_ns_view  as *mut AnyObject;
+        let nv = new_ns_view as *mut AnyObject;
         let ew: *mut AnyObject = msg_send![ev, window];
         let nw: *mut AnyObject = msg_send![nv, window];
-        if ew.is_null() || nw.is_null() { return; }
+        if ew.is_null() || nw.is_null() {
+            return;
+        }
 
         // Find the last window in the tab group so we append after it,
         // rather than inserting after whichever window we happened to pick.
@@ -210,7 +479,7 @@ pub fn select_next_tab(ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
-        let win:  *mut AnyObject = msg_send![view, window];
+        let win: *mut AnyObject = msg_send![view, window];
         if !win.is_null() {
             let _: () = msg_send![win, selectNextTab: std::ptr::null::<AnyObject>()];
         }
@@ -223,7 +492,7 @@ pub fn select_prev_tab(ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
-        let win:  *mut AnyObject = msg_send![view, window];
+        let win: *mut AnyObject = msg_send![view, window];
         if !win.is_null() {
             let _: () = msg_send![win, selectPreviousTab: std::ptr::null::<AnyObject>()];
         }
@@ -238,12 +507,18 @@ pub fn select_tab_at_index(ns_view: *mut std::ffi::c_void, n: usize) {
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
         let win: *mut AnyObject = msg_send![view, window];
-        if win.is_null() { return; }
+        if win.is_null() {
+            return;
+        }
         let tabs: *mut AnyObject = msg_send![win, tabbedWindows];
-        if tabs.is_null() { return; }
+        if tabs.is_null() {
+            return;
+        }
         let count: usize = msg_send![tabs, count];
         let idx = n.saturating_sub(1);
-        if idx >= count { return; }
+        if idx >= count {
+            return;
+        }
         let target: *mut AnyObject = msg_send![tabs, objectAtIndex: idx];
         if !target.is_null() {
             let _: () = msg_send![target, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
@@ -259,11 +534,17 @@ pub fn tab_index_and_count(ns_view: *mut std::ffi::c_void) -> (usize, usize) {
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
         let win: *mut AnyObject = msg_send![view, window];
-        if win.is_null() { return (1, 1); }
+        if win.is_null() {
+            return (1, 1);
+        }
         let tabs: *mut AnyObject = msg_send![win, tabbedWindows];
-        if tabs.is_null() { return (1, 1); }
+        if tabs.is_null() {
+            return (1, 1);
+        }
         let count: usize = msg_send![tabs, count];
-        if count == 0 { return (1, 1); }
+        if count == 0 {
+            return (1, 1);
+        }
         for i in 0..count {
             let w: *mut AnyObject = msg_send![tabs, objectAtIndex: i];
             // Compare by pointer identity (both are NSWindow*).
@@ -282,18 +563,26 @@ pub fn tab_index_and_count(ns_view: *mut std::ffi::c_void) -> (usize, usize) {
 pub fn set_tab_title(ns_view: *mut std::ffi::c_void, title: &str) {
     use objc2::{msg_send, runtime::AnyObject};
     use std::ffi::CString;
-    let Ok(c_title) = CString::new(title) else { return };
+    let Ok(c_title) = CString::new(title) else {
+        return;
+    };
     unsafe {
         let view: *mut AnyObject = ns_view as *mut AnyObject;
-        let win:  *mut AnyObject = msg_send![view, window];
-        if win.is_null() { return; }
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() {
+            return;
+        }
         let tab: *mut AnyObject = msg_send![win, tab];
-        if tab.is_null() { return; }
+        if tab.is_null() {
+            return;
+        }
         let ns_str: *mut AnyObject = msg_send![
             objc2::class!(NSString),
             stringWithUTF8String: c_title.as_ptr()
         ];
-        if ns_str.is_null() { return; }
+        if ns_str.is_null() {
+            return;
+        }
         let _: () = msg_send![tab, setTitle: ns_str];
     }
 }

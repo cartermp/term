@@ -18,7 +18,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use completion::Engine;
-use config::{WINDOW_HEIGHT, WINDOW_WIDTH};
+use config::{BackgroundAppearance, DEFAULT_BACKGROUND_APPEARANCE, WINDOW_HEIGHT, WINDOW_WIDTH};
 use renderer::{PaneView, Renderer};
 use terminal::Terminal;
 
@@ -27,6 +27,8 @@ enum AppEvent {
     PtyData { pane_id: u64, data: Vec<u8> },
     PtyExit { pane_id: u64 },
     NewTab,
+    ShowBackgroundAppearancePanel,
+    BackgroundAppearanceChanged(BackgroundAppearance),
 }
 
 // ── Split direction ───────────────────────────────────────────────────────────
@@ -385,6 +387,18 @@ struct WgpuShared {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
+}
+
+fn choose_surface_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+    [
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+        wgpu::CompositeAlphaMode::Auto,
+    ]
+    .into_iter()
+    .find(|mode| modes.contains(mode))
+    .or_else(|| modes.first().copied())
+    .unwrap_or(wgpu::CompositeAlphaMode::Auto)
 }
 
 // ── TerminalWindow ────────────────────────────────────────────────────────────
@@ -1024,6 +1038,7 @@ struct App {
     next_pane_id: u64,
     proxy: EventLoopProxy<AppEvent>,
     tabbing_id: String,
+    background: BackgroundAppearance,
 }
 
 impl App {
@@ -1035,6 +1050,15 @@ impl App {
             next_pane_id: 0,
             proxy,
             tabbing_id: format!("term-{}", std::process::id()),
+            background: DEFAULT_BACKGROUND_APPEARANCE,
+        }
+    }
+
+    fn apply_background_appearance(&mut self, background: BackgroundAppearance) {
+        self.background = background;
+        for tw in self.windows.values_mut() {
+            tw.renderer.set_background(background);
+            tw.window.request_redraw();
         }
     }
 
@@ -1148,6 +1172,7 @@ impl App {
 
         let mut attrs = WindowAttributes::default()
             .with_title("term")
+            .with_transparent(true)
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
 
         #[cfg(target_os = "macos")]
@@ -1162,6 +1187,7 @@ impl App {
         // Set NSWindowTabbingModePreferred so tab bar always shows
         #[cfg(target_os = "macos")]
         if let Some(ns_view) = ns_view_ptr(&window) {
+            platform::configure_window_background(ns_view);
             use objc2::{msg_send, runtime::AnyObject};
             unsafe {
                 let view = ns_view as *mut AnyObject;
@@ -1193,11 +1219,7 @@ impl App {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: choose_surface_alpha_mode(&caps.alpha_modes),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1209,6 +1231,7 @@ impl App {
             wgpu.queue.clone(),
             surface_format,
             scale,
+            self.background,
         );
 
         let (cols, rows) = {
@@ -1386,6 +1409,7 @@ impl ApplicationHandler<AppEvent> for App {
 
         let mut attrs = WindowAttributes::default()
             .with_title("term")
+            .with_transparent(true)
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
 
         #[cfg(target_os = "macos")]
@@ -1441,11 +1465,7 @@ impl ApplicationHandler<AppEvent> for App {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: choose_surface_alpha_mode(&caps.alpha_modes),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1454,6 +1474,7 @@ impl ApplicationHandler<AppEvent> for App {
         // Set NSWindowTabbingModePreferred
         #[cfg(target_os = "macos")]
         if let Some(ns_view) = ns_view_ptr(&window) {
+            platform::configure_window_background(ns_view);
             use objc2::{msg_send, runtime::AnyObject};
             unsafe {
                 let view = ns_view as *mut AnyObject;
@@ -1471,10 +1492,25 @@ impl ApplicationHandler<AppEvent> for App {
             platform::set_new_tab_callback(move || {
                 let _ = proxy.send_event(AppEvent::NewTab);
             });
+            let proxy = self.proxy.clone();
+            platform::set_show_background_panel_callback(move || {
+                let _ = proxy.send_event(AppEvent::ShowBackgroundAppearancePanel);
+            });
+            let proxy = self.proxy.clone();
+            platform::set_background_changed_callback(move |background| {
+                let _ = proxy.send_event(AppEvent::BackgroundAppearanceChanged(background));
+            });
+            platform::install_background_menu_item();
         }
 
         let scale = window.scale_factor();
-        let renderer = Renderer::new(device.clone(), queue.clone(), surface_format, scale);
+        let renderer = Renderer::new(
+            device.clone(),
+            queue.clone(),
+            surface_format,
+            scale,
+            self.background,
+        );
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
@@ -1577,7 +1613,8 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(tw) = self.windows.get_mut(&window_id) {
                         let fmt = tw.renderer.surface_format;
                         let device = tw.renderer.device.clone();
-                        tw.renderer = Renderer::new(device, queue, fmt, scale_factor);
+                        tw.renderer =
+                            Renderer::new(device, queue, fmt, scale_factor, self.background);
                     }
                 }
             }
@@ -1988,6 +2025,13 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::NewTab => {
                 self.open_tab(event_loop);
+            }
+            AppEvent::ShowBackgroundAppearancePanel => {
+                #[cfg(target_os = "macos")]
+                platform::show_background_panel(self.background);
+            }
+            AppEvent::BackgroundAppearanceChanged(background) => {
+                self.apply_background_appearance(background);
             }
         }
     }
@@ -2880,5 +2924,21 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".zshrc")).unwrap(),
             files.zshrc
         );
+    }
+
+    #[test]
+    fn choose_surface_alpha_mode_prefers_premultiplied() {
+        let chosen = choose_surface_alpha_mode(&[
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Auto,
+        ]);
+        assert_eq!(chosen, wgpu::CompositeAlphaMode::PreMultiplied);
+    }
+
+    #[test]
+    fn choose_surface_alpha_mode_falls_back_to_first_supported_mode() {
+        let chosen = choose_surface_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]);
+        assert_eq!(chosen, wgpu::CompositeAlphaMode::Opaque);
     }
 }

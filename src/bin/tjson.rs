@@ -16,7 +16,7 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -33,9 +33,15 @@ fn reset(out: &mut impl Write) -> io::Result<()> {
 fn write_span(out: &mut impl Write, style: Style, text: &str) -> io::Result<()> {
     let s = style.foreground;
     fg(out, s.r, s.g, s.b)?;
-    if style.font_style.contains(FontStyle::BOLD)      { out.write_all(b"\x1b[1m")?; }
-    if style.font_style.contains(FontStyle::ITALIC)    { out.write_all(b"\x1b[3m")?; }
-    if style.font_style.contains(FontStyle::UNDERLINE) { out.write_all(b"\x1b[4m")?; }
+    if style.font_style.contains(FontStyle::BOLD) {
+        out.write_all(b"\x1b[1m")?;
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        out.write_all(b"\x1b[3m")?;
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        out.write_all(b"\x1b[4m")?;
+    }
     out.write_all(text.as_bytes())?;
     reset(out)
 }
@@ -81,7 +87,10 @@ fn process_line(
             if let Ok(pretty) = serde_json::to_string_pretty(&val) {
                 match print_highlighted(out, &pretty, ps, syntax, theme) {
                     Ok(()) => return,
-                    Err(_) => { *drain = true; return; }
+                    Err(_) => {
+                        *drain = true;
+                        return;
+                    }
                 }
             }
         }
@@ -109,7 +118,9 @@ fn run_filter(
             Ok(l) => l,
             Err(_) => break,
         };
-        if drain { continue; }
+        if drain {
+            continue;
+        }
         process_line(&line, &mut out, ps, syntax, theme, &mut drain);
     }
     let _ = out.flush();
@@ -124,16 +135,23 @@ fn run_pty(
     theme: &syntect::highlighting::Theme,
 ) {
     // Inherit terminal dimensions if available.
-    let cols: u16 = std::env::var("COLUMNS").ok()
+    let cols: u16 = std::env::var("COLUMNS")
+        .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(220);
-    let rows: u16 = std::env::var("LINES").ok()
+    let rows: u16 = std::env::var("LINES")
+        .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty failed");
 
     let mut cmd = CommandBuilder::new(&args[0]);
@@ -172,10 +190,16 @@ fn run_pty(
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let mut line_bytes = buf.drain(..=pos).collect::<Vec<u8>>();
             // Strip trailing \n and \r\n.
-            if line_bytes.last() == Some(&b'\n') { line_bytes.pop(); }
-            if line_bytes.last() == Some(&b'\r') { line_bytes.pop(); }
+            if line_bytes.last() == Some(&b'\n') {
+                line_bytes.pop();
+            }
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
 
-            if drain { continue; }
+            if drain {
+                continue;
+            }
 
             // Try to interpret as UTF-8 for JSON detection; fall back to raw write.
             match std::str::from_utf8(&line_bytes) {
@@ -193,12 +217,20 @@ fn run_pty(
     if !buf.is_empty() && !drain {
         match std::str::from_utf8(&buf) {
             Ok(line) => process_line(line, &mut out, ps, syntax, theme, &mut drain),
-            Err(_) => { let _ = out.write_all(&buf); }
+            Err(_) => {
+                let _ = out.write_all(&buf);
+            }
         }
     }
 
     let exit_code = match child.wait() {
-        Ok(status) => if status.success() { 0 } else { 1 },
+        Ok(status) => {
+            if status.success() {
+                0
+            } else {
+                1
+            }
+        }
         Err(_) => 1,
     };
     std::process::exit(exit_code);
@@ -234,7 +266,8 @@ mod tests {
     fn highlighted(json: &str) -> String {
         let ps = SyntaxSet::load_defaults_newlines();
         let ts = ThemeSet::load_defaults();
-        let syntax = ps.find_syntax_by_extension("json")
+        let syntax = ps
+            .find_syntax_by_extension("json")
             .unwrap_or_else(|| ps.find_syntax_plain_text());
         let theme = ts.themes.values().next().expect("no theme");
         let val: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -247,10 +280,10 @@ mod tests {
     #[test]
     fn test_json_object_contains_keys() {
         let out = highlighted(r#"{"level":30,"msg":"hello"}"#);
-        assert!(out.contains("level"),  "key 'level' missing from output");
-        assert!(out.contains("msg"),    "key 'msg' missing from output");
-        assert!(out.contains("hello"),  "string value missing from output");
-        assert!(out.contains("30"),     "number value missing from output");
+        assert!(out.contains("level"), "key 'level' missing from output");
+        assert!(out.contains("msg"), "key 'msg' missing from output");
+        assert!(out.contains("hello"), "string value missing from output");
+        assert!(out.contains("30"), "number value missing from output");
     }
 
     #[test]
@@ -263,14 +296,20 @@ mod tests {
     #[test]
     fn test_output_has_ansi_escapes() {
         let out = highlighted(r#"{"x":1}"#);
-        assert!(out.contains("\x1b["), "expected ANSI escape sequences in output");
+        assert!(
+            out.contains("\x1b["),
+            "expected ANSI escape sequences in output"
+        );
     }
 
     #[test]
     fn test_pretty_printed_multiline() {
         let out = highlighted(r#"{"a":1,"b":2}"#);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.len() >= 3, "expected multi-line pretty output, got: {out:?}");
+        assert!(
+            lines.len() >= 3,
+            "expected multi-line pretty output, got: {out:?}"
+        );
     }
 
     #[test]
@@ -286,9 +325,12 @@ mod tests {
     fn test_partial_json_not_parsed() {
         let line = r#"{"incomplete":"#;
         let trimmed = line.trim();
-        let would_parse = trimmed.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
-        assert!(!would_parse, "partial JSON must fall through to passthrough");
+        let would_parse =
+            trimmed.starts_with('{') && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+        assert!(
+            !would_parse,
+            "partial JSON must fall through to passthrough"
+        );
     }
 
     // ── process_line passthrough ──────────────────────────────────────────────
@@ -296,7 +338,8 @@ mod tests {
     fn process_output(line: &str) -> String {
         let ps = SyntaxSet::load_defaults_newlines();
         let ts = ThemeSet::load_defaults();
-        let syntax = ps.find_syntax_by_extension("json")
+        let syntax = ps
+            .find_syntax_by_extension("json")
             .unwrap_or_else(|| ps.find_syntax_plain_text());
         let theme = ts.themes.values().next().expect("no theme");
         let mut buf = Vec::new();
@@ -309,7 +352,10 @@ mod tests {
     fn test_number_passes_through_unchanged() {
         let out = process_output("42");
         assert!(out.contains("42"), "number must pass through: {out:?}");
-        assert!(!out.contains("\x1b["), "number must not be syntax-highlighted");
+        assert!(
+            !out.contains("\x1b["),
+            "number must not be syntax-highlighted"
+        );
     }
 
     #[test]
@@ -338,7 +384,10 @@ mod tests {
         // Looks like JSON but isn't — unquoted keys.
         let line = "{key: value}";
         let out = process_output(line);
-        assert!(out.contains("{key: value}"), "invalid JSON must pass through: {out:?}");
+        assert!(
+            out.contains("{key: value}"),
+            "invalid JSON must pass through: {out:?}"
+        );
     }
 
     #[test]
@@ -346,21 +395,36 @@ mod tests {
         // serde_json rejects trailing non-whitespace after a valid value.
         let line = r#"{"a": 1} not json"#;
         let out = process_output(line);
-        assert!(out.contains(r#"{"a": 1} not json"#), "JSON with trailing garbage must pass through");
+        assert!(
+            out.contains(r#"{"a": 1} not json"#),
+            "JSON with trailing garbage must pass through"
+        );
     }
 
     #[test]
     fn test_empty_object_prettified() {
         let out = process_output("{}");
-        assert!(out.contains("{}") || out.contains('{'), "empty object must be prettified");
-        assert!(out.contains("\x1b["), "prettified output must have ANSI escapes");
+        assert!(
+            out.contains("{}") || out.contains('{'),
+            "empty object must be prettified"
+        );
+        assert!(
+            out.contains("\x1b["),
+            "prettified output must have ANSI escapes"
+        );
     }
 
     #[test]
     fn test_empty_array_prettified() {
         let out = process_output("[]");
-        assert!(out.contains("[]") || out.contains('['), "empty array must be prettified");
-        assert!(out.contains("\x1b["), "prettified output must have ANSI escapes");
+        assert!(
+            out.contains("[]") || out.contains('['),
+            "empty array must be prettified"
+        );
+        assert!(
+            out.contains("\x1b["),
+            "prettified output must have ANSI escapes"
+        );
     }
 
     #[test]
@@ -368,9 +432,15 @@ mod tests {
         // process_line calls `line.trim()` before JSON detection, so
         // "   {}" is treated as "{}" and gets prettified.
         let out = process_output(r#"   {"x": 1}"#);
-        assert!(out.contains("\x1b["), "JSON with leading spaces must be prettified");
+        assert!(
+            out.contains("\x1b["),
+            "JSON with leading spaces must be prettified"
+        );
         // The raw leading spaces must NOT appear in prettified output.
-        assert!(!out.starts_with("   {"), "leading spaces must be stripped from prettified output");
+        assert!(
+            !out.starts_with("   {"),
+            "leading spaces must be stripped from prettified output"
+        );
     }
 
     // ── Additional process_line / process_output tests ────────────────────────
@@ -386,7 +456,10 @@ mod tests {
     fn test_whitespace_only_line_passes_through() {
         let out = process_output("   ");
         // Whitespace-only lines cannot start with '{' or '[' after trimming.
-        assert!(out.contains("   "), "whitespace-only line must pass through unchanged");
+        assert!(
+            out.contains("   "),
+            "whitespace-only line must pass through unchanged"
+        );
     }
 
     #[test]
@@ -399,7 +472,10 @@ mod tests {
     #[test]
     fn test_deeply_nested_json_prettified() {
         let out = process_output(r#"{"a":{"b":{"c":{"d":42}}}}"#);
-        assert!(out.contains("\x1b["), "deeply nested JSON must be prettified");
+        assert!(
+            out.contains("\x1b["),
+            "deeply nested JSON must be prettified"
+        );
         assert!(out.contains("42"), "leaf value must appear in output");
     }
 
@@ -415,20 +491,29 @@ mod tests {
     fn test_line_starting_with_brace_but_invalid_json_passes_through() {
         let line = "{not valid json at all";
         let out = process_output(line);
-        assert!(out.contains(line), "invalid JSON starting with '{{' must pass through");
+        assert!(
+            out.contains(line),
+            "invalid JSON starting with '{{' must pass through"
+        );
     }
 
     #[test]
     fn test_line_starting_with_bracket_but_invalid_json_passes_through() {
         let line = "[1, 2, broken";
         let out = process_output(line);
-        assert!(out.contains(line), "invalid JSON starting with '[' must pass through");
+        assert!(
+            out.contains(line),
+            "invalid JSON starting with '[' must pass through"
+        );
     }
 
     #[test]
     fn test_json_with_null_value_prettified() {
         let out = process_output(r#"{"key":null}"#);
-        assert!(out.contains("null"), "null value must appear in prettified output");
+        assert!(
+            out.contains("null"),
+            "null value must appear in prettified output"
+        );
     }
 
     #[test]

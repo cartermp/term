@@ -46,9 +46,13 @@ fn strip_ansi(s: &str) -> String {
                     // OSC sequence — terminated by BEL (0x07) or ST (ESC \).
                     chars.next(); // consume ']'
                     while let Some(nc) = chars.next() {
-                        if nc == '\x07' { break; }
+                        if nc == '\x07' {
+                            break;
+                        }
                         if nc == '\x1b' {
-                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
                             break;
                         }
                     }
@@ -56,7 +60,9 @@ fn strip_ansi(s: &str) -> String {
                 _ => {
                     // CSI or other ESC sequence — consume until alphabetic final byte.
                     for nc in chars.by_ref() {
-                        if nc.is_ascii_alphabetic() { break; }
+                        if nc.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
             }
@@ -69,7 +75,11 @@ fn strip_ansi(s: &str) -> String {
 
 // ── Syntect helpers ───────────────────────────────────────────────────────────
 
-fn make_highlighter<'a>(syntax_name: &str, ps: &'a SyntaxSet, ts: &'a ThemeSet) -> HighlightLines<'a> {
+fn make_highlighter<'a>(
+    syntax_name: &str,
+    ps: &'a SyntaxSet,
+    ts: &'a ThemeSet,
+) -> HighlightLines<'a> {
     let syntax = ps
         .find_syntax_by_name(syntax_name)
         .or_else(|| ps.find_syntax_by_extension(syntax_name))
@@ -86,7 +96,10 @@ fn make_highlighter<'a>(syntax_name: &str, ps: &'a SyntaxSet, ts: &'a ThemeSet) 
 fn parse_file_path(header: &str) -> &str {
     // Strip leading "a/" or "b/" that git adds
     let p = header.trim();
-    let p = p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p);
+    let p = p
+        .strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p);
     // Strip /dev/null (binary / new-file cases)
     if p.starts_with("/dev/null") { "" } else { p }
 }
@@ -102,11 +115,7 @@ fn syntax_hint(path: &str) -> &str {
 // ── Per-line highlighter ──────────────────────────────────────────────────────
 
 /// Highlights a code line using a running HighlightLines (state advances per call).
-fn hl_line<'s>(
-    line: &'s str,
-    h: &mut HighlightLines,
-    ps: &SyntaxSet,
-) -> Vec<(Style, String)> {
+fn hl_line<'s>(line: &'s str, h: &mut HighlightLines, ps: &SyntaxSet) -> Vec<(Style, String)> {
     let with_nl = if line.ends_with('\n') {
         std::borrow::Cow::Borrowed(line)
     } else {
@@ -184,7 +193,10 @@ fn run(out: &mut impl Write) -> io::Result<()> {
             // New file diff — print separator
             reset(out)?;
             fg(out, sfr, sfg, sfb)?;
-            writeln!(out, "──────────────────────────────────────────────────────")?;
+            writeln!(
+                out,
+                "──────────────────────────────────────────────────────"
+            )?;
             reset(out)?;
             fg(out, or_, og, ob)?;
             writeln!(out, "{line}")?;
@@ -268,13 +280,13 @@ fn run(out: &mut impl Write) -> io::Result<()> {
                 }
                 s
             } else {
-                vec![(
-                    Style::default(),
-                    content.to_string(),
-                )]
+                vec![(Style::default(), content.to_string())]
             };
             write_code_line(out, " ", OVERLAY0, &spans, (0x1e, 0x1e, 0x2e))?;
-        } else if line.starts_with("index ") || line.starts_with("new file") || line.starts_with("deleted file") {
+        } else if line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+        {
             fg(out, or_, og, ob)?;
             writeln!(out, "{line}")?;
             reset(out)?;

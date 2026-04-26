@@ -27,6 +27,26 @@ impl Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackgroundAppearance {
+    pub color: Color,
+    pub alpha: u8,
+}
+
+impl BackgroundAppearance {
+    pub const fn new(color: Color, alpha: u8) -> Self {
+        Self { color, alpha }
+    }
+
+    pub fn alpha_f32(self) -> f32 {
+        self.alpha as f32 / 255.
+    }
+
+    pub fn alpha_f64(self) -> f64 {
+        self.alpha as f64 / 255.
+    }
+}
+
 // Neutral dark theme — matches the screenshot aesthetic
 // Near-black background, vivid ANSI palette, warm amber yellow, bright green
 pub const DEFAULT_FG: Color = Color::new(0xc8, 0xc8, 0xc8); // light gray
@@ -73,6 +93,8 @@ pub const GHOST_COLOR: Color = Color::new(0x55, 0x55, 0x55);
 
 /// Alpha applied to terminal background cells (0xFF = fully opaque).
 pub const BG_ALPHA: u8 = 0xFF;
+pub const DEFAULT_BACKGROUND_APPEARANCE: BackgroundAppearance =
+    BackgroundAppearance::new(DEFAULT_BG, BG_ALPHA);
 
 pub const FONT_SIZE_PT: f32 = 14.0;
 pub const WINDOW_WIDTH: u32 = 960;
@@ -117,6 +139,13 @@ mod tests {
         let out = bg.blend(fg, 128);
         // 100 * 128 / 255 ≈ 50
         assert!(out.r >= 49 && out.r <= 51, "expected ~50, got {}", out.r);
+    }
+
+    #[test]
+    fn background_appearance_alpha_helpers_match_byte_value() {
+        let appearance = BackgroundAppearance::new(Color::new(1, 2, 3), 128);
+        assert!((appearance.alpha_f32() - (128.0 / 255.0)).abs() < f32::EPSILON);
+        assert!((appearance.alpha_f64() - (128.0 / 255.0)).abs() < f64::EPSILON);
     }
 
     // ── 256-colour lookup ─────────────────────────────────────────────────────

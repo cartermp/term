@@ -54,6 +54,7 @@ Automated coverage includes inline unit tests, subprocess integration tests for 
 - **Catppuccin Mocha** color theme throughout
 - **True-color support** — ANSI 8/16, 256-color, and 24-bit RGB
 - **Multiple tabs** — Cmd+T/W to open/close, Cmd+[/] or Cmd+1–9 to navigate, drag to reorder
+- **Native background controls** — `Appearance -> Background...` opens the macOS color panel with an alpha slider for live background color/opacity changes
 - **Scrollback** — 10,000-line buffer; scroll with mouse wheel, Cmd+Up/Down, Cmd+Home/End
 - **Clipboard** — Cmd+C copies selection (text), Cmd+V pastes (text or image path); OSC 52 supported
 - **URL detection** — hold Cmd to underline URLs; Cmd+click opens in browser
