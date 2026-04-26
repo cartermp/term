@@ -401,6 +401,10 @@ fn choose_surface_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Compos
     .unwrap_or(wgpu::CompositeAlphaMode::Auto)
 }
 
+fn should_bootstrap_resize(current: (usize, usize), desired: (usize, usize)) -> bool {
+    (desired.0 > current.0 || desired.1 > current.1) && desired.0 > 1 && desired.1 > 1
+}
+
 // ── TerminalWindow ────────────────────────────────────────────────────────────
 
 struct TerminalWindow {
@@ -648,7 +652,33 @@ impl TerminalWindow {
         }
     }
 
+    fn maybe_bootstrap_resize(&mut self) {
+        let size = self.window.inner_size();
+        if size.width <= self.surface_config.width && size.height <= self.surface_config.height {
+            return;
+        }
+
+        let rects = self.pane_rects();
+        let cw = self.renderer.cell_width.max(1);
+        let ch = self.renderer.cell_height.max(1);
+        let should_resize = self.panes.iter().enumerate().any(|(i, pane)| {
+            let (_, _, pw, ph) =
+                rects
+                    .get(i)
+                    .copied()
+                    .unwrap_or((0.0, 0.0, size.width as f32, size.height as f32));
+            let desired = ((pw as usize / cw).max(1), (ph as usize / ch).max(1));
+            let current = (pane.terminal.state.cols, pane.terminal.state.rows);
+            should_bootstrap_resize(current, desired)
+        });
+
+        if should_resize {
+            self.on_resize(size.width, size.height);
+        }
+    }
+
     fn redraw(&mut self) {
+        self.maybe_bootstrap_resize();
         let window = self.window.clone();
         let sz = window.inner_size();
         let (w, h) = (sz.width, sz.height);
@@ -2940,5 +2970,15 @@ mod tests {
     fn choose_surface_alpha_mode_falls_back_to_first_supported_mode() {
         let chosen = choose_surface_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]);
         assert_eq!(chosen, wgpu::CompositeAlphaMode::Opaque);
+    }
+
+    #[test]
+    fn bootstrap_resize_triggers_for_real_growth() {
+        assert!(should_bootstrap_resize((80, 24), (120, 32)));
+    }
+
+    #[test]
+    fn bootstrap_resize_ignores_suspicious_one_cell_target() {
+        assert!(!should_bootstrap_resize((80, 24), (1, 1)));
     }
 }

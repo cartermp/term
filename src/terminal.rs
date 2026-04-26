@@ -145,6 +145,8 @@ pub struct TerminalState {
     /// Whether synchronized-output mode is active (?2026h). When true,
     /// redraws are suppressed until the mode is cleared.
     pub sync_output: bool,
+    /// Whether insert-replace mode (IRM, CSI 4 h/l) is active.
+    insert_mode: bool,
     /// OSC 8 hyperlink URL table. Index 0 is unused; `link_id` in Cell is
     /// 1-based into this vec.
     pub links: Vec<String>,
@@ -152,6 +154,7 @@ pub struct TerminalState {
     current_link_id: u16,
     saved_cursor: (usize, usize),
     saved_attrs: Attrs,
+    saved_wrap_next: bool,
     wrap_next: bool,
     /// Grid coordinates of the most recently printed cell (for combining-char attachment).
     last_placed: (usize, usize),
@@ -193,6 +196,7 @@ impl TerminalState {
             current_dir: std::env::var("HOME").unwrap_or_default(),
             saved_cursor: (0, 0),
             saved_attrs: Attrs::default(),
+            saved_wrap_next: false,
             wrap_next: false,
             last_placed: (0, 0),
             last_was_regional_indicator: false,
@@ -207,6 +211,7 @@ impl TerminalState {
             mouse_tracking: false,
             mouse_sgr: false,
             sync_output: false,
+            insert_mode: false,
             links: Vec::new(),
             current_link_id: 0,
         }
@@ -363,6 +368,9 @@ impl TerminalState {
             self.do_newline();
         }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
+            if self.insert_mode {
+                self.insert_blank_cells_at_cursor(width);
+            }
             let blank = self.blank_cell();
             self.clear_cell_span(self.cursor_row, self.cursor_col, blank);
             if width == 2 && self.cursor_col + 1 < self.cols {
@@ -454,6 +462,23 @@ impl TerminalState {
         }
 
         self.grid[row][col] = blank;
+    }
+
+    fn insert_blank_cells_at_cursor(&mut self, n: usize) {
+        if self.cursor_row >= self.rows || self.cursor_col >= self.cols || n == 0 {
+            return;
+        }
+        let blank = self.blank_cell();
+        let row = &mut self.grid[self.cursor_row];
+        row[self.cursor_col..].rotate_right(n);
+        for cell in row
+            .iter_mut()
+            .take((self.cursor_col + n).min(self.cols))
+            .skip(self.cursor_col)
+        {
+            *cell = blank;
+        }
+        Self::normalize_row_cells(row);
     }
 
     fn normalize_row_cells(row: &mut [Cell]) {
@@ -887,12 +912,28 @@ impl Perform for TerminalState {
             (0, 's') => {
                 self.saved_cursor = (self.cursor_row, self.cursor_col);
                 self.saved_attrs = self.attrs;
+                self.saved_wrap_next = self.wrap_next;
             }
             (0, 'u') => {
                 (self.cursor_row, self.cursor_col) = self.saved_cursor;
                 self.attrs = self.saved_attrs;
+                self.wrap_next = self.saved_wrap_next;
                 self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
                 self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
+            }
+            (0, 'h') => {
+                for &param in &p {
+                    if param == 4 {
+                        self.insert_mode = true;
+                    }
+                }
+            }
+            (0, 'l') => {
+                for &param in &p {
+                    if param == 4 {
+                        self.insert_mode = false;
+                    }
+                }
             }
             // Device attributes
             (0, 'c') => {
@@ -944,10 +985,12 @@ impl Perform for TerminalState {
             b'7' => {
                 self.saved_cursor = (self.cursor_row, self.cursor_col);
                 self.saved_attrs = self.attrs;
+                self.saved_wrap_next = self.wrap_next;
             }
             b'8' => {
                 (self.cursor_row, self.cursor_col) = self.saved_cursor;
                 self.attrs = self.saved_attrs;
+                self.wrap_next = self.saved_wrap_next;
                 self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
                 self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
             }
@@ -1061,6 +1104,7 @@ impl TerminalState {
         self.cursor_shape = 0;
         self.mouse_tracking = false;
         self.mouse_sgr = false;
+        self.insert_mode = false;
         self.wrap_next = false;
     }
 }
@@ -1115,10 +1159,12 @@ mod tests {
         mouse_tracking: bool,
         mouse_sgr: bool,
         sync_output: bool,
+        insert_mode: bool,
         links: Vec<String>,
         current_link_id: u16,
         saved_cursor: (usize, usize),
         saved_attrs: Attrs,
+        saved_wrap_next: bool,
         wrap_next: bool,
         last_placed: (usize, usize),
         last_was_regional_indicator: bool,
@@ -1173,10 +1219,12 @@ mod tests {
             mouse_tracking: state.mouse_tracking,
             mouse_sgr: state.mouse_sgr,
             sync_output: state.sync_output,
+            insert_mode: state.insert_mode,
             links: state.links.clone(),
             current_link_id: state.current_link_id,
             saved_cursor: state.saved_cursor,
             saved_attrs: state.saved_attrs,
+            saved_wrap_next: state.saved_wrap_next,
             wrap_next: state.wrap_next,
             last_placed: state.last_placed,
             last_was_regional_indicator: state.last_was_regional_indicator,
@@ -2813,6 +2861,27 @@ mod tests {
         assert_eq!(ch(&t, 0, 3), 'B');
     }
 
+    #[test]
+    fn irm_toggle_tracks_insert_mode() {
+        let mut t = t(10, 5);
+        assert!(!t.state.insert_mode);
+        t.process(b"\x1b[4h");
+        assert!(t.state.insert_mode);
+        t.process(b"\x1b[4l");
+        assert!(!t.state.insert_mode);
+    }
+
+    #[test]
+    fn irm_print_inserts_at_cursor() {
+        let mut t = t(6, 2);
+        t.process(b"ABCD\x1b[1;2H\x1b[4hX");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'X');
+        assert_eq!(ch(&t, 0, 2), 'B');
+        assert_eq!(ch(&t, 0, 3), 'C');
+        assert_eq!(ch(&t, 0, 4), 'D');
+    }
+
     // ── Resize ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -3110,6 +3179,30 @@ mod tests {
         // CUU does NOT clear it
         t.process(b"\x1b[1A");
         assert!(t.state.wrap_next, "CUU must not affect pending wrap");
+    }
+
+    #[test]
+    fn esc_save_restore_preserves_wrap_next() {
+        let mut t = t(5, 3);
+        t.process(b"AB");
+        t.process(b"\x1b7\x1b[3;1fXXXXX\x1b8C");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'B');
+        assert_eq!(ch(&t, 0, 2), 'C');
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 3);
+    }
+
+    #[test]
+    fn csi_save_restore_preserves_wrap_next() {
+        let mut t = t(5, 3);
+        t.process(b"AB");
+        t.process(b"\x1b[s\x1b[3;1fXXXXX\x1b[uC");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 0, 1), 'B');
+        assert_eq!(ch(&t, 0, 2), 'C');
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(t.state.cursor_col, 3);
     }
 
     // ── Cursor clamping ───────────────────────────────────────────────────────
