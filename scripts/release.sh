@@ -13,7 +13,48 @@ if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
   exit 1
 fi
 
-cd "$(git rev-parse --show-toplevel)"
+REPO_DIR="$(git rev-parse --show-toplevel)"
+cd "$REPO_DIR"
+TMP_WORKTREE=""
+
+cleanup() {
+  if [[ -n "$TMP_WORKTREE" ]]; then
+    git worktree remove --force "$TMP_WORKTREE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+update_well_known_release_number() {
+  local repo_dir=$1
+  local version=$2
+  python3 - "$repo_dir" "$version" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+repo_dir = Path(sys.argv[1])
+version = sys.argv[2]
+
+cargo_toml = repo_dir / "Cargo.toml"
+text = cargo_toml.read_text()
+text, count = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"', text, count=1)
+if count != 1:
+    raise SystemExit("error: failed to update Cargo.toml version")
+cargo_toml.write_text(text)
+
+cargo_lock = repo_dir / "Cargo.lock"
+text = cargo_lock.read_text()
+text, count = re.subn(
+    r'(\[\[package\]\]\nname = "term"\nversion = ")[^"]+(")',
+    rf'\g<1>{version}\2',
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit('error: failed to update Cargo.lock term package version')
+cargo_lock.write_text(text)
+PY
+}
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 
@@ -47,12 +88,31 @@ case "$BUMP" in
 esac
 
 VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+VERSION_NO_V="${VERSION#v}"
+
+# ── Update version on main ────────────────────────────────────────────────────
+
+TMP_WORKTREE="$(mktemp -d "${TMPDIR:-/tmp}/term-release.XXXXXX")"
+git worktree add --detach "$TMP_WORKTREE" main >/dev/null
+
+echo "→ Updating well-known release number to $VERSION"
+update_well_known_release_number "$TMP_WORKTREE" "$VERSION_NO_V"
+
+git -C "$TMP_WORKTREE" add Cargo.toml Cargo.lock
+git -C "$TMP_WORKTREE" commit -m "release $VERSION" >/dev/null
+
+echo "→ Pushing version bump to origin/main"
+if ! git -C "$TMP_WORKTREE" push origin HEAD:main; then
+  echo "error: failed to push version bump to origin/main" >&2
+  exit 1
+fi
 
 # ── Tag & push ────────────────────────────────────────────────────────────────
 
-# Tag main explicitly — in jj, HEAD points to @ (the working copy), not main
+# Tag the version-bump commit on main explicitly — in jj, HEAD points to @
+# (the working copy), not the commit we just created for the release.
 echo "→ Tagging $VERSION"
-git tag "$VERSION" "$(git rev-parse main)"
+git tag "$VERSION" "$(git -C "$TMP_WORKTREE" rev-parse HEAD)"
 
 echo "→ Pushing tag to origin"
 if ! git push origin "$VERSION"; then
