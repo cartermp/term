@@ -27,6 +27,8 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+        env:
+          TERM_RELEASE_VERSION: ${{ github.ref_name }}
 
       - name: Install librsvg (for icon rendering)
         run: brew install librsvg

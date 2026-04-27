@@ -6,14 +6,23 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Term"
 APP_BUNDLE="/Applications/$APP_NAME.app"
 BIN_DIR="$REPO_DIR/target/release"
+VERSION="${TERM_RELEASE_VERSION:-}"
+
+if [ -z "$VERSION" ]; then
+  if GIT_TAG=$(git -C "$REPO_DIR" describe --tags --exact-match 2>/dev/null); then
+    VERSION="${GIT_TAG#v}"
+  else
+    VERSION=$(grep '^version = ' "$REPO_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+  fi
+fi
 
 # Clean up the iconset temp dir on exit (success or failure).
 _ICONSET_TMP=""
 trap '[[ -n "$_ICONSET_TMP" ]] && rm -rf "$_ICONSET_TMP"' EXIT
 
-echo "→ Building (release)…"
+echo "→ Building (release ${VERSION})…"
 cd "$REPO_DIR"
-cargo build --release
+TERM_RELEASE_VERSION="$VERSION" cargo build --release
 
 echo "→ Creating app bundle at $APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
@@ -75,7 +84,7 @@ APPLESCRIPT
 fi
 
 # Info.plist — minimum viable for macOS to treat this as an app
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -84,7 +93,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key>             <string>Term</string>
   <key>CFBundleDisplayName</key>      <string>Term</string>
   <key>CFBundleIdentifier</key>       <string>com.local.term</string>
-  <key>CFBundleVersion</key>          <string>1.0</string>
+  <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
+  <key>CFBundleVersion</key>          <string>${VERSION}</string>
   <key>CFBundleExecutable</key>       <string>term</string>
   <key>CFBundlePackageType</key>      <string>APPL</string>
   <key>CFBundleIconFile</key>         <string>AppIcon</string>

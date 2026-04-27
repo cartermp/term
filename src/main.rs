@@ -3,6 +3,7 @@ mod config;
 mod platform;
 mod renderer;
 mod terminal;
+mod updater;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,12 +22,15 @@ use completion::Engine;
 use config::{BackgroundAppearance, DEFAULT_BACKGROUND_APPEARANCE, WINDOW_HEIGHT, WINDOW_WIDTH};
 use renderer::{PaneView, Renderer};
 use terminal::Terminal;
+use updater::UpdateCheck;
 
 #[derive(Debug)]
 enum AppEvent {
     PtyData { pane_id: u64, data: Vec<u8> },
     PtyExit { pane_id: u64 },
     NewTab,
+    CheckForUpdates,
+    UpdateCheckFinished(Result<UpdateCheck, String>),
     ShowBackgroundAppearancePanel,
     BackgroundAppearanceChanged(BackgroundAppearance),
 }
@@ -1069,6 +1073,7 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     tabbing_id: String,
     background: BackgroundAppearance,
+    checking_for_updates: bool,
 }
 
 impl App {
@@ -1081,6 +1086,7 @@ impl App {
             proxy,
             tabbing_id: format!("term-{}", std::process::id()),
             background: DEFAULT_BACKGROUND_APPEARANCE,
+            checking_for_updates: false,
         }
     }
 
@@ -1096,6 +1102,63 @@ impl App {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         id
+    }
+
+    fn begin_update_check(&mut self) {
+        if self.checking_for_updates {
+            return;
+        }
+        self.checking_for_updates = true;
+        #[cfg(target_os = "macos")]
+        platform::set_update_menu_checking(true);
+
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(AppEvent::UpdateCheckFinished(updater::check_for_updates()));
+        });
+    }
+
+    fn finish_update_check(&mut self, result: Result<UpdateCheck, String>) {
+        self.checking_for_updates = false;
+        #[cfg(target_os = "macos")]
+        platform::set_update_menu_checking(false);
+
+        #[cfg(target_os = "macos")]
+        match result {
+            Ok(UpdateCheck::NoUpdateNeeded {
+                current_version,
+                latest_version,
+                comparison,
+            }) => {
+                let current = updater::display_version(&current_version);
+                let latest = updater::display_version(&latest_version);
+                let message = if comparison.is_gt() {
+                    format!("{current} is newer than the latest GitHub release ({latest}).")
+                } else {
+                    format!("Term {current} is already up to date.")
+                };
+                platform::show_info_alert("You're Up to Date", &message);
+            }
+            Ok(UpdateCheck::UpdateAvailable {
+                current_version,
+                release,
+            }) => {
+                let current = updater::display_version(&current_version);
+                let latest = updater::display_version(&release.version);
+                if platform::confirm_update_install(&current, &latest) {
+                    match updater::spawn_background_update(&release) {
+                        Ok(()) => platform::show_info_alert(
+                            "Updating Term",
+                            &format!(
+                                "Downloading {latest} now. Term will relaunch when the update is ready."
+                            ),
+                        ),
+                        Err(err) => platform::show_error_alert("Update Failed", &err),
+                    }
+                }
+            }
+            Err(err) => platform::show_error_alert("Update Failed", &err),
+        }
     }
 
     fn create_pane(
@@ -1523,6 +1586,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let _ = proxy.send_event(AppEvent::NewTab);
             });
             let proxy = self.proxy.clone();
+            platform::set_check_for_updates_callback(move || {
+                let _ = proxy.send_event(AppEvent::CheckForUpdates);
+            });
+            let proxy = self.proxy.clone();
             platform::set_show_background_panel_callback(move || {
                 let _ = proxy.send_event(AppEvent::ShowBackgroundAppearancePanel);
             });
@@ -1530,6 +1597,7 @@ impl ApplicationHandler<AppEvent> for App {
             platform::set_background_changed_callback(move |background| {
                 let _ = proxy.send_event(AppEvent::BackgroundAppearanceChanged(background));
             });
+            platform::install_update_menu_item();
             platform::install_background_menu_item();
         }
 
@@ -2055,6 +2123,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::NewTab => {
                 self.open_tab(event_loop);
+            }
+            AppEvent::CheckForUpdates => {
+                self.begin_update_check();
+            }
+            AppEvent::UpdateCheckFinished(result) => {
+                self.finish_update_check(result);
             }
             AppEvent::ShowBackgroundAppearancePanel => {
                 #[cfg(target_os = "macos")]

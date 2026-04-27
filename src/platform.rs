@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 static NEW_TAB_CB: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 static SHOW_BACKGROUND_PANEL_CB: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static CHECK_FOR_UPDATES_CB: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 static BACKGROUND_CHANGED_CB: OnceLock<Box<dyn Fn(BackgroundAppearance) + Send + Sync>> =
     OnceLock::new();
 
@@ -16,6 +17,10 @@ pub fn set_new_tab_callback(f: impl Fn() + Send + Sync + 'static) {
 
 pub fn set_show_background_panel_callback(f: impl Fn() + Send + Sync + 'static) {
     let _ = SHOW_BACKGROUND_PANEL_CB.set(Box::new(f));
+}
+
+pub fn set_check_for_updates_callback(f: impl Fn() + Send + Sync + 'static) {
+    let _ = CHECK_FOR_UPDATES_CB.set(Box::new(f));
 }
 
 pub fn set_background_changed_callback(f: impl Fn(BackgroundAppearance) + Send + Sync + 'static) {
@@ -38,6 +43,16 @@ extern "C" fn show_background_panel_action(
     _sender: *mut objc2::runtime::AnyObject,
 ) {
     if let Some(cb) = SHOW_BACKGROUND_PANEL_CB.get() {
+        cb();
+    }
+}
+
+extern "C" fn check_for_updates_action(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
+) {
+    if let Some(cb) = CHECK_FOR_UPDATES_CB.get() {
         cb();
     }
 }
@@ -69,6 +84,11 @@ fn action_target_class() -> Option<&'static objc2::runtime::AnyClass> {
                     builder.add_method(
                         sel!(openBackgroundAppearancePanel:),
                         show_background_panel_action
+                            as extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject),
+                    );
+                    builder.add_method(
+                        sel!(checkForUpdates:),
+                        check_for_updates_action
                             as extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject),
                     );
                     builder.add_method(
@@ -161,6 +181,48 @@ fn find_menu_item(
 }
 
 #[cfg(target_os = "macos")]
+fn app_menu_submenu(
+    main_menu: *mut objc2::runtime::AnyObject,
+) -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::{msg_send, runtime::AnyObject};
+    if main_menu.is_null() {
+        return None;
+    }
+    unsafe {
+        let count: usize = msg_send![main_menu, numberOfItems];
+        if count == 0 {
+            return None;
+        }
+        let app_item: *mut AnyObject = msg_send![main_menu, itemAtIndex: 0usize];
+        if app_item.is_null() {
+            return None;
+        }
+        let submenu: *mut AnyObject = msg_send![app_item, submenu];
+        (!submenu.is_null()).then_some(submenu)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main_menu() -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return None;
+        }
+        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
+        (!main_menu.is_null()).then_some(main_menu)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn update_menu_item() -> Option<*mut objc2::runtime::AnyObject> {
+    let submenu = app_menu_submenu(main_menu()?)?;
+    find_menu_item(submenu, "Check for Updates...")
+        .or_else(|| find_menu_item(submenu, "Checking for Updates..."))
+}
+
+#[cfg(target_os = "macos")]
 fn panel_background(sender: *mut objc2::runtime::AnyObject) -> Option<BackgroundAppearance> {
     use objc2::{class, msg_send, runtime::AnyObject};
     unsafe {
@@ -232,17 +294,54 @@ pub fn configure_window_background(ns_view: *mut std::ffi::c_void) {
 }
 
 #[cfg(target_os = "macos")]
+pub fn install_update_menu_item() {
+    use objc2::{class, msg_send, runtime::AnyObject, sel};
+    unsafe {
+        let Some(main_menu) = main_menu() else {
+            return;
+        };
+        let Some(submenu) = app_menu_submenu(main_menu) else {
+            return;
+        };
+        if update_menu_item().is_some() {
+            return;
+        }
+
+        let title = match ns_string("Check for Updates...") {
+            Some(s) => s,
+            None => return,
+        };
+        let empty = match ns_string("") {
+            Some(s) => s,
+            None => return,
+        };
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
+            item,
+            initWithTitle: title
+            action: sel!(checkForUpdates:)
+            keyEquivalent: empty
+        ];
+        if item.is_null() {
+            return;
+        }
+        let Some(target) = shared_action_target() else {
+            return;
+        };
+        let _: () = msg_send![item, setTarget: target];
+        let count: usize = msg_send![submenu, numberOfItems];
+        let insert_at = count.min(1usize);
+        let _: () = msg_send![submenu, insertItem: item atIndex: insert_at];
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn install_background_menu_item() {
     use objc2::{class, msg_send, runtime::AnyObject, sel};
     unsafe {
-        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        if app.is_null() {
+        let Some(main_menu) = main_menu() else {
             return;
-        }
-        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
-        if main_menu.is_null() {
-            return;
-        }
+        };
 
         let appearance_title = match ns_string("Appearance") {
             Some(s) => s,
@@ -334,6 +433,74 @@ pub fn show_background_panel(background: BackgroundAppearance) {
         let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_update_menu_checking(checking: bool) {
+    use objc2::msg_send;
+    let Some(item) = update_menu_item() else {
+        return;
+    };
+    let Some(title) = ns_string(if checking {
+        "Checking for Updates..."
+    } else {
+        "Check for Updates..."
+    }) else {
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![item, setTitle: title];
+        let _: () = msg_send![item, setEnabled: !checking];
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_alert(title: &str, message: &str, second_button: Option<&str>) -> Option<i64> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if !app.is_null() {
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        }
+
+        let alert: *mut AnyObject = msg_send![class!(NSAlert), alloc];
+        let alert: *mut AnyObject = msg_send![alert, init];
+        if alert.is_null() {
+            return None;
+        }
+
+        let title = ns_string(title)?;
+        let message = ns_string(message)?;
+        let ok = ns_string("OK")?;
+        let _: () = msg_send![alert, setMessageText: title];
+        let _: () = msg_send![alert, setInformativeText: message];
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ok];
+
+        if let Some(second_button) = second_button {
+            let second = ns_string(second_button)?;
+            let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: second];
+        }
+
+        Some(msg_send![alert, runModal])
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn show_info_alert(title: &str, message: &str) {
+    let _ = run_alert(title, message, None);
+}
+
+#[cfg(target_os = "macos")]
+pub fn show_error_alert(title: &str, message: &str) {
+    let _ = run_alert(title, message, None);
+}
+
+#[cfg(target_os = "macos")]
+pub fn confirm_update_install(current_version: &str, latest_version: &str) -> bool {
+    let message = format!(
+        "A newer Term release is available.\n\nCurrent: {current_version}\nLatest: {latest_version}\n\nTerm will download the update in the background, then quit and relaunch when it is ready."
+    );
+    run_alert("Update Available", &message, Some("Later")) == Some(1000)
 }
 
 // ── Clipboard ──────────────────────────────────────────────────────────────────
