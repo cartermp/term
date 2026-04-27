@@ -65,7 +65,7 @@ Automated coverage includes inline unit tests, subprocess integration tests for 
 - **Syntax-highlighted `cat`** — `cat` is aliased to `tcat`, which highlights files via `syntect`
 - **Syntax-highlighted diffs** — `tdiff` is set as `GIT_PAGER`, so `git diff`, `git show`, and `git log -p` all render with color and line-level highlights
 - **JSON prettifier** — `json pnpm dev` (or any command) runs it in a PTY so it sees a real terminal, then pretty-prints any JSON log lines while passing everything else through
-- **Shell integration** — ZLE hooks report the input buffer and cursor position live; `chpwd` reports the working directory for dynamic tab titles
+- **Shell integration** — ZLE hooks report the input buffer and cursor position live; `chpwd` reports the working directory for dynamic tab titles; mistyped commands show the top 3 likely matches
 - **Blinking cursor** — narrow 2px vertical bar, blinks at ~530 ms, resets on input
 - **zsh** with your real `~/.zshrc` and `~/.zshenv` sourced automatically
 

@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 fn bin_path(name: &str) -> &'static str {
     match name {
+        "term" => env!("CARGO_BIN_EXE_term"),
         "tcat" => env!("CARGO_BIN_EXE_tcat"),
         "tdiff" => env!("CARGO_BIN_EXE_tdiff"),
         "tjson" => env!("CARGO_BIN_EXE_tjson"),
@@ -356,4 +357,19 @@ fn tjson_pty_mode_passes_through_invalid_utf8_bytes() {
 fn tjson_pty_mode_returns_failure_for_nonzero_child() {
     let output = run_bin("tjson", &["/bin/sh", "-lc", "exit 7"], None, None);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+}
+
+#[test]
+fn term_hidden_command_suggester_returns_best_matches() {
+    let output = run_bin(
+        "term",
+        &["__suggest_command", "cargu"],
+        Some("cargo\ncargo-clippy\ncargo-fmt\ncurl\ngit\n"),
+        None,
+    );
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let suggestions: Vec<_> = stdout.lines().collect();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(suggestions, vec!["cargo", "cargo-fmt", "cargo-clippy"]);
 }

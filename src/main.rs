@@ -1,3 +1,4 @@
+mod command_suggest;
 mod completion;
 mod config;
 mod platform;
@@ -2249,6 +2250,7 @@ fn sh_sq_escape(s: &str) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ShellTools {
+    term: Option<PathBuf>,
     tcat: Option<PathBuf>,
     tdiff: Option<PathBuf>,
     tjson: Option<PathBuf>,
@@ -2275,6 +2277,7 @@ fn discover_shell_tools(exe_dir: Option<&Path>) -> ShellTools {
         path.exists().then_some(path)
     };
     ShellTools {
+        term: tool("term"),
         tcat: tool("tcat"),
         tdiff: tool("tdiff"),
         tjson: tool("tjson"),
@@ -2302,6 +2305,56 @@ fn build_shell_bootstrap_files(home: &str, tools: &ShellTools) -> ShellBootstrap
     let json_fn = match tools.tjson.as_ref() {
         Some(path) => format!(
             "_TJSON='{}'\nfunction json() {{ \"$_TJSON\" \"$@\"; }}\n",
+            sh_sq_escape(&path.display().to_string())
+        ),
+        None => String::new(),
+    };
+    let suggest_extra_candidates = format!(
+        "{}{}",
+        if tools.tcat.is_some() {
+            "        print -rl -- cat\n"
+        } else {
+            ""
+        },
+        if tools.tjson.is_some() {
+            "        print -rl -- json\n"
+        } else {
+            ""
+        }
+    );
+    let command_not_found_fn = match tools.term.as_ref() {
+        Some(path) => format!(
+            "_TERM_SELF='{}'\n\
+             function command_not_found_handler() {{\n\
+               emulate -L zsh\n\
+               local cmd=\"$1\"\n\
+               shift\n\
+               print -u2 -- \"zsh: command not found: $cmd\"\n\
+               if [[ -x \"$_TERM_SELF\" ]]; then\n\
+                 local -a suggestions\n\
+                 suggestions=(${{(@f)$({{\n\
+        print -rl -- ${{(k)commands}}\n\
+        print -rl -- ${{(k)builtins}}\n\
+{suggest_extra_candidates}      }} | LC_ALL=C sort -u | \"$_TERM_SELF\" __suggest_command \"$cmd\" 2>/dev/null)}})\n\
+                 if (( ${{#suggestions[@]}} > 0 )); then\n\
+                   print -u2 -- 'Did you mean:'\n\
+                   local suggestion\n\
+                   for suggestion in $suggestions; do\n\
+                     print -u2 -- \"  $suggestion\"\n\
+                   done\n\
+                   local -a retry_words\n\
+                   retry_words=(\"${{suggestions[1]}}\" \"$@\")\n\
+                   local retry_display=\"${{(j: :)retry_words}}\"\n\
+                   if read -q \"reply?try '$retry_display'? y/n \"; then\n\
+                     print -u2\n\
+                     \"$retry_words[@]\"\n\
+                     return $?\n\
+                   fi\n\
+                   print -u2\n\
+                 fi\n\
+               fi\n\
+               return 127\n\
+             }}\n",
             sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
@@ -2341,7 +2394,7 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
-         {cat_fn}{diff_fn}{json_fn}{zle_hooks}{prompt_setup}"
+         {cat_fn}{diff_fn}{json_fn}{command_not_found_fn}{zle_hooks}{prompt_setup}"
     );
 
     ShellBootstrapFiles { zshenv, zshrc }
@@ -2406,9 +2459,41 @@ fn setup_shell_env(cmd: &mut CommandBuilder) {
     }
 }
 
+fn maybe_run_helper_mode() -> Option<i32> {
+    let mut args = std::env::args();
+    let _exe = args.next();
+    match args.next().as_deref() {
+        Some("__suggest_command") => {
+            let Some(query) = args.next() else {
+                eprintln!("term: missing command name for __suggest_command");
+                return Some(2);
+            };
+            if args.next().is_some() {
+                eprintln!("term: too many arguments for __suggest_command");
+                return Some(2);
+            }
+
+            let mut candidates = String::new();
+            if std::io::stdin().read_to_string(&mut candidates).is_err() {
+                eprintln!("term: failed to read command candidates");
+                return Some(1);
+            }
+
+            for suggestion in command_suggest::suggest_commands(&query, candidates.lines(), 3) {
+                println!("{suggestion}");
+            }
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    if let Some(code) = maybe_run_helper_mode() {
+        std::process::exit(code);
+    }
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .expect("event loop");
@@ -2948,10 +3033,12 @@ mod tests {
     #[test]
     fn discover_shell_tools_finds_existing_neighbors() {
         let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("term"), b"").unwrap();
         std::fs::write(dir.path().join("tcat"), b"").unwrap();
         std::fs::write(dir.path().join("tdiff"), b"").unwrap();
 
         let tools = discover_shell_tools(Some(dir.path()));
+        assert_eq!(tools.term, Some(dir.path().join("term")));
         assert_eq!(tools.tcat, Some(dir.path().join("tcat")));
         assert_eq!(tools.tdiff, Some(dir.path().join("tdiff")));
         assert_eq!(tools.tjson, None);
@@ -2960,6 +3047,7 @@ mod tests {
     #[test]
     fn build_shell_bootstrap_files_include_aliases_hooks_and_escaping() {
         let tools = ShellTools {
+            term: Some(PathBuf::from("/tmp/O'Brien/bin/term")),
             tcat: Some(PathBuf::from("/tmp/O'Brien/bin/tcat")),
             tdiff: Some(PathBuf::from("/tmp/O'Brien/bin/tdiff")),
             tjson: Some(PathBuf::from("/tmp/O'Brien/bin/tjson")),
@@ -2967,6 +3055,11 @@ mod tests {
 
         let files = build_shell_bootstrap_files("/Users/O'Brien", &tools);
         assert!(files.zshenv.contains("[ -f '/Users/O'\\''Brien/.zshenv' ]"));
+        assert!(
+            files
+                .zshrc
+                .contains("_TERM_SELF='/tmp/O'\\''Brien/bin/term'")
+        );
         assert!(files.zshrc.contains("_TCAT='/tmp/O'\\''Brien/bin/tcat'"));
         assert!(
             files
@@ -2976,6 +3069,19 @@ mod tests {
         assert!(files.zshrc.contains("_TJSON='/tmp/O'\\''Brien/bin/tjson'"));
         assert!(files.zshrc.contains("function cat()"));
         assert!(files.zshrc.contains("function json()"));
+        assert!(files.zshrc.contains("function command_not_found_handler()"));
+        assert!(files.zshrc.contains("__suggest_command \"$cmd\""));
+        assert!(
+            files
+                .zshrc
+                .contains("retry_words=(\"${suggestions[1]}\" \"$@\")")
+        );
+        assert!(
+            files
+                .zshrc
+                .contains("read -q \"reply?try '$retry_display'? y/n \"")
+        );
+        assert!(files.zshrc.contains("\"$retry_words[@]\""));
         assert!(
             files
                 .zshrc
