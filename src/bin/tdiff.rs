@@ -168,28 +168,32 @@ fn write_code_line(
 
 // ── Main rendering loop ───────────────────────────────────────────────────────
 
-fn run(out: &mut impl Write) -> io::Result<()> {
+fn render_lines<I>(lines: I, out: &mut impl Write) -> io::Result<()>
+where
+    I: IntoIterator<Item = io::Result<String>>,
+{
     let ps = SyntaxSet::load_defaults_newlines();
     let ts = ThemeSet::load_defaults();
-
-    let stdin = io::stdin();
-    let reader = stdin.lock();
 
     let mut hint = String::new(); // current file extension/name
     let mut new_hl: Option<HighlightLines> = None;
     let mut old_hl: Option<HighlightLines> = None;
+    let mut in_diff = false;
+    let mut in_hunk = false;
 
     let (lr, lg, lb) = LAVENDER;
     let (mr, mg, mb) = MAUVE;
     let (sfr, sfg, sfb) = SURFACE1;
     let (or_, og, ob) = OVERLAY0;
 
-    for raw_line in reader.lines() {
+    for raw_line in lines {
         let raw = raw_line?;
         // Strip ANSI in case git was called with --color=always
         let line = strip_ansi(&raw);
 
         if line.starts_with("diff ") {
+            in_diff = true;
+            in_hunk = false;
             // New file diff — print separator
             reset(out)?;
             fg(out, sfr, sfg, sfb)?;
@@ -204,7 +208,11 @@ fn run(out: &mut impl Write) -> io::Result<()> {
             new_hl = None;
             old_hl = None;
             hint.clear();
-        } else if let Some(rest) = line.strip_prefix("--- ") {
+        } else if in_diff && line.starts_with("index ") {
+            fg(out, or_, og, ob)?;
+            writeln!(out, "{line}")?;
+            reset(out)?;
+        } else if in_diff && let Some(rest) = line.strip_prefix("--- ") {
             let path = parse_file_path(rest);
             if !path.is_empty() {
                 let ext = syntax_hint(path);
@@ -219,7 +227,7 @@ fn run(out: &mut impl Write) -> io::Result<()> {
             fg(out, lr, lg, lb)?;
             writeln!(out, "{}", parse_file_path(rest))?;
             reset(out)?;
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
+        } else if in_diff && let Some(rest) = line.strip_prefix("+++ ") {
             let path = parse_file_path(rest);
             // (Re)initialize highlighters for this file
             new_hl = Some(make_highlighter(&hint, &ps, &ts));
@@ -232,9 +240,10 @@ fn run(out: &mut impl Write) -> io::Result<()> {
             fg(out, lr, lg, lb)?;
             writeln!(out, "{path}")?;
             reset(out)?;
-        } else if line.starts_with("@@ ") {
+        } else if in_diff && line.starts_with("@@ ") {
             // Parse @@ -old +new @@ optional_tail
             // Reset per-hunk state
+            in_hunk = true;
             new_hl = Some(make_highlighter(&hint, &ps, &ts));
             old_hl = Some(make_highlighter(&hint, &ps, &ts));
 
@@ -259,7 +268,7 @@ fn run(out: &mut impl Write) -> io::Result<()> {
             out.write_all(b"\x1b[K")?;
             reset(out)?;
             writeln!(out)?;
-        } else if let Some(content) = line.strip_prefix('+') {
+        } else if in_hunk && let Some(content) = line.strip_prefix('+') {
             let hl = new_hl.get_or_insert_with(|| make_highlighter(&hint, &ps, &ts));
             let spans = hl_line(content, hl, &ps);
             // Also advance old_hl with a context-like phantom to keep state roughly in sync
@@ -267,11 +276,11 @@ fn run(out: &mut impl Write) -> io::Result<()> {
                 let _ = hl_line(content, old, &ps);
             }
             write_code_line(out, "+", GREEN, &spans, BG_ADDED)?;
-        } else if let Some(content) = line.strip_prefix('-') {
+        } else if in_hunk && let Some(content) = line.strip_prefix('-') {
             let hl = old_hl.get_or_insert_with(|| make_highlighter(&hint, &ps, &ts));
             let spans = hl_line(content, hl, &ps);
             write_code_line(out, "-", RED, &spans, BG_REMOVED)?;
-        } else if let Some(content) = line.strip_prefix(' ') {
+        } else if in_hunk && let Some(content) = line.strip_prefix(' ') {
             // Context line — advance both highlighters
             let spans = if let Some(hl) = new_hl.as_mut() {
                 let s = hl_line(content, hl, &ps);
@@ -283,26 +292,27 @@ fn run(out: &mut impl Write) -> io::Result<()> {
                 vec![(Style::default(), content.to_string())]
             };
             write_code_line(out, " ", OVERLAY0, &spans, (0x1e, 0x1e, 0x2e))?;
-        } else if line.starts_with("index ")
-            || line.starts_with("new file")
-            || line.starts_with("deleted file")
-        {
-            fg(out, or_, og, ob)?;
-            writeln!(out, "{line}")?;
-            reset(out)?;
-        } else if line.starts_with('\\') {
+        } else if in_hunk && line.starts_with('\\') {
             // \ No newline at end of file
             fg(out, or_, og, ob)?;
             writeln!(out, "{line}")?;
             reset(out)?;
         } else {
+            in_hunk = false;
             // Unrecognised line — pass through
+            reset(out)?;
             writeln!(out, "{line}")?;
         }
     }
 
     reset(out)?;
     out.flush()
+}
+
+fn run(out: &mut impl Write) -> io::Result<()> {
+    let stdin = io::stdin();
+    let reader = stdin.lock();
+    render_lines(reader.lines(), out)
 }
 
 fn main() {
@@ -514,5 +524,46 @@ mod tests {
     fn test_strip_ansi_preserves_unicode_text() {
         let result = strip_ansi("héllo\x1b[31m wörld\x1b[0m");
         assert_eq!(result, "héllo wörld");
+    }
+
+    #[test]
+    fn test_render_lines_space_prefixed_non_diff_stays_plain() {
+        let mut out = Vec::<u8>::new();
+        let lines = vec![
+            Ok(String::from("error: invalid option: --stats")),
+            Ok(String::from("usage: git diff [<options>] [<commit>] [--] [<path>...]")),
+            Ok(String::from("  --stat show diffstat instead of patch.")),
+        ];
+        render_lines(lines, &mut out).unwrap();
+
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            rendered.contains("  --stat show diffstat instead of patch."),
+            "space-prefixed non-diff line must pass through unchanged"
+        );
+        assert!(
+            !rendered.contains("\x1b[48;2;30;30;46m"),
+            "space-prefixed non-diff line must not be tinted as a diff context line"
+        );
+    }
+
+    #[test]
+    fn test_render_lines_styles_context_only_inside_hunk() {
+        let mut out = Vec::<u8>::new();
+        let lines = vec![
+            Ok(String::from("diff --git a/foo.rs b/foo.rs")),
+            Ok(String::from("index 1111111..2222222 100644")),
+            Ok(String::from("--- a/foo.rs")),
+            Ok(String::from("+++ b/foo.rs")),
+            Ok(String::from("@@ -1,1 +1,1 @@")),
+            Ok(String::from(" context line")),
+        ];
+        render_lines(lines, &mut out).unwrap();
+
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            rendered.contains("\x1b[48;2;30;30;46m"),
+            "context lines inside hunks should be rendered with the context tint"
+        );
     }
 }
