@@ -21,7 +21,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use completion::Engine;
 use config::{BackgroundAppearance, DEFAULT_BACKGROUND_APPEARANCE, WINDOW_HEIGHT, WINDOW_WIDTH};
-use renderer::{PaneView, Renderer};
+use renderer::{PaneView, Renderer, RendererShared};
 use terminal::Terminal;
 use updater::UpdateCheck;
 
@@ -88,7 +88,7 @@ struct Pane {
     pty_master: Box<dyn MasterPty>,
     pty_writer: Box<dyn Write + Send>,
     ghost_text: Option<String>,
-    engine: Engine,
+    engine: Arc<Engine>,
     selection: Option<Selection>,
     /// Cached URL scan result. Keyed on (generation, vis_rows, vis_cols) so
     /// we only re-scan when terminal content or viewport dimensions change.
@@ -1075,6 +1075,14 @@ struct App {
     tabbing_id: String,
     background: BackgroundAppearance,
     checking_for_updates: bool,
+    /// Ghost-text completion engine, shared across every pane. Loaded once at
+    /// startup — new commands in the current session won't be reflected until
+    /// `term` is restarted (zsh only flushes history on shell exit anyway).
+    engine: Arc<Engine>,
+    /// Heavy GPU/font resources, shared across every `Renderer` at the same
+    /// DPI scale. Keyed by `scale_factor.to_bits()` — most users only have
+    /// one entry; mixed-DPI setups grow to one entry per unique scale.
+    renderer_shareds: HashMap<u64, Arc<RendererShared>>,
 }
 
 impl App {
@@ -1088,7 +1096,30 @@ impl App {
             tabbing_id: format!("term-{}", std::process::id()),
             background: DEFAULT_BACKGROUND_APPEARANCE,
             checking_for_updates: false,
+            engine: Arc::new(Engine::new()),
+            renderer_shareds: HashMap::new(),
         }
+    }
+
+    /// Return a shared renderer for `scale_factor`, building one if this is
+    /// the first window at that scale.
+    fn shared_renderer_for(&mut self, scale_factor: f64) -> Arc<RendererShared> {
+        let key = scale_factor.to_bits();
+        if let Some(shared) = self.renderer_shareds.get(&key) {
+            return Arc::clone(shared);
+        }
+        let wgpu = self
+            .wgpu
+            .as_ref()
+            .expect("wgpu must be initialised before constructing a renderer");
+        let shared = Arc::new(RendererShared::new(
+            wgpu.device.clone(),
+            wgpu.queue.clone(),
+            wgpu.surface_format,
+            scale_factor,
+        ));
+        self.renderer_shareds.insert(key, Arc::clone(&shared));
+        shared
     }
 
     fn apply_background_appearance(&mut self, background: BackgroundAppearance) {
@@ -1235,7 +1266,7 @@ impl App {
             pty_master: pair.master,
             pty_writer: writer,
             ghost_text: None,
-            engine: Engine::new(),
+            engine: Arc::clone(&self.engine),
             selection: None,
             url_cache: Vec::new(),
             url_cache_gen: u64::MAX, // sentinel: force first-use recompute
@@ -1320,13 +1351,8 @@ impl App {
         surface.configure(&wgpu.device, &surface_config);
 
         let scale = window.scale_factor();
-        let renderer = Renderer::new(
-            wgpu.device.clone(),
-            wgpu.queue.clone(),
-            surface_format,
-            scale,
-            self.background,
-        );
+        let shared = self.shared_renderer_for(scale);
+        let renderer = Renderer::new(shared, self.background);
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
@@ -1602,14 +1628,17 @@ impl ApplicationHandler<AppEvent> for App {
             platform::install_background_menu_item();
         }
 
-        let scale = window.scale_factor();
-        let renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
+        self.wgpu = Some(WgpuShared {
+            instance,
+            adapter,
+            device,
+            queue,
             surface_format,
-            scale,
-            self.background,
-        );
+        });
+
+        let scale = window.scale_factor();
+        let shared = self.shared_renderer_for(scale);
+        let renderer = Renderer::new(shared, self.background);
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
@@ -1619,14 +1648,6 @@ impl ApplicationHandler<AppEvent> for App {
                 (size.height as usize / ch).max(1),
             )
         };
-
-        self.wgpu = Some(WgpuShared {
-            instance,
-            adapter,
-            device,
-            queue,
-            surface_format,
-        });
 
         let proxy = self.proxy.clone();
         let first_pane = match self.create_pane(window_id, &proxy, cols, rows) {
@@ -1708,12 +1729,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(queue) = self.wgpu.as_ref().map(|w| w.queue.clone()) {
+                if self.windows.contains_key(&window_id) {
+                    let shared = self.shared_renderer_for(scale_factor);
                     if let Some(tw) = self.windows.get_mut(&window_id) {
-                        let fmt = tw.renderer.surface_format;
-                        let device = tw.renderer.device.clone();
-                        tw.renderer =
-                            Renderer::new(device, queue, fmt, scale_factor, self.background);
+                        tw.renderer = Renderer::new(shared, self.background);
                     }
                 }
             }

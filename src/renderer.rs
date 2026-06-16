@@ -510,43 +510,24 @@ pub struct PaneView<'a> {
     pub url_underlines: &'a [(usize, usize, usize)],
 }
 
-// ── Renderer ──────────────────────────────────────────────────────────────────
+// ── RendererShared ────────────────────────────────────────────────────────────
 
-pub struct Renderer {
+/// GPU + font resources that depend only on the device, surface format, and
+/// DPI scale — not on any particular window. Shared via `Arc` across every
+/// `Renderer` at the same scale factor so we compile pipelines and parse
+/// fonts once per scale instead of once per window.
+pub struct RendererShared {
     pub device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
+    pub queue: Arc<wgpu::Queue>,
+    #[allow(dead_code)]
+    pub surface_format: wgpu::TextureFormat,
 
     rect_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
 
-    uni_buf: wgpu::Buffer,
-    uni_bg: wgpu::BindGroup,
-
-    atlas_tex: wgpu::Texture,
-    _atlas_view: wgpu::TextureView,
-    _atlas_sampler: wgpu::Sampler,
-    atlas_bg: wgpu::BindGroup,
-    _atlas_bgl: wgpu::BindGroupLayout,
-    /// Atlas cache keyed by OpenType glyph ID (not char) so shaped ligature
-    /// glyphs share entries with their constituent characters when applicable.
-    atlas_cache: HashMap<u16, Option<AtlasEntry>>,
-    row_glyph_cache: HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
-    atlas_x: u32,
-    atlas_y: u32,
-    atlas_row_h: u32,
-
-    // Reusable GPU instance buffers (grown on demand)
-    rect_buf: wgpu::Buffer,
-    rect_buf_cap: usize,
-    glyph_buf: wgpu::Buffer,
-    glyph_buf_cap: usize,
-
-    // Per-frame CPU-side instance staging buffers; cleared at the start of
-    // each render() call instead of being allocated fresh every frame.
-    bg_rects: Vec<RectInst>,
-    block_rects: Vec<RectInst>,
-    glyphs: Vec<GlyphInst>,
-    fg_rects: Vec<RectInst>,
+    uni_bgl: wgpu::BindGroupLayout,
+    atlas_bgl: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
 
     font: fontdue::Font,
     /// HarfBuzz-compatible shaper for OpenType ligature / calt substitution.
@@ -555,17 +536,18 @@ pub struct Renderer {
     pub cell_height: usize,
     pub baseline: i32,
     font_size: f32,
-    pub surface_format: wgpu::TextureFormat,
-    background: BackgroundAppearance,
+    /// Kept so the shared can be looked up by scale at GC time, even though
+    /// internal methods don't reference it directly.
+    #[allow(dead_code)]
+    pub scale_factor: f64,
 }
 
-impl Renderer {
+impl RendererShared {
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
         scale_factor: f64,
-        background: BackgroundAppearance,
     ) -> Self {
         // ── Font ──────────────────────────────────────────────────────────────
         let font_size = (FONT_SIZE_PT * scale_factor as f32).round();
@@ -588,14 +570,7 @@ impl Renderer {
         let gap = lm.line_gap.ceil() as i32;
         let cell_height = (ascent + descent + gap).max(font_size as i32 + 4) as usize;
 
-        // ── Uniform buffer (resolution) ───────────────────────────────────────
-        let uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uni"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        // ── Layouts ───────────────────────────────────────────────────────────
         let uni_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uni_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -609,31 +584,7 @@ impl Renderer {
                 count: None,
             }],
         });
-        let uni_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uni_bg"),
-            layout: &uni_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uni_buf.as_entire_binding(),
-            }],
-        });
 
-        // ── Atlas texture ─────────────────────────────────────────────────────
-        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_smp"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -661,9 +612,118 @@ impl Renderer {
                 },
             ],
         });
+
+        // ── Pipelines ─────────────────────────────────────────────────────────
+        let rect_pipeline = Renderer::make_rect_pipeline(&device, surface_format, &uni_bgl);
+        let glyph_pipeline =
+            Renderer::make_glyph_pipeline(&device, surface_format, &uni_bgl, &atlas_bgl);
+
+        Self {
+            device,
+            queue,
+            surface_format,
+            rect_pipeline,
+            glyph_pipeline,
+            uni_bgl,
+            atlas_bgl,
+            atlas_sampler,
+            font,
+            rb_face,
+            cell_width,
+            cell_height,
+            baseline: ascent,
+            font_size,
+            scale_factor,
+        }
+    }
+}
+
+// ── Renderer ──────────────────────────────────────────────────────────────────
+
+pub struct Renderer {
+    pub shared: Arc<RendererShared>,
+
+    // Convenience copies of immutable shared values so existing call sites
+    // (`renderer.device`, `renderer.cell_width`, …) keep working without
+    // chasing through `shared`.
+    pub device: Arc<wgpu::Device>,
+    pub cell_width: usize,
+    pub cell_height: usize,
+    pub baseline: i32,
+
+    queue: Arc<wgpu::Queue>,
+
+    uni_buf: wgpu::Buffer,
+    uni_bg: wgpu::BindGroup,
+
+    atlas_tex: wgpu::Texture,
+    _atlas_view: wgpu::TextureView,
+    atlas_bg: wgpu::BindGroup,
+    /// Atlas cache keyed by OpenType glyph ID (not char) so shaped ligature
+    /// glyphs share entries with their constituent characters when applicable.
+    atlas_cache: HashMap<u16, Option<AtlasEntry>>,
+    row_glyph_cache: HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
+    atlas_x: u32,
+    atlas_y: u32,
+    atlas_row_h: u32,
+
+    // Reusable GPU instance buffers (grown on demand)
+    rect_buf: wgpu::Buffer,
+    rect_buf_cap: usize,
+    glyph_buf: wgpu::Buffer,
+    glyph_buf_cap: usize,
+
+    // Per-frame CPU-side instance staging buffers; cleared at the start of
+    // each render() call instead of being allocated fresh every frame.
+    bg_rects: Vec<RectInst>,
+    block_rects: Vec<RectInst>,
+    glyphs: Vec<GlyphInst>,
+    fg_rects: Vec<RectInst>,
+
+    background: BackgroundAppearance,
+}
+
+impl Renderer {
+    pub fn new(shared: Arc<RendererShared>, background: BackgroundAppearance) -> Self {
+        let device = shared.device.clone();
+        let queue = shared.queue.clone();
+
+        // ── Uniform buffer (resolution) ───────────────────────────────────────
+        let uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uni"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uni_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("uni_bg"),
+            layout: &shared.uni_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uni_buf.as_entire_binding(),
+            }],
+        });
+
+        // ── Atlas texture (per-window — content depends on which glyphs each
+        //    window has rendered, so we keep it independent) ──────────────────
+        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas_bg"),
-            layout: &atlas_bgl,
+            layout: &shared.atlas_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -671,15 +731,10 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    resource: wgpu::BindingResource::Sampler(&shared.atlas_sampler),
                 },
             ],
         });
-
-        // ── Pipelines ─────────────────────────────────────────────────────────
-        let rect_pipeline = Self::make_rect_pipeline(&device, surface_format, &uni_bgl);
-        let glyph_pipeline =
-            Self::make_glyph_pipeline(&device, surface_format, &uni_bgl, &atlas_bgl);
 
         // ── Instance buffers (pre-allocate for typical terminal) ───────────────
         let init_rect = 8192usize;
@@ -697,18 +752,22 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let cell_width = shared.cell_width;
+        let cell_height = shared.cell_height;
+        let baseline = shared.baseline;
+
         Self {
+            shared,
             device,
             queue,
-            rect_pipeline,
-            glyph_pipeline,
+            cell_width,
+            cell_height,
+            baseline,
             uni_buf,
             uni_bg,
             atlas_tex,
             _atlas_view: atlas_view,
-            _atlas_sampler: atlas_sampler,
             atlas_bg,
-            _atlas_bgl: atlas_bgl,
             atlas_cache: HashMap::new(),
             row_glyph_cache: HashMap::new(),
             atlas_x: 0,
@@ -722,13 +781,6 @@ impl Renderer {
             block_rects: Vec::with_capacity(256),
             glyphs: Vec::with_capacity(4096),
             fg_rects: Vec::with_capacity(256),
-            font,
-            rb_face,
-            cell_width,
-            cell_height,
-            baseline: ascent,
-            font_size,
-            surface_format,
             background,
         }
     }
@@ -837,7 +889,7 @@ impl Renderer {
         if let Some(entry) = self.atlas_cache.get(&id) {
             return entry.clone();
         }
-        let (m, bitmap) = self.font.rasterize_indexed(id, self.font_size);
+        let (m, bitmap) = self.shared.font.rasterize_indexed(id, self.shared.font_size);
         if m.width == 0 || m.height == 0 {
             self.atlas_cache.insert(id, None);
             return None;
@@ -920,7 +972,7 @@ impl Renderer {
     }
 
     fn emit_char(&mut self, c: char, px: f32, py: f32, fg: [f32; 4]) {
-        let id = self.font.lookup_glyph_index(c);
+        let id = self.shared.font.lookup_glyph_index(c);
         self.emit_glyph_id(id, px, py, fg);
     }
 
@@ -945,7 +997,7 @@ impl Renderer {
         };
         let key = build_row_glyph_key(state, row, vis_cols);
         lookup_cached_row_ops(&mut self.row_glyph_cache, slot, key, || {
-            compute_row_glyph_ops_impl(&self.rb_face, state, row, vis_cols)
+            compute_row_glyph_ops_impl(&self.shared.rb_face, state, row, vis_cols)
         })
     }
 
@@ -1185,7 +1237,7 @@ impl Renderer {
                             self.emit_glyph_id(glyph_id, px, py, fg);
                             // Combining chars overlay at the same cell origin.
                             for &combining in cell.combining_chars() {
-                                let comb_id = self.font.lookup_glyph_index(combining);
+                                let comb_id = self.shared.font.lookup_glyph_index(combining);
                                 self.emit_glyph_id(comb_id, px, py, fg);
                             }
                         }
@@ -1355,7 +1407,7 @@ impl Renderer {
             });
 
             pass.set_bind_group(0, &self.uni_bg, &[]);
-            pass.set_pipeline(&self.rect_pipeline);
+            pass.set_pipeline(&self.shared.rect_pipeline);
 
             if bg_count > 0 {
                 pass.set_vertex_buffer(0, self.rect_buf.slice(..(bg_count * ri_size) as u64));
@@ -1368,13 +1420,13 @@ impl Renderer {
                 pass.draw(0..4, 0..block_count as u32);
             }
             if glyph_count > 0 {
-                pass.set_pipeline(&self.glyph_pipeline);
+                pass.set_pipeline(&self.shared.glyph_pipeline);
                 pass.set_bind_group(1, &self.atlas_bg, &[]);
                 pass.set_vertex_buffer(0, self.glyph_buf.slice(..(glyph_count * gi_size) as u64));
                 pass.draw(0..4, 0..glyph_count as u32);
             }
             if fg_count > 0 {
-                pass.set_pipeline(&self.rect_pipeline);
+                pass.set_pipeline(&self.shared.rect_pipeline);
                 pass.set_bind_group(0, &self.uni_bg, &[]);
                 let start = ((bg_count + block_count) * ri_size) as u64;
                 let end = start + (fg_count * ri_size) as u64;

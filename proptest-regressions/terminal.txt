@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3d222fff44ed5ef125880b0bd6e39f0f317e3d32c0eb0f390f2369fcb5d473c3 # shrinks to actions = [Write([])]
+cc 5927453c4ebeaa501d44a90218663e7bdda22dfb7798fce90de328e8727f55f0 # shrinks to bytes = [119, 162, 30, 143, 199, 163, 10, 59, 89, 65, 98, 61, 183], chunk_lengths = [29, 29, 19, 25, 7, 29, 5, 10, 10, 16, 5, 31, 2, 8, 15, 11, 15, 26, 31, 16, 27, 20, 6, 14, 14, 22, 30, 25, 8, 1, 17, 22, 28, 11, 14, 24, 23, 31, 4, 6, 5, 28, 11, 12, 24, 15, 18, 4, 5, 10, 24, 22, 5, 16, 29, 27, 16, 17, 11, 14, 15, 18, 24, 12, 2, 16, 27, 6, 28, 4, 1, 22, 22, 20, 25, 2, 1, 30, 24, 21, 13, 2, 18, 2, 12, 20, 28, 30, 4, 21, 26, 15, 2, 26, 6, 27, 30, 8, 14, 16, 27]

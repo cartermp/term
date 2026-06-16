@@ -4,6 +4,9 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 const SCROLLBACK_MAX: usize = 10_000;
+/// Cap on OSC-supplied strings (title, cwd, hyperlink URI) to bound how much
+/// memory a hostile or buggy program can chew up via a single escape sequence.
+const OSC_STRING_MAX: usize = 4096;
 
 /// SGR underline style (4:N sub-parameter family).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -42,7 +45,7 @@ impl Default for Attrs {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Cell {
     pub c: char,
     /// Combining / extending codepoints that form the rest of this grapheme
@@ -201,7 +204,9 @@ impl TerminalState {
             last_placed: (0, 0),
             last_was_regional_indicator: false,
             alt_screen: false,
-            alt_grid: vec![vec![Cell::default(); cols]; rows],
+            // Allocated lazily on first ?1049h / ?47h. Terminals that never
+            // enter alternate screen save rows × cols × sizeof(Cell) bytes.
+            alt_grid: Vec::new(),
             alt_saved_cursor: (0, 0),
             osc_52_query: false,
             bracketed_paste: false,
@@ -225,6 +230,11 @@ impl TerminalState {
         }
         if save_cursor {
             self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
+        }
+        // alt_grid starts empty; allocate on first enter, then reuse the
+        // existing allocation on subsequent enter/leave cycles.
+        if self.alt_grid.is_empty() {
+            self.alt_grid = vec![vec![Cell::default(); self.cols]; self.rows];
         }
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
         self.alt_screen = true;
@@ -303,11 +313,15 @@ impl TerminalState {
             Self::normalize_row_cells(row);
         }
         self.grid.resize(rows, vec![Cell::default(); cols]);
-        for row in &mut self.alt_grid {
-            row.resize(cols, Cell::default());
-            Self::normalize_row_cells(row);
+        // Leave alt_grid alone when it's empty (the common case: alt screen
+        // never used). It'll be allocated at the right size on next enter.
+        if !self.alt_grid.is_empty() {
+            for row in &mut self.alt_grid {
+                row.resize(cols, Cell::default());
+                Self::normalize_row_cells(row);
+            }
+            self.alt_grid.resize(rows, vec![Cell::default(); cols]);
         }
-        self.alt_grid.resize(rows, vec![Cell::default(); cols]);
         self.cols = cols;
         self.rows = rows;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
@@ -327,7 +341,15 @@ impl TerminalState {
             let mut row = std::mem::take(&mut self.grid[top]);
             // Capture into scrollback only for full-screen scrolls on the normal screen
             if top == 0 && !self.alt_screen {
-                self.scrollback.push_back(row.clone());
+                // Trim trailing default cells before storing to slash memory use on
+                // wide terminals with short lines. `visual_cell` already returns
+                // Cell::default() for out-of-bounds reads, so this is invisible.
+                let default = Cell::default();
+                let trim_to = row
+                    .iter()
+                    .rposition(|c| *c != default)
+                    .map_or(0, |i| i + 1);
+                self.scrollback.push_back(row[..trim_to].to_vec());
                 if self.scrollback.len() > SCROLLBACK_MAX {
                     self.scrollback.pop_front();
                 }
@@ -1019,6 +1041,7 @@ impl Perform for TerminalState {
             b"0" | b"2" => {
                 if params.len() >= 2
                     && let Ok(s) = std::str::from_utf8(params[1])
+                    && s.len() <= OSC_STRING_MAX
                 {
                     self.title = s.to_string();
                 }
@@ -1030,6 +1053,9 @@ impl Perform for TerminalState {
                     .filter_map(|p| std::str::from_utf8(p).ok())
                     .collect::<Vec<_>>()
                     .join(";");
+                if content.len() > OSC_STRING_MAX {
+                    return;
+                }
                 let path = content
                     .strip_prefix("file://")
                     .and_then(|s| s.split_once('/').map(|x| x.1))
@@ -1077,7 +1103,9 @@ impl Perform for TerminalState {
                     if let Ok(uri) = std::str::from_utf8(params[2]) {
                         if uri.is_empty() {
                             self.current_link_id = 0;
-                        } else if self.links.len() < u16::MAX as usize {
+                        } else if uri.len() <= OSC_STRING_MAX
+                            && self.links.len() < u16::MAX as usize
+                        {
                             self.links.push(uri.to_owned());
                             self.current_link_id = self.links.len() as u16;
                         }
@@ -1331,7 +1359,9 @@ mod tests {
 
         let state = &term.state;
         assert_eq!(state.grid.len(), state.rows);
-        assert_eq!(state.alt_grid.len(), state.rows);
+        // alt_grid is allocated lazily on first ?1049h / ?47h, so it's
+        // either empty (alt screen never used) or full-sized.
+        assert!(state.alt_grid.is_empty() || state.alt_grid.len() == state.rows);
         assert!(state.rows > 0);
         assert!(state.cols > 0);
         assert!(
