@@ -1,14 +1,20 @@
 // Ghost-text engine: suggests completions from shell history inline.
 // Tab completion is handled natively by zsh — we just pass \t through.
 
+use std::sync::OnceLock;
+
 pub struct Engine {
-    history: Vec<String>,
+    /// `~/.zsh_history` parsed on first `.ghost()` call rather than at app
+    /// startup — keeps the read+dedupe cost (and however many KB / MB of
+    /// strings the user has accumulated) out of the base process footprint
+    /// until ghost text is actually needed.
+    history: OnceLock<Vec<String>>,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self {
-            history: load_history(),
+            history: OnceLock::new(),
         }
     }
 
@@ -17,7 +23,8 @@ impl Engine {
         if !cursor_at_end || prefix.trim().is_empty() {
             return None;
         }
-        self.history
+        let history = self.history.get_or_init(load_history);
+        history
             .iter()
             .find(|h| h.starts_with(prefix) && h.as_str() != prefix)
             .map(|h| &h[prefix.len()..])
@@ -27,9 +34,9 @@ impl Engine {
 #[cfg(test)]
 impl Engine {
     fn with_history(items: &[&str]) -> Self {
-        Self {
-            history: items.iter().map(|s| s.to_string()).collect(),
-        }
+        let history = OnceLock::new();
+        let _ = history.set(items.iter().map(|s| s.to_string()).collect());
+        Self { history }
     }
 }
 

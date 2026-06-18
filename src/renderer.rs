@@ -2,7 +2,7 @@ use crate::config::*;
 use crate::terminal::TerminalState;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
 
@@ -173,7 +173,10 @@ impl GlyphInst {
 
 // ── Atlas ─────────────────────────────────────────────────────────────────────
 
-const ATLAS_SIZE: u32 = 1024;
+// 512×512 R8 = 256 KB of GPU memory. Fits ~500 rasterised glyphs at typical
+// JetBrains-Mono-at-14pt-2×-scale sizes (ASCII + common box/Unicode glyphs
+// comfortably), and resets itself on overflow.
+const ATLAS_SIZE: u32 = 512;
 
 #[derive(Clone)]
 struct AtlasEntry {
@@ -235,7 +238,11 @@ struct RowGlyphCacheEntry {
     ops: Vec<GlyphOp>,
 }
 
-const ROW_GLYPH_CACHE_MAX_ENTRIES: usize = 4096;
+// Each cache entry holds two Vec allocations (key cells + glyph ops), so the
+// cap directly bounds worst-case memory. 256 entries is plenty for any window
+// (one entry per (row, vis_cols) slot — typical terminals have <100 rows
+// visible).
+const ROW_GLYPH_CACHE_MAX_ENTRIES: usize = 256;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -512,6 +519,18 @@ pub struct PaneView<'a> {
 
 // ── RendererShared ────────────────────────────────────────────────────────────
 
+/// Mutable atlas packing state — the rasterised-glyph LUT and the
+/// row-packing cursor. Lives behind a `Mutex` inside `RendererShared` so
+/// every window at the same DPI scale shares the same GPU atlas texture
+/// instead of paying 256 KB (or 1 MB pre-shrink) per window for an
+/// almost-identical ASCII set.
+struct AtlasPack {
+    cache: HashMap<u16, Option<AtlasEntry>>,
+    x: u32,
+    y: u32,
+    row_h: u32,
+}
+
 /// GPU + font resources that depend only on the device, surface format, and
 /// DPI scale — not on any particular window. Shared via `Arc` across every
 /// `Renderer` at the same scale factor so we compile pipelines and parse
@@ -526,8 +545,13 @@ pub struct RendererShared {
     glyph_pipeline: wgpu::RenderPipeline,
 
     uni_bgl: wgpu::BindGroupLayout,
-    atlas_bgl: wgpu::BindGroupLayout,
-    atlas_sampler: wgpu::Sampler,
+
+    /// Shared atlas texture + bind group. Once-allocated for every window at
+    /// this DPI; `pack` tracks packing state and the glyph LUT.
+    #[allow(dead_code)]
+    atlas_tex: wgpu::Texture,
+    pub atlas_bg: wgpu::BindGroup,
+    atlas_pack: Mutex<AtlasPack>,
 
     font: fontdue::Font,
     /// HarfBuzz-compatible shaper for OpenType ligature / calt substitution.
@@ -551,12 +575,16 @@ impl RendererShared {
     ) -> Self {
         // ── Font ──────────────────────────────────────────────────────────────
         let font_size = (FONT_SIZE_PT * scale_factor as f32).round();
+        // Shaping (incl. ligatures) is handled by rustybuzz below; fontdue
+        // only needs to rasterise by glyph id, so we skip the OpenType
+        // substitution tables — saves a couple of MB of heap for a font as
+        // ligature-heavy as JetBrains Mono.
         let font = fontdue::Font::from_bytes(
             FONT_BYTES,
             fontdue::FontSettings {
                 scale: font_size,
                 collection_index: 0,
-                load_substitutions: true,
+                load_substitutions: false,
             },
         )
         .expect("font load");
@@ -618,6 +646,37 @@ impl RendererShared {
         let glyph_pipeline =
             Renderer::make_glyph_pipeline(&device, surface_format, &uni_bgl, &atlas_bgl);
 
+        // ── Atlas (shared across every Renderer at this DPI) ──────────────────
+        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atlas_bg"),
+            layout: &atlas_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -625,8 +684,14 @@ impl RendererShared {
             rect_pipeline,
             glyph_pipeline,
             uni_bgl,
-            atlas_bgl,
-            atlas_sampler,
+            atlas_tex,
+            atlas_bg,
+            atlas_pack: Mutex::new(AtlasPack {
+                cache: HashMap::new(),
+                x: 0,
+                y: 0,
+                row_h: 0,
+            }),
             font,
             rb_face,
             cell_width,
@@ -635,6 +700,84 @@ impl RendererShared {
             font_size,
             scale_factor,
         }
+    }
+
+    /// Ensure OpenType glyph `id` is in the shared atlas. Returns the entry,
+    /// or `None` if the glyph is missing or invisible (id 0, zero-size bitmap).
+    fn ensure_glyph_id(&self, id: u16) -> Option<AtlasEntry> {
+        if id == 0 {
+            return None;
+        }
+        let mut pack = self.atlas_pack.lock().unwrap();
+        if let Some(entry) = pack.cache.get(&id) {
+            return entry.clone();
+        }
+        let (m, bitmap) = self.font.rasterize_indexed(id, self.font_size);
+        if m.width == 0 || m.height == 0 {
+            pack.cache.insert(id, None);
+            return None;
+        }
+        let gw = m.width as u32;
+        let gh = m.height as u32;
+
+        // Advance to next row if needed (1px padding).
+        if pack.x + gw + 1 > ATLAS_SIZE {
+            pack.y += pack.row_h + 1;
+            pack.x = 0;
+            pack.row_h = 0;
+        }
+        if pack.y + gh > ATLAS_SIZE {
+            // Atlas full — evict and restart (rare; terminals have small glyph sets).
+            pack.cache.clear();
+            pack.x = 0;
+            pack.y = 0;
+            pack.row_h = 0;
+        }
+
+        let ax = pack.x;
+        let ay = pack.y;
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bitmap,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(gw),
+                rows_per_image: Some(gh),
+            },
+            wgpu::Extent3d {
+                width: gw,
+                height: gh,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        pack.x += gw + 1;
+        pack.row_h = pack.row_h.max(gh);
+
+        // Pixel offset to place the glyph relative to the cell origin
+        // (top-left). baseline is measured from cell top; fontdue ymin is
+        // measured from baseline up.
+        let glyph_y = self.baseline - (m.ymin + m.height as i32);
+        let glyph_x = m.xmin;
+
+        let entry = AtlasEntry {
+            uv_x: ax as f32 / ATLAS_SIZE as f32,
+            uv_y: ay as f32 / ATLAS_SIZE as f32,
+            uv_w: gw as f32 / ATLAS_SIZE as f32,
+            uv_h: gh as f32 / ATLAS_SIZE as f32,
+            glyph_x,
+            glyph_y,
+            w: gw,
+            h: gh,
+        };
+        pack.cache.insert(id, Some(entry.clone()));
+        Some(entry)
     }
 }
 
@@ -649,23 +792,14 @@ pub struct Renderer {
     pub device: Arc<wgpu::Device>,
     pub cell_width: usize,
     pub cell_height: usize,
-    pub baseline: i32,
 
     queue: Arc<wgpu::Queue>,
 
     uni_buf: wgpu::Buffer,
     uni_bg: wgpu::BindGroup,
 
-    atlas_tex: wgpu::Texture,
-    _atlas_view: wgpu::TextureView,
-    atlas_bg: wgpu::BindGroup,
-    /// Atlas cache keyed by OpenType glyph ID (not char) so shaped ligature
-    /// glyphs share entries with their constituent characters when applicable.
-    atlas_cache: HashMap<u16, Option<AtlasEntry>>,
+    /// Per-window shaping cache (independent of the shared GPU atlas).
     row_glyph_cache: HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
-    atlas_x: u32,
-    atlas_y: u32,
-    atlas_row_h: u32,
 
     // Reusable GPU instance buffers (grown on demand)
     rect_buf: wgpu::Buffer,
@@ -704,41 +838,13 @@ impl Renderer {
             }],
         });
 
-        // ── Atlas texture (per-window — content depends on which glyphs each
-        //    window has rendered, so we keep it independent) ──────────────────
-        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("atlas_bg"),
-            layout: &shared.atlas_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&shared.atlas_sampler),
-                },
-            ],
-        });
-
-        // ── Instance buffers (pre-allocate for typical terminal) ───────────────
-        let init_rect = 8192usize;
-        let init_glyph = 8192usize;
+        // ── Instance buffers ─────────────────────────────────────────────────
+        // Start small; ensure_rect_buf / ensure_glyph_buf grow on demand. A
+        // freshly-opened 80×24 window draws ~2 K rects and ~1 K glyphs, so
+        // 1024 is the right initial size — buffers grow once on first real
+        // content and then stay there.
+        let init_rect = 1024usize;
+        let init_glyph = 1024usize;
         let rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rect_buf"),
             size: (init_rect * std::mem::size_of::<RectInst>()) as u64,
@@ -754,7 +860,6 @@ impl Renderer {
 
         let cell_width = shared.cell_width;
         let cell_height = shared.cell_height;
-        let baseline = shared.baseline;
 
         Self {
             shared,
@@ -762,25 +867,20 @@ impl Renderer {
             queue,
             cell_width,
             cell_height,
-            baseline,
             uni_buf,
             uni_bg,
-            atlas_tex,
-            _atlas_view: atlas_view,
-            atlas_bg,
-            atlas_cache: HashMap::new(),
             row_glyph_cache: HashMap::new(),
-            atlas_x: 0,
-            atlas_y: 0,
-            atlas_row_h: 0,
             rect_buf,
             rect_buf_cap: init_rect,
             glyph_buf,
             glyph_buf_cap: init_glyph,
-            bg_rects: Vec::with_capacity(4096),
-            block_rects: Vec::with_capacity(256),
-            glyphs: Vec::with_capacity(4096),
-            fg_rects: Vec::with_capacity(256),
+            // Start empty; Vec grows on push and `clear()` keeps capacity,
+            // so steady-state matches the first frame's peak instead of an
+            // up-front guess that's almost always too large.
+            bg_rects: Vec::new(),
+            block_rects: Vec::new(),
+            glyphs: Vec::new(),
+            fg_rects: Vec::new(),
             background,
         }
     }
@@ -878,89 +978,10 @@ impl Renderer {
         })
     }
 
-    // ── Atlas management ──────────────────────────────────────────────────────
-
-    /// Ensure OpenType glyph `id` is in the atlas. Returns the entry, or `None`
-    /// if the glyph is missing or invisible (id 0, zero-size bitmap).
-    fn ensure_glyph_id(&mut self, id: u16) -> Option<AtlasEntry> {
-        if id == 0 {
-            return None;
-        }
-        if let Some(entry) = self.atlas_cache.get(&id) {
-            return entry.clone();
-        }
-        let (m, bitmap) = self.shared.font.rasterize_indexed(id, self.shared.font_size);
-        if m.width == 0 || m.height == 0 {
-            self.atlas_cache.insert(id, None);
-            return None;
-        }
-        let gw = m.width as u32;
-        let gh = m.height as u32;
-
-        // Advance to next row if needed (1px padding)
-        if self.atlas_x + gw + 1 > ATLAS_SIZE {
-            self.atlas_y += self.atlas_row_h + 1;
-            self.atlas_x = 0;
-            self.atlas_row_h = 0;
-        }
-        if self.atlas_y + gh > ATLAS_SIZE {
-            // Atlas full — evict and restart (rare; terminals have small glyph sets)
-            self.atlas_cache.clear();
-            self.atlas_x = 0;
-            self.atlas_y = 0;
-            self.atlas_row_h = 0;
-        }
-
-        let ax = self.atlas_x;
-        let ay = self.atlas_y;
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bitmap,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(gw),
-                rows_per_image: Some(gh),
-            },
-            wgpu::Extent3d {
-                width: gw,
-                height: gh,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        self.atlas_x += gw + 1;
-        self.atlas_row_h = self.atlas_row_h.max(gh);
-
-        // Compute pixel offset to place glyph at the correct position relative
-        // to the cell origin (top-left of the cell).
-        // baseline is measured from cell top. fontdue ymin is from baseline up.
-        let glyph_y = self.baseline - (m.ymin + m.height as i32);
-        let glyph_x = m.xmin;
-
-        let entry = AtlasEntry {
-            uv_x: ax as f32 / ATLAS_SIZE as f32,
-            uv_y: ay as f32 / ATLAS_SIZE as f32,
-            uv_w: gw as f32 / ATLAS_SIZE as f32,
-            uv_h: gh as f32 / ATLAS_SIZE as f32,
-            glyph_x,
-            glyph_y,
-            w: gw,
-            h: gh,
-        };
-        self.atlas_cache.insert(id, Some(entry.clone()));
-        Some(entry)
-    }
-
     // ── Glyph emit helpers ────────────────────────────────────────────────────
 
     fn emit_glyph_id(&mut self, id: u16, px: f32, py: f32, fg: [f32; 4]) {
-        if let Some(e) = self.ensure_glyph_id(id) {
+        if let Some(e) = self.shared.ensure_glyph_id(id) {
             self.glyphs.push(GlyphInst {
                 pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
                 sz: [e.w as f32, e.h as f32],
@@ -1111,7 +1132,7 @@ impl Renderer {
 
     fn ensure_rect_buf(&mut self, need: usize) {
         if need > self.rect_buf_cap {
-            let cap = need.next_power_of_two().max(8192);
+            let cap = need.next_power_of_two().max(1024);
             self.rect_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rect_buf"),
                 size: (cap * std::mem::size_of::<RectInst>()) as u64,
@@ -1124,7 +1145,7 @@ impl Renderer {
 
     fn ensure_glyph_buf(&mut self, need: usize) {
         if need > self.glyph_buf_cap {
-            let cap = need.next_power_of_two().max(8192);
+            let cap = need.next_power_of_two().max(1024);
             self.glyph_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("glyph_buf"),
                 size: (cap * std::mem::size_of::<GlyphInst>()) as u64,
@@ -1421,7 +1442,7 @@ impl Renderer {
             }
             if glyph_count > 0 {
                 pass.set_pipeline(&self.shared.glyph_pipeline);
-                pass.set_bind_group(1, &self.atlas_bg, &[]);
+                pass.set_bind_group(1, &self.shared.atlas_bg, &[]);
                 pass.set_vertex_buffer(0, self.glyph_buf.slice(..(glyph_count * gi_size) as u64));
                 pass.draw(0..4, 0..glyph_count as u32);
             }
