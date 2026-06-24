@@ -2328,6 +2328,28 @@ fn build_shell_bootstrap_files(home: &str, tools: &ShellTools) -> ShellBootstrap
         ),
         None => String::new(),
     };
+    // Default `git log` to `--reverse` so the most recent commit lands closest
+    // to the prompt and scrolling up walks backward in time. Skip the
+    // rewrite when the user already specified an ordering flag, and ignore
+    // anything but the bare `git log ...` form — `command git log ...` is
+    // always the escape hatch.
+    let git_fn = r#"function git() {
+  if [[ "$1" == "log" ]]; then
+    local arg
+    for arg in "$@"; do
+      case "$arg" in --reverse|--no-reverse|--topo-order|--date-order|--author-date-order)
+        command git "$@"
+        return $?
+      ;;
+      esac
+    done
+    shift
+    command git log --reverse "$@"
+  else
+    command git "$@"
+  fi
+}
+"#;
     let suggest_extra_candidates = format!(
         "{}{}",
         if tools.tcat.is_some() {
@@ -2413,7 +2435,7 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
         "ZDOTDIR='{home}'\n\
          [ -f '{home}/.zprofile' ] && source '{home}/.zprofile'\n\
          [ -f '{home}/.zshrc' ] && source '{home}/.zshrc'\n\
-         {cat_fn}{diff_fn}{json_fn}{command_not_found_fn}{zle_hooks}{prompt_setup}"
+         {cat_fn}{diff_fn}{json_fn}{git_fn}{command_not_found_fn}{zle_hooks}{prompt_setup}"
     );
 
     ShellBootstrapFiles { zshenv, zshrc }
@@ -3088,6 +3110,8 @@ mod tests {
         assert!(files.zshrc.contains("_TJSON='/tmp/O'\\''Brien/bin/tjson'"));
         assert!(files.zshrc.contains("function cat()"));
         assert!(files.zshrc.contains("function json()"));
+        assert!(files.zshrc.contains("function git()"));
+        assert!(files.zshrc.contains("command git log --reverse"));
         assert!(files.zshrc.contains("function command_not_found_handler()"));
         assert!(files.zshrc.contains("__suggest_command \"$cmd\""));
         assert!(
