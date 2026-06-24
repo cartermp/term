@@ -11,6 +11,9 @@ const GREEN: (u8, u8, u8) = (0xa6, 0xe3, 0xa1); // added prefix +
 const RED: (u8, u8, u8) = (0xf3, 0x8b, 0xa8); // removed prefix -
 const OVERLAY0: (u8, u8, u8) = (0x6c, 0x70, 0x86); // meta / index lines
 const SURFACE1: (u8, u8, u8) = (0x45, 0x47, 0x5a); // subtle separators
+const PEACH: (u8, u8, u8) = (0xfa, 0xb3, 0x87); // commit hashes
+const SKY: (u8, u8, u8) = (0x89, 0xdc, 0xeb); // author names
+const YELLOW: (u8, u8, u8) = (0xf9, 0xe2, 0xaf); // ref decorations (HEAD, branches, tags)
 
 // Background tints for diff lines (dark, not too loud)
 const BG_ADDED: (u8, u8, u8) = (23, 51, 34);
@@ -166,6 +169,112 @@ fn write_code_line(
     writeln!(out)
 }
 
+// ── git log header recognition ────────────────────────────────────────────────
+
+/// True iff the whole string is ASCII hex (lowercase or upper) and at least
+/// 7 chars long — i.e. could plausibly be a git short or full SHA.
+fn looks_like_sha(s: &str) -> bool {
+    s.len() >= 7 && s.len() <= 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Try to render `line` as a `git log` header line (commit/Author/Date/Merge
+/// /...) or a `--oneline` row. Returns `Ok(true)` when the line was handled.
+fn try_render_log_line(line: &str, out: &mut impl Write) -> io::Result<bool> {
+    // `commit <hash>` — optionally followed by ref decoration like
+    //   `commit abc1234 (HEAD -> main, origin/main)`
+    if let Some(rest) = line.strip_prefix("commit ") {
+        let (hash, decoration) = match rest.find(' ') {
+            Some(idx) => (&rest[..idx], Some(&rest[idx..])),
+            None => (rest, None),
+        };
+        if looks_like_sha(hash) {
+            fg(out, OVERLAY0.0, OVERLAY0.1, OVERLAY0.2)?;
+            write!(out, "commit ")?;
+            bold(out)?;
+            fg(out, PEACH.0, PEACH.1, PEACH.2)?;
+            write!(out, "{hash}")?;
+            reset(out)?;
+            if let Some(dec) = decoration {
+                fg(out, YELLOW.0, YELLOW.1, YELLOW.2)?;
+                write!(out, "{dec}")?;
+                reset(out)?;
+            }
+            writeln!(out)?;
+            return Ok(true);
+        }
+    }
+
+    // `Author: Name <email>` — split name and email; dim the label and email,
+    // colour the name.
+    if let Some(rest) = line.strip_prefix("Author: ") {
+        let (name, email) = match rest.rfind(" <") {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, ""),
+        };
+        fg(out, OVERLAY0.0, OVERLAY0.1, OVERLAY0.2)?;
+        write!(out, "Author: ")?;
+        fg(out, SKY.0, SKY.1, SKY.2)?;
+        write!(out, "{name}")?;
+        if !email.is_empty() {
+            fg(out, OVERLAY0.0, OVERLAY0.1, OVERLAY0.2)?;
+            write!(out, "{email}")?;
+        }
+        reset(out)?;
+        writeln!(out)?;
+        return Ok(true);
+    }
+
+    // Other plain-format header labels — all dim. Listed explicitly so we
+    // don't accidentally swallow random `Foo: bar` lines.
+    for label in [
+        "Date:",
+        "Merge:",
+        "AuthorDate:",
+        "CommitDate:",
+        "Commit:",
+        "Tag:",
+        "Refs:",
+    ] {
+        if line.starts_with(label) {
+            fg(out, OVERLAY0.0, OVERLAY0.1, OVERLAY0.2)?;
+            writeln!(out, "{line}")?;
+            reset(out)?;
+            return Ok(true);
+        }
+    }
+
+    // `--oneline` rows: `<hash> <subject>` (optionally with ` (refs)` between).
+    if let Some(space) = line.find(' ') {
+        let hash = &line[..space];
+        let rest = &line[space + 1..];
+        if looks_like_sha(hash) && !rest.is_empty() {
+            bold(out)?;
+            fg(out, PEACH.0, PEACH.1, PEACH.2)?;
+            write!(out, "{hash}")?;
+            reset(out)?;
+            // Optional ref decoration before the subject.
+            let (decoration, subject) = if rest.starts_with('(') {
+                match rest.find(')') {
+                    Some(close) => (Some(&rest[..=close]), rest[close + 1..].trim_start()),
+                    None => (None, rest),
+                }
+            } else {
+                (None, rest)
+            };
+            write!(out, " ")?;
+            if let Some(dec) = decoration {
+                fg(out, YELLOW.0, YELLOW.1, YELLOW.2)?;
+                write!(out, "{dec} ")?;
+                reset(out)?;
+            }
+            writeln!(out, "{subject}")?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 // ── Main rendering loop ───────────────────────────────────────────────────────
 
 fn render_lines<I>(lines: I, out: &mut impl Write) -> io::Result<()>
@@ -299,9 +408,12 @@ where
             reset(out)?;
         } else {
             in_hunk = false;
-            // Unrecognised line — pass through
+            // Try `git log` header / `--oneline` styling first; fall back to
+            // an unstyled passthrough for anything else.
             reset(out)?;
-            writeln!(out, "{line}")?;
+            if !try_render_log_line(&line, out)? {
+                writeln!(out, "{line}")?;
+            }
         }
     }
 
@@ -545,6 +657,118 @@ mod tests {
             !rendered.contains("\x1b[48;2;30;30;46m"),
             "space-prefixed non-diff line must not be tinted as a diff context line"
         );
+    }
+
+    // ── git log styling ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_log_commit_line_renders_hash_in_peach() {
+        let mut out = Vec::<u8>::new();
+        assert!(
+            try_render_log_line("commit 1234567890abcdef1234567890abcdef12345678", &mut out)
+                .unwrap()
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("commit "), "label preserved: {s:?}");
+        assert!(s.contains("1234567890abcdef1234567890abcdef12345678"));
+        // PEACH = (0xfa, 0xb3, 0x87) -> 250;179;135
+        assert!(s.contains("\x1b[38;2;250;179;135m"), "peach fg applied: {s:?}");
+    }
+
+    #[test]
+    fn test_log_commit_line_with_ref_decoration_styles_refs() {
+        let mut out = Vec::<u8>::new();
+        assert!(
+            try_render_log_line("commit abcdef0123456 (HEAD -> main)", &mut out).unwrap()
+        );
+        let s = String::from_utf8_lossy(&out);
+        // YELLOW = (0xf9, 0xe2, 0xaf) -> 249;226;175
+        assert!(
+            s.contains("\x1b[38;2;249;226;175m"),
+            "ref decoration styled yellow: {s:?}"
+        );
+        assert!(s.contains("(HEAD -> main)"));
+    }
+
+    #[test]
+    fn test_log_author_line_splits_name_and_email() {
+        let mut out = Vec::<u8>::new();
+        assert!(
+            try_render_log_line("Author: Phillip Carter <phil@example.com>", &mut out)
+                .unwrap()
+        );
+        let s = String::from_utf8_lossy(&out);
+        // SKY = (0x89, 0xdc, 0xeb) -> 137;220;235
+        assert!(s.contains("\x1b[38;2;137;220;235m"), "name in sky: {s:?}");
+        assert!(s.contains("Phillip Carter"));
+        assert!(s.contains("<phil@example.com>"));
+    }
+
+    #[test]
+    fn test_log_date_line_dimmed() {
+        let mut out = Vec::<u8>::new();
+        assert!(
+            try_render_log_line("Date:   Wed Jun 24 12:00:00 2026 -0700", &mut out).unwrap()
+        );
+        let s = String::from_utf8_lossy(&out);
+        // OVERLAY0 = (0x6c, 0x70, 0x86) -> 108;112;134
+        assert!(s.contains("\x1b[38;2;108;112;134m"), "date dimmed: {s:?}");
+        assert!(s.contains("Date:   Wed Jun 24"));
+    }
+
+    #[test]
+    fn test_log_oneline_row_handled() {
+        let mut out = Vec::<u8>::new();
+        assert!(try_render_log_line("abc1234 implement nice log styling", &mut out).unwrap());
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("abc1234"));
+        assert!(s.contains("implement nice log styling"));
+        // Peach again for the hash.
+        assert!(s.contains("\x1b[38;2;250;179;135m"));
+    }
+
+    #[test]
+    fn test_log_oneline_rejects_non_hex_prefix() {
+        // A regular sentence shouldn't be misread as a --oneline row.
+        let mut out = Vec::<u8>::new();
+        assert!(!try_render_log_line("hello world", &mut out).unwrap());
+    }
+
+    #[test]
+    fn test_log_commit_rejects_short_or_non_hex() {
+        let mut out = Vec::<u8>::new();
+        // Too short.
+        assert!(!try_render_log_line("commit 12345", &mut out).unwrap());
+        // Non-hex character.
+        assert!(!try_render_log_line("commit zzzzzzzzzz", &mut out).unwrap());
+    }
+
+    #[test]
+    fn test_render_lines_styles_log_then_diff() {
+        // Verify integration: log header followed by a diff section both get
+        // their respective styling and the transition doesn't confuse state.
+        let mut out = Vec::<u8>::new();
+        let lines = vec![
+            Ok(String::from("commit 0123456789abcdef0123456789abcdef01234567")),
+            Ok(String::from("Author: Alice <alice@example.com>")),
+            Ok(String::from("Date:   Wed Jun 24 12:00:00 2026 -0700")),
+            Ok(String::from("")),
+            Ok(String::from("    fix the thing")),
+            Ok(String::from("")),
+            Ok(String::from("diff --git a/foo.rs b/foo.rs")),
+            Ok(String::from("--- a/foo.rs")),
+            Ok(String::from("+++ b/foo.rs")),
+            Ok(String::from("@@ -1,1 +1,1 @@")),
+            Ok(String::from("+added")),
+        ];
+        render_lines(lines, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        // Peach hash from the commit header.
+        assert!(s.contains("\x1b[38;2;250;179;135m"), "commit hash styled");
+        // Green for the + line in the diff.
+        assert!(s.contains("\x1b[38;2;166;227;161m"), "added line styled");
+        // Subject body line passed through plain.
+        assert!(s.contains("    fix the thing"));
     }
 
     #[test]
