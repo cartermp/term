@@ -303,7 +303,9 @@ APPLESCRIPT
   /usr/bin/ditto "$TMP/Term.app" "$APP_DST"
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
     -f "$APP_DST" 2>/dev/null || true
-  /usr/bin/open -a "$APP_DST"
+  # Pass --restore-session so the freshly-launched binary reads the saved
+  # session file and re-creates the user's tabs + CWDs.
+  /usr/bin/open -a "$APP_DST" --args --restore-session
 } >>"$LOG_PATH" 2>&1 || report_failure
 "#
 }

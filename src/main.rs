@@ -3,6 +3,7 @@ mod completion;
 mod config;
 mod platform;
 mod renderer;
+mod session;
 mod terminal;
 mod updater;
 
@@ -1083,10 +1084,16 @@ struct App {
     /// DPI scale. Keyed by `scale_factor.to_bits()` — most users only have
     /// one entry; mixed-DPI setups grow to one entry per unique scale.
     renderer_shareds: HashMap<u64, Arc<RendererShared>>,
+    /// Session restore payload — set from `--restore-session` at process
+    /// start, consumed once by `resumed()` to recreate the saved tabs.
+    pending_restore: Option<session::SavedSession>,
+    /// Last successful session-file write. Used to throttle the periodic
+    /// save inside `about_to_wait()`.
+    last_session_save: Instant,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+    fn new(proxy: EventLoopProxy<AppEvent>, pending_restore: Option<session::SavedSession>) -> Self {
         Self {
             wgpu: None,
             windows: HashMap::new(),
@@ -1098,7 +1105,64 @@ impl App {
             checking_for_updates: false,
             engine: Arc::new(Engine::new()),
             renderer_shareds: HashMap::new(),
+            pending_restore,
+            last_session_save: Instant::now(),
         }
+    }
+
+    /// Snapshot the current window/tab layout for persistence. Per-pane CWD
+    /// is read from `terminal.state.current_dir` (kept up to date by OSC 7);
+    /// title from `Pane::title()` (which falls back to CWD).
+    fn snapshot(&self) -> session::SavedSession {
+        let mut windows = Vec::with_capacity(self.windows.len());
+        // Iteration order over HashMap is non-deterministic; sort by raw id so
+        // saved JSON is stable across saves with no structural change.
+        let mut ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        ids.sort_by_key(|w| format!("{w:?}"));
+        for id in &ids {
+            let tw = match self.windows.get(id) {
+                Some(w) => w,
+                None => continue,
+            };
+            let inner = tw.window.inner_size();
+            let outer = tw.window.outer_position().ok();
+            windows.push(session::SavedWindow {
+                outer_x: outer.map(|p| p.x),
+                outer_y: outer.map(|p| p.y),
+                inner_w: inner.width,
+                inner_h: inner.height,
+                split: tw.split.map(|d| match d {
+                    SplitDir::Vertical => session::SavedSplit::Vertical,
+                    SplitDir::Horizontal => session::SavedSplit::Horizontal,
+                }),
+                active_pane: tw.active_pane,
+                panes: tw
+                    .panes
+                    .iter()
+                    .map(|p| session::SavedPane {
+                        cwd: p.terminal.state.current_dir.clone(),
+                        title: p.title().to_string(),
+                    })
+                    .collect(),
+            });
+        }
+        session::SavedSession {
+            schema: session::SCHEMA_VERSION,
+            term_version: env!("CARGO_PKG_VERSION").to_string(),
+            saved_at_ms: session::now_ms(),
+            focused_window: None,
+            windows,
+        }
+    }
+
+    /// Persist `snapshot()` to disk. Failures are logged and otherwise
+    /// ignored — losing a session save shouldn't take the app down.
+    fn save_session_now(&mut self) {
+        let snap = self.snapshot();
+        if let Err(e) = session::save(&snap) {
+            eprintln!("term: failed to save session: {e}");
+        }
+        self.last_session_save = Instant::now();
     }
 
     /// Return a shared renderer for `scale_factor`, building one if this is
@@ -1200,6 +1264,17 @@ impl App {
         cols: usize,
         rows: usize,
     ) -> Option<Pane> {
+        self.create_pane_in(window_id, proxy, cols, rows, None)
+    }
+
+    fn create_pane_in(
+        &mut self,
+        window_id: WindowId,
+        proxy: &EventLoopProxy<AppEvent>,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+    ) -> Option<Pane> {
         let pane_id = self.alloc_pane_id();
         self.pane_to_window.insert(pane_id, window_id);
 
@@ -1221,6 +1296,14 @@ impl App {
         cmd.arg("-l");
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Honour a saved CWD when present and the directory still exists.
+        // CommandBuilder defaults to the parent process's CWD otherwise.
+        if let Some(dir) = cwd
+            && !dir.is_empty()
+            && std::path::Path::new(dir).is_dir()
+        {
+            cmd.cwd(dir);
+        }
         setup_shell_env(&mut cmd);
 
         let _ = pair.slave.spawn_command(cmd);
@@ -1275,6 +1358,10 @@ impl App {
     }
 
     fn open_tab(&mut self, event_loop: &ActiveEventLoop) {
+        self.open_tab_with_cwd(event_loop, None);
+    }
+
+    fn open_tab_with_cwd(&mut self, event_loop: &ActiveEventLoop, cwd: Option<&str>) {
         let wgpu = match &self.wgpu {
             Some(w) => w,
             None => return,
@@ -1364,7 +1451,7 @@ impl App {
         };
 
         let proxy = self.proxy.clone();
-        let first_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+        let first_pane = match self.create_pane_in(window_id, &proxy, cols, rows, cwd) {
             Some(p) => p,
             None => return,
         };
@@ -1649,8 +1736,20 @@ impl ApplicationHandler<AppEvent> for App {
             )
         };
 
+        // CWD for the first (default) window when restoring a session. The
+        // remaining tabs are restored after `resumed()` returns, by calling
+        // `open_tab_with_cwd` for each — kept owned so the &str lives long
+        // enough.
+        let restore_first_cwd: Option<String> = self
+            .pending_restore
+            .as_ref()
+            .and_then(|s| s.windows.first())
+            .and_then(|w| w.panes.first())
+            .map(|p| p.cwd.clone());
+        let cwd: Option<&str> = restore_first_cwd.as_deref();
+
         let proxy = self.proxy.clone();
-        let first_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+        let first_pane = match self.create_pane_in(window_id, &proxy, cols, rows, cwd) {
             Some(p) => p,
             None => return,
         };
@@ -1687,6 +1786,24 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Re-number all tab labels now that a new tab has been added.
         self.sync_all_titles();
+
+        // Restore additional tabs from a `--restore-session` payload. The
+        // first saved window already drove the default-window CWD above;
+        // here we replay every subsequent saved window as a fresh tab.
+        if let Some(saved) = self.pending_restore.take() {
+            let extra_cwds: Vec<String> = saved
+                .windows
+                .iter()
+                .skip(1)
+                .filter_map(|w| w.panes.first().map(|p| p.cwd.clone()))
+                .collect();
+            for c in &extra_cwds {
+                self.open_tab_with_cwd(event_loop, Some(c.as_str()));
+            }
+            // Best-effort: drop the file after we successfully restored from
+            // it so a normal next launch starts fresh.
+            session::clear();
+        }
     }
 
     fn window_event(
@@ -2001,7 +2118,15 @@ impl ApplicationHandler<AppEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         const BLINK_PERIOD: Duration = Duration::from_millis(530);
         const SCROLL_PERIOD: Duration = Duration::from_millis(50);
+        const SESSION_SAVE_PERIOD: Duration = Duration::from_secs(30);
         let now = Instant::now();
+
+        // Cheap periodic snapshot of the layout so a sudden SIGTERM from the
+        // updater never loses more than ~30 s of state changes. Heavy lifting
+        // is in save_session_now(); here we just gate on the interval.
+        if !self.windows.is_empty() && now.duration_since(self.last_session_save) >= SESSION_SAVE_PERIOD {
+            self.save_session_now();
+        }
 
         let mut earliest_deadline = now + BLINK_PERIOD;
 
@@ -2157,6 +2282,15 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::BackgroundAppearanceChanged(background) => {
                 self.apply_background_appearance(background);
             }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Final flush so the most recent layout is on disk by the time the
+        // process actually exits (covers Cmd+Q and close-last-window;
+        // SIGTERM from the updater is covered by the periodic save).
+        if !self.windows.is_empty() {
+            self.save_session_now();
         }
     }
 }
@@ -2535,13 +2669,21 @@ fn main() {
     if let Some(code) = maybe_run_helper_mode() {
         std::process::exit(code);
     }
+
+    // `--restore-session` is the flag the updater script (and anyone who
+    // wants a manual replay) passes via `open --args` to load the saved
+    // tab layout. Without the flag we always start fresh, even if the
+    // file exists — keeps the natural Cmd+Q → relaunch flow predictable.
+    let restore = std::env::args().any(|a| a == "--restore-session");
+    let pending_restore = if restore { session::load() } else { None };
+
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, pending_restore);
     event_loop.run_app(&mut app).unwrap();
 }
 
