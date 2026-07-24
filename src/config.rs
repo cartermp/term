@@ -38,10 +38,6 @@ impl BackgroundAppearance {
         Self { color, alpha }
     }
 
-    pub fn alpha_f32(self) -> f32 {
-        self.alpha as f32 / 255.
-    }
-
     pub fn alpha_f64(self) -> f64 {
         self.alpha as f64 / 255.
     }
@@ -142,9 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn background_appearance_alpha_helpers_match_byte_value() {
+    fn background_appearance_alpha_matches_byte_value() {
         let appearance = BackgroundAppearance::new(Color::new(1, 2, 3), 128);
-        assert!((appearance.alpha_f32() - (128.0 / 255.0)).abs() < f32::EPSILON);
         assert!((appearance.alpha_f64() - (128.0 / 255.0)).abs() < f64::EPSILON);
     }
 

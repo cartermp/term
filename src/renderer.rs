@@ -254,12 +254,8 @@ fn c2fa(c: Color, a: f32) -> [f32; 4] {
     [c.r as f32 / 255., c.g as f32 / 255., c.b as f32 / 255., a]
 }
 
-fn default_background_fill(appearance: BackgroundAppearance, cell_bg: Color) -> [f32; 4] {
-    if cell_bg == DEFAULT_BG {
-        c2fa(appearance.color, appearance.alpha_f32())
-    } else {
-        c2f(cell_bg)
-    }
+fn explicit_background_fill(cell_bg: Color) -> Option<[f32; 4]> {
+    (cell_bg != DEFAULT_BG).then(|| c2f(cell_bg))
 }
 
 fn background_clear_color(appearance: BackgroundAppearance) -> wgpu::Color {
@@ -1236,12 +1232,14 @@ impl Renderer {
                     let px = ox + col as f32 * cw;
                     let py = oy + row as f32 * ch;
 
-                    let bg = if selected {
-                        sel_bg
-                    } else {
-                        default_background_fill(self.background, bg_color)
-                    };
-                    push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
+                    if selected {
+                        push_rect(&mut self.bg_rects, px, py, cw, ch, sel_bg);
+                    } else if let Some(bg) = explicit_background_fill(bg_color) {
+                        // The render pass already clears the surface to the
+                        // configured default background. Only explicit cell
+                        // backgrounds need per-cell GPU instances.
+                        push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
+                    }
 
                     let fg = c2f(fg_color);
                     let c = cell.c;
@@ -1998,20 +1996,25 @@ mod tests {
     }
 
     #[test]
-    fn default_background_fill_uses_custom_color_and_alpha() {
+    fn background_clear_uses_custom_color_and_alpha() {
         let appearance = BackgroundAppearance::new(Color::new(10, 20, 30), 128);
-        assert_eq!(
-            default_background_fill(appearance, DEFAULT_BG),
-            [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 128.0 / 255.0]
-        );
+        let clear = background_clear_color(appearance);
+        assert_eq!(clear.r, 10.0 / 255.0);
+        assert_eq!(clear.g, 20.0 / 255.0);
+        assert_eq!(clear.b, 30.0 / 255.0);
+        assert_eq!(clear.a, 128.0 / 255.0);
     }
 
     #[test]
-    fn default_background_fill_keeps_explicit_cell_background_opaque() {
-        let appearance = BackgroundAppearance::new(Color::new(10, 20, 30), 64);
+    fn default_cell_background_needs_no_rect() {
+        assert_eq!(explicit_background_fill(DEFAULT_BG), None);
+    }
+
+    #[test]
+    fn explicit_cell_background_stays_opaque() {
         assert_eq!(
-            default_background_fill(appearance, Color::new(40, 50, 60)),
-            [40.0 / 255.0, 50.0 / 255.0, 60.0 / 255.0, 1.0]
+            explicit_background_fill(Color::new(40, 50, 60)),
+            Some([40.0 / 255.0, 50.0 / 255.0, 60.0 / 255.0, 1.0])
         );
     }
 

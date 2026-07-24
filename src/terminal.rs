@@ -125,6 +125,10 @@ pub struct TerminalState {
     pub input_cursor: usize,
     /// Current working directory (sent via OSC 7 on each chpwd).
     pub current_dir: String,
+    /// Host-side UI invalidation bits. These let the event loop avoid
+    /// recomputing ghost text and native titles for ordinary PTY output.
+    ui_input_changed: bool,
+    ui_title_changed: bool,
     /// Set by OSC 52 `?` query; cleared after the host responds.
     pub osc_52_query: bool,
     /// Whether the app has enabled bracketed paste mode (?2004h).
@@ -176,6 +180,13 @@ impl TerminalState {
     pub fn is_alt_screen(&self) -> bool {
         self.alt_screen
     }
+
+    pub fn take_ui_changes(&mut self) -> (bool, bool) {
+        (
+            std::mem::take(&mut self.ui_input_changed),
+            std::mem::take(&mut self.ui_title_changed),
+        )
+    }
 }
 
 impl TerminalState {
@@ -197,6 +208,8 @@ impl TerminalState {
             input_buffer: String::new(),
             input_cursor: 0,
             current_dir: std::env::var("HOME").unwrap_or_default(),
+            ui_input_changed: false,
+            ui_title_changed: false,
             saved_cursor: (0, 0),
             saved_attrs: Attrs::default(),
             saved_wrap_next: false,
@@ -332,49 +345,58 @@ impl TerminalState {
     }
 
     fn scroll_up(&mut self, n: usize) {
-        for _ in 0..n {
-            if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
-                break;
-            }
-            let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
-            let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-            let mut row = std::mem::take(&mut self.grid[top]);
-            // Capture into scrollback only for full-screen scrolls on the normal screen
-            if top == 0 && !self.alt_screen {
+        if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+        let count = n.min(bottom - top + 1);
+        if count == 0 {
+            return;
+        }
+
+        // Capture into scrollback only for full-screen scrolls on the normal
+        // screen. Clone just the rows that are actually leaving the viewport,
+        // then rotate the region once even for large CSI S counts.
+        if top == 0 && bottom + 1 == self.grid.len() && !self.alt_screen {
+            for row in &self.grid[top..top + count] {
                 // Trim trailing default cells before storing to slash memory use on
                 // wide terminals with short lines. `visual_cell` already returns
                 // Cell::default() for out-of-bounds reads, so this is invisible.
                 let default = Cell::default();
-                let trim_to = row
-                    .iter()
-                    .rposition(|c| *c != default)
-                    .map_or(0, |i| i + 1);
+                let trim_to = row.iter().rposition(|c| *c != default).map_or(0, |i| i + 1);
                 self.scrollback.push_back(row[..trim_to].to_vec());
-                if self.scrollback.len() > SCROLLBACK_MAX {
-                    self.scrollback.pop_front();
-                }
-                // Keep the viewport pinned to the same content when user is scrolled back
-                if self.viewport_offset > 0 {
-                    self.viewport_offset = (self.viewport_offset + 1).min(self.scrollback.len());
-                }
             }
-            self.grid[top..=bottom].rotate_left(1);
+            while self.scrollback.len() > SCROLLBACK_MAX {
+                self.scrollback.pop_front();
+            }
+            // Keep the viewport pinned to the same content when user is
+            // scrolled back.
+            if self.viewport_offset > 0 {
+                self.viewport_offset = (self.viewport_offset + count).min(self.scrollback.len());
+            }
+        }
+
+        self.grid[top..=bottom].rotate_left(count);
+        for row in &mut self.grid[bottom + 1 - count..=bottom] {
             row.fill(Cell::default());
-            self.grid[bottom] = row;
         }
     }
 
     fn scroll_down(&mut self, n: usize) {
-        for _ in 0..n {
-            if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
-                break;
-            }
-            let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
-            let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-            let mut row = std::mem::take(&mut self.grid[bottom]);
-            self.grid[top..=bottom].rotate_right(1);
+        if self.grid.is_empty() || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let top = self.scroll_top.min(self.grid.len().saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+        let count = n.min(bottom - top + 1);
+        if count == 0 {
+            return;
+        }
+
+        self.grid[top..=bottom].rotate_right(count);
+        for row in &mut self.grid[top..top + count] {
             row.fill(Cell::default());
-            self.grid[top] = row;
         }
     }
 
@@ -433,9 +455,9 @@ impl TerminalState {
     }
 
     fn do_newline(&mut self) {
-        if self.cursor_row >= self.scroll_bottom {
+        if self.cursor_row == self.scroll_bottom {
             self.scroll_up(1);
-        } else {
+        } else if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
         }
     }
@@ -808,11 +830,14 @@ impl Perform for TerminalState {
         match (inter, action) {
             (0, 'A') => {
                 let n = p0.max(1) as usize;
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(self.scroll_top);
+                self.cursor_row = self.cursor_row.saturating_sub(n);
             }
             (0, 'B') => {
                 let n = p0.max(1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.scroll_bottom);
+                self.cursor_row = self
+                    .cursor_row
+                    .saturating_add(n)
+                    .min(self.rows.saturating_sub(1));
             }
             (0, 'C') => {
                 let n = p0.max(1) as usize;
@@ -844,26 +869,29 @@ impl Perform for TerminalState {
             (0, 'K') => self.erase_line(p0),
             (0, 'L') => {
                 let n = p0.max(1) as usize;
-                for _ in 0..n {
-                    if self.grid.is_empty() || self.cursor_row > self.scroll_bottom {
-                        break;
-                    }
+                if !self.grid.is_empty()
+                    && self.cursor_row >= self.scroll_top
+                    && self.cursor_row <= self.scroll_bottom
+                {
                     let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-                    let mut row = std::mem::take(&mut self.grid[bottom]);
-                    self.grid[self.cursor_row..=bottom].rotate_right(1);
-                    row.fill(Cell::default());
-                    self.grid[self.cursor_row] = row;
+                    let count = n.min(bottom - self.cursor_row + 1);
+                    self.grid[self.cursor_row..=bottom].rotate_right(count);
+                    for row in &mut self.grid[self.cursor_row..self.cursor_row + count] {
+                        row.fill(Cell::default());
+                    }
                 }
             }
             (0, 'M') => {
                 let n = p0.max(1) as usize;
-                for _ in 0..n {
-                    if self.cursor_row < self.grid.len() {
-                        let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
-                        let mut row = std::mem::take(&mut self.grid[self.cursor_row]);
-                        self.grid[self.cursor_row..=bottom].rotate_left(1);
+                if !self.grid.is_empty()
+                    && self.cursor_row >= self.scroll_top
+                    && self.cursor_row <= self.scroll_bottom
+                {
+                    let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
+                    let count = n.min(bottom - self.cursor_row + 1);
+                    self.grid[self.cursor_row..=bottom].rotate_left(count);
+                    for row in &mut self.grid[bottom + 1 - count..=bottom] {
                         row.fill(Cell::default());
-                        self.grid[bottom] = row;
                     }
                 }
             }
@@ -871,14 +899,13 @@ impl Perform for TerminalState {
                 let n = p0.max(1) as usize;
                 let row = self.cursor_row;
                 let col = self.cursor_col;
-                if row < self.rows {
-                    for _ in 0..n {
-                        if col < self.grid[row].len() {
-                            self.grid[row][col..].rotate_left(1);
-                            if let Some(last) = self.grid[row].last_mut() {
-                                *last = Cell::default();
-                            }
-                        }
+                if row < self.grid.len() && col < self.grid[row].len() {
+                    let row_len = self.grid[row].len();
+                    let remaining = row_len - col;
+                    let count = n.min(remaining);
+                    self.grid[row][col..].rotate_left(count);
+                    for cell in &mut self.grid[row][row_len - count..] {
+                        *cell = Cell::default();
                     }
                     Self::normalize_row_cells(&mut self.grid[row]);
                 }
@@ -887,13 +914,13 @@ impl Perform for TerminalState {
                 let n = p0.max(1) as usize;
                 let row = self.cursor_row;
                 let col = self.cursor_col;
-                for _ in 0..n {
-                    if row < self.rows && col < self.cols {
-                        self.grid[row][col..].rotate_right(1);
-                        self.grid[row][col] = Cell::default();
+                if row < self.grid.len() && col < self.grid[row].len() {
+                    let remaining = self.grid[row].len() - col;
+                    let count = n.min(remaining);
+                    self.grid[row][col..].rotate_right(count);
+                    for cell in &mut self.grid[row][col..col + count] {
+                        *cell = Cell::default();
                     }
-                }
-                if row < self.rows {
                     Self::normalize_row_cells(&mut self.grid[row]);
                 }
             }
@@ -970,6 +997,9 @@ impl Perform for TerminalState {
             // Private modes
             (b'?', 'h') => {
                 for &param in &p {
+                    if std::env::var_os("TERM_DEBUG_OSC8").is_some() {
+                        eprintln!("[mode] set ?{param}h");
+                    }
                     match param {
                         1 => self.cursor_keys_app_mode = true,
                         1000 | 1002 | 1003 => self.mouse_tracking = true,
@@ -1022,13 +1052,17 @@ impl Perform for TerminalState {
                 self.do_newline();
             }
             b'M' => {
-                if self.cursor_row <= self.scroll_top {
+                if self.cursor_row == self.scroll_top {
                     self.scroll_down(1);
-                } else {
+                } else if self.cursor_row > 0 {
                     self.cursor_row = self.cursor_row.saturating_sub(1);
                 }
             }
-            b'c' => *self = TerminalState::new(self.cols, self.rows),
+            b'c' => {
+                *self = TerminalState::new(self.cols, self.rows);
+                self.ui_input_changed = true;
+                self.ui_title_changed = true;
+            }
             _ => {}
         }
     }
@@ -1042,8 +1076,11 @@ impl Perform for TerminalState {
                 if params.len() >= 2
                     && let Ok(s) = std::str::from_utf8(params[1])
                     && s.len() <= OSC_STRING_MAX
+                    && self.title != s
                 {
-                    self.title = s.to_string();
+                    self.title.clear();
+                    self.title.push_str(s);
+                    self.ui_title_changed = true;
                 }
             }
             b"7" => {
@@ -1061,8 +1098,9 @@ impl Perform for TerminalState {
                     .and_then(|s| s.split_once('/').map(|x| x.1))
                     .map(|s| format!("/{s}"))
                     .unwrap_or(content);
-                if !path.is_empty() {
+                if !path.is_empty() && self.current_dir != path {
                     self.current_dir = path;
+                    self.ui_title_changed = true;
                 }
             }
             b"52" => {
@@ -1088,12 +1126,19 @@ impl Perform for TerminalState {
                     return;
                 }
                 // \x1c (ASCII 28, FS) separates buffer from cursor position
-                if let Some(sep) = content.find('\x1c') {
-                    self.input_buffer = content[..sep].to_string();
-                    self.input_cursor = content[sep + 1..].parse().unwrap_or(0);
+                let (input_buffer, input_cursor) = if let Some(sep) = content.find('\x1c') {
+                    (
+                        content[..sep].to_string(),
+                        content[sep + 1..].parse().unwrap_or(0),
+                    )
                 } else {
-                    self.input_buffer = content;
-                    self.input_cursor = self.input_buffer.len();
+                    let cursor = content.len();
+                    (content, cursor)
+                };
+                if self.input_buffer != input_buffer || self.input_cursor != input_cursor {
+                    self.input_buffer = input_buffer;
+                    self.input_cursor = input_cursor;
+                    self.ui_input_changed = true;
                 }
             }
             b"8" => {
@@ -1101,6 +1146,12 @@ impl Perform for TerminalState {
                 // vte splits on ";": params[0]="8", params[1]=param_str, params[2]=uri
                 if params.len() >= 3 {
                     if let Ok(uri) = std::str::from_utf8(params[2]) {
+                        // TERM_DEBUG_OSC8=1 dumps every OSC 8 URI to stderr so
+                        // it's easy to tell whether an app is actually emitting
+                        // hyperlinks and, if so, what scheme they use.
+                        if std::env::var_os("TERM_DEBUG_OSC8").is_some() {
+                            eprintln!("[osc8] uri={uri:?} params[1]={:?}", params.get(1));
+                        }
                         if uri.is_empty() {
                             self.current_link_id = 0;
                         } else if uri.len() <= OSC_STRING_MAX
@@ -2799,6 +2850,31 @@ mod tests {
         assert_eq!(t.state.cursor_col, 0);
     }
 
+    #[test]
+    fn relative_cursor_motion_ignores_scroll_region_without_origin_mode() {
+        let mut t = t(10, 8);
+        t.process(b"\x1b[3;5r");
+        t.process(b"\x1b[4;1H\x1b[100A");
+        assert_eq!(t.state.cursor_row, 0);
+        t.process(b"\x1b[4;1H\x1b[100B");
+        assert_eq!(t.state.cursor_row, 7);
+    }
+
+    #[test]
+    fn newline_below_scroll_region_advances_without_scrolling_region() {
+        let mut t = t(5, 8);
+        for row in 0..8u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;5r\x1b[6;1H\n");
+
+        assert_eq!(t.state.cursor_row, 6);
+        assert_eq!(ch(&t, 2, 0), 'C');
+        assert_eq!(ch(&t, 3, 0), 'D');
+        assert_eq!(ch(&t, 4, 0), 'E');
+    }
+
     // ── OSC handlers ─────────────────────────────────────────────────────────
 
     #[test]
@@ -2806,6 +2882,31 @@ mod tests {
         let mut t = t(80, 24);
         t.process(b"\x1b]0;hello world\x07");
         assert_eq!(t.state.title, "hello world");
+    }
+
+    #[test]
+    fn ui_change_flags_only_report_changed_shell_metadata() {
+        let mut t = t(80, 24);
+        assert_eq!(t.state.take_ui_changes(), (false, false));
+
+        t.process(b"\x1b]0;hello world\x07");
+        assert_eq!(t.state.take_ui_changes(), (false, true));
+        assert_eq!(t.state.take_ui_changes(), (false, false));
+
+        t.process(b"\x1b]0;hello world\x07");
+        assert_eq!(t.state.take_ui_changes(), (false, false));
+
+        t.process(b"\x1b]9001;git status\x1c10\x07");
+        assert_eq!(t.state.take_ui_changes(), (true, false));
+        t.process(b"\x1b]9001;git status\x1c10\x07");
+        assert_eq!(t.state.take_ui_changes(), (false, false));
+    }
+
+    #[test]
+    fn hard_reset_invalidates_host_ui_metadata() {
+        let mut t = t(80, 24);
+        t.process(b"\x1bc");
+        assert_eq!(t.state.take_ui_changes(), (true, true));
     }
 
     #[test]
@@ -3425,6 +3526,52 @@ mod tests {
         assert_eq!(ch(&t, 7, 0), 'H');
     }
 
+    #[test]
+    fn line_edits_outside_scroll_region_are_ignored() {
+        let mut t = t(5, 6);
+        for row in 0..6u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;5r\x1b[2;1H\x1b[2L\x1b[2M");
+        for row in 0..6u8 {
+            assert_eq!(ch(&t, row as usize, 0), (b'A' + row) as char);
+        }
+    }
+
+    #[test]
+    fn large_character_edit_counts_clamp_to_remaining_row() {
+        let mut delete = t(10, 2);
+        delete.process(b"ABCDEFGHIJ\x1b[1;4H\x1b[65535P");
+        assert_eq!(
+            delete.state.grid[0].iter().map(|c| c.c).collect::<String>(),
+            "ABC       "
+        );
+
+        let mut insert = t(10, 2);
+        insert.process(b"ABCDEFGHIJ\x1b[1;4H\x1b[65535@");
+        assert_eq!(
+            insert.state.grid[0].iter().map(|c| c.c).collect::<String>(),
+            "ABC       "
+        );
+    }
+
+    #[test]
+    fn large_line_edit_count_clamps_to_scroll_region() {
+        let mut t = t(5, 6);
+        for row in 0..6u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[2;4r\x1b[3;1H\x1b[65535L");
+        assert_eq!(ch(&t, 0, 0), 'A');
+        assert_eq!(ch(&t, 1, 0), 'B');
+        assert_eq!(ch(&t, 2, 0), ' ');
+        assert_eq!(ch(&t, 3, 0), ' ');
+        assert_eq!(ch(&t, 4, 0), 'E');
+        assert_eq!(ch(&t, 5, 0), 'F');
+    }
+
     // ── SGR italic / underline ────────────────────────────────────────────────
 
     #[test]
@@ -3623,6 +3770,20 @@ mod tests {
         t.process(b"\x1bM");
         assert_eq!(ch(&t, 0, 0), ' ', "RI at top must insert blank row");
         assert_eq!(ch(&t, 1, 0), 'A', "previous row 0 shifts down");
+    }
+
+    #[test]
+    fn esc_m_above_scroll_top_moves_up_without_scrolling_region() {
+        let mut t = t(5, 6);
+        for row in 0..6u8 {
+            let seq = format!("\x1b[{};1H{}", row + 1, (b'A' + row) as char);
+            t.process(seq.as_bytes());
+        }
+        t.process(b"\x1b[3;5r\x1b[2;1H\x1bM");
+        assert_eq!(t.state.cursor_row, 0);
+        assert_eq!(ch(&t, 2, 0), 'C');
+        assert_eq!(ch(&t, 3, 0), 'D');
+        assert_eq!(ch(&t, 4, 0), 'E');
     }
 
     // ── ESC c (hard reset) ────────────────────────────────────────────────────

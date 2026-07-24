@@ -30,11 +30,11 @@ pub struct SavedSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedWindow {
-    /// Outer-frame top-left in logical screen coordinates. `None` when winit
+    /// Outer-frame top-left in physical screen coordinates. `None` when winit
     /// couldn't report a position (rare).
     pub outer_x: Option<i32>,
     pub outer_y: Option<i32>,
-    /// Inner-size in logical pixels.
+    /// Inner-size in physical pixels.
     pub inner_w: u32,
     pub inner_h: u32,
     pub split: Option<SavedSplit>,

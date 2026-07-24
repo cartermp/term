@@ -45,6 +45,23 @@ enum SplitDir {
     Horizontal,
 }
 
+fn terminal_window_attributes(saved: Option<&session::SavedWindow>) -> WindowAttributes {
+    let mut attrs = WindowAttributes::default()
+        .with_title("term")
+        .with_transparent(true)
+        .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+    if let Some(saved) = saved {
+        attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(
+            saved.inner_w.max(1),
+            saved.inner_h.max(1),
+        ));
+        if let (Some(x), Some(y)) = (saved.outer_x, saved.outer_y) {
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
+    }
+    attrs
+}
+
 // ── Selection ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,10 +108,12 @@ struct Pane {
     ghost_text: Option<String>,
     engine: Arc<Engine>,
     selection: Option<Selection>,
-    /// Cached URL scan result. Keyed on (generation, vis_rows, vis_cols) so
-    /// we only re-scan when terminal content or viewport dimensions change.
+    /// Cached URL scan result. Keyed on terminal generation, viewport offset,
+    /// and visible dimensions so scrolling cannot reuse links from another
+    /// section of scrollback.
     url_cache: Vec<(usize, usize, usize, String)>,
     url_cache_gen: u64,
+    url_cache_viewport_offset: usize,
     url_cache_dims: (usize, usize),
 }
 
@@ -109,6 +128,7 @@ impl Pane {
         urls_with_cache(
             &mut self.url_cache,
             &mut self.url_cache_gen,
+            &mut self.url_cache_viewport_offset,
             &mut self.url_cache_dims,
             &self.terminal.state,
             vis_rows,
@@ -197,21 +217,27 @@ fn physical_key_to_ascii(kc: KeyCode) -> Option<u8> {
 
 /// Core URL-cache logic extracted as a free function for testability.
 ///
-/// Checks whether `cache_gen`/`cache_dims` match the current terminal
-/// generation and viewport size.  On a miss the cache is repopulated via
+/// Checks whether the cache key matches the current terminal generation,
+/// viewport position, and size. On a miss the cache is repopulated via
 /// `find_urls`; on a hit it is returned as-is.
 fn urls_with_cache<'a>(
     cache: &'a mut Vec<(usize, usize, usize, String)>,
     cache_gen: &mut u64,
+    cache_viewport_offset: &mut usize,
     cache_dims: &mut (usize, usize),
     state: &terminal::TerminalState,
     vis_rows: usize,
     vis_cols: usize,
 ) -> &'a [(usize, usize, usize, String)] {
     let cur_gen = state.generation;
-    if *cache_gen != cur_gen || *cache_dims != (vis_rows, vis_cols) {
+    let cur_viewport_offset = state.viewport_offset;
+    if *cache_gen != cur_gen
+        || *cache_viewport_offset != cur_viewport_offset
+        || *cache_dims != (vis_rows, vis_cols)
+    {
         *cache = find_urls(state, vis_rows, vis_cols);
         *cache_gen = cur_gen;
+        *cache_viewport_offset = cur_viewport_offset;
         *cache_dims = (vis_rows, vis_cols);
     }
     cache
@@ -484,6 +510,18 @@ impl TerminalWindow {
         &mut self.panes[idx]
     }
 
+    fn set_active_pane(&mut self, index: usize) {
+        let index = index.min(self.panes.len().saturating_sub(1));
+        if index == self.active_pane {
+            return;
+        }
+        self.active_pane = index;
+        self.update_ghost();
+        self.sync_title();
+        self.update_cursor_icon();
+        self.window.request_redraw();
+    }
+
     fn pty_write(&mut self, data: &[u8]) {
         let idx = self.active_pane.min(self.panes.len().saturating_sub(1));
         self.panes[idx].write(data);
@@ -595,9 +633,18 @@ impl TerminalWindow {
 
     fn update_cursor_icon(&mut self) {
         let icon = if self.modifiers.super_key() {
-            let is_url = self
+            let is_clickable = self
                 .pixel_to_pane_cell(self.cursor_pos.0, self.cursor_pos.1)
                 .map(|(pi, row, col)| {
+                    // OSC 8 hyperlink first — apps (e.g. copilot-cli, gh)
+                    // opt into these explicitly, so treat the whole cell run
+                    // as clickable regardless of visible text.
+                    let osc8 =
+                        self.panes[pi].terminal.state.visual_cell(row, col).link_id != 0;
+                    if osc8 {
+                        return true;
+                    }
+                    // Fall back to the auto-detected http/https URL scanner.
                     let rects = self.pane_rects();
                     let (_, _, pw, ph) = rects.get(pi).copied().unwrap_or((0., 0., 0., 0.));
                     let vis_cols = (pw as usize / self.renderer.cell_width).max(1);
@@ -608,7 +655,7 @@ impl TerminalWindow {
                         .any(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
                 })
                 .unwrap_or(false);
-            if is_url {
+            if is_clickable {
                 CursorIcon::Pointer
             } else {
                 CursorIcon::Default
@@ -833,7 +880,7 @@ impl TerminalWindow {
                     if alt {
                         // Cmd+Opt+Left: previous pane
                         if self.panes.len() > 1 {
-                            self.active_pane = self.active_pane.saturating_sub(1);
+                            self.set_active_pane(self.active_pane.saturating_sub(1));
                         }
                         return KeyAction::None;
                     }
@@ -844,7 +891,7 @@ impl TerminalWindow {
                     if alt {
                         // Cmd+Opt+Right: next pane
                         if self.panes.len() > 1 {
-                            self.active_pane = (self.active_pane + 1).min(self.panes.len() - 1);
+                            self.set_active_pane(self.active_pane + 1);
                         }
                         return KeyAction::None;
                     }
@@ -1087,6 +1134,9 @@ struct App {
     /// Session restore payload — set from `--restore-session` at process
     /// start, consumed once by `resumed()` to recreate the saved tabs.
     pending_restore: Option<session::SavedSession>,
+    /// Most recently focused native window, used to preserve the active tab
+    /// across update-driven session restores.
+    focused_window: Option<WindowId>,
     /// Last successful session-file write. Used to throttle the periodic
     /// save inside `about_to_wait()`.
     last_session_save: Instant,
@@ -1106,6 +1156,7 @@ impl App {
             engine: Arc::new(Engine::new()),
             renderer_shareds: HashMap::new(),
             pending_restore,
+            focused_window: None,
             last_session_save: Instant::now(),
         }
     }
@@ -1115,10 +1166,21 @@ impl App {
     /// title from `Pane::title()` (which falls back to CWD).
     fn snapshot(&self) -> session::SavedSession {
         let mut windows = Vec::with_capacity(self.windows.len());
-        // Iteration order over HashMap is non-deterministic; sort by raw id so
-        // saved JSON is stable across saves with no structural change.
+        // HashMap order is non-deterministic. On macOS, preserve the native
+        // tab-bar order so restore recreates tabs in the same sequence.
         let mut ids: Vec<WindowId> = self.windows.keys().copied().collect();
-        ids.sort_by_key(|w| format!("{w:?}"));
+        #[cfg(target_os = "macos")]
+        ids.sort_by_key(|id| {
+            let tab_index = self
+                .windows
+                .get(id)
+                .and_then(|tw| ns_view_ptr(&tw.window))
+                .map(|view| platform::tab_index_and_count(view).0)
+                .unwrap_or(usize::MAX);
+            (tab_index, format!("{id:?}"))
+        });
+        #[cfg(not(target_os = "macos"))]
+        ids.sort_by_key(|id| format!("{id:?}"));
         for id in &ids {
             let tw = match self.windows.get(id) {
                 Some(w) => w,
@@ -1150,7 +1212,9 @@ impl App {
             schema: session::SCHEMA_VERSION,
             term_version: env!("CARGO_PKG_VERSION").to_string(),
             saved_at_ms: session::now_ms(),
-            focused_window: None,
+            focused_window: self
+                .focused_window
+                .and_then(|focused| ids.iter().position(|id| *id == focused)),
             windows,
         }
     }
@@ -1257,16 +1321,6 @@ impl App {
         }
     }
 
-    fn create_pane(
-        &mut self,
-        window_id: WindowId,
-        proxy: &EventLoopProxy<AppEvent>,
-        cols: usize,
-        rows: usize,
-    ) -> Option<Pane> {
-        self.create_pane_in(window_id, proxy, cols, rows, None)
-    }
-
     fn create_pane_in(
         &mut self,
         window_id: WindowId,
@@ -1276,7 +1330,6 @@ impl App {
         cwd: Option<&str>,
     ) -> Option<Pane> {
         let pane_id = self.alloc_pane_id();
-        self.pane_to_window.insert(pane_id, window_id);
 
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -1306,7 +1359,10 @@ impl App {
         }
         setup_shell_env(&mut cmd);
 
-        let _ = pair.slave.spawn_command(cmd);
+        if let Err(e) = pair.slave.spawn_command(cmd) {
+            eprintln!("spawn zsh: {e}");
+            return None;
+        }
         drop(pair.slave);
 
         let mut reader = match pair.master.try_clone_reader() {
@@ -1324,9 +1380,10 @@ impl App {
             }
         };
 
+        self.pane_to_window.insert(pane_id, window_id);
         let proxy_clone = proxy.clone();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -1353,18 +1410,23 @@ impl App {
             selection: None,
             url_cache: Vec::new(),
             url_cache_gen: u64::MAX, // sentinel: force first-use recompute
+            url_cache_viewport_offset: usize::MAX,
             url_cache_dims: (0, 0),
         })
     }
 
     fn open_tab(&mut self, event_loop: &ActiveEventLoop) {
-        self.open_tab_with_cwd(event_loop, None);
+        let _ = self.open_tab_with_saved(event_loop, None);
     }
 
-    fn open_tab_with_cwd(&mut self, event_loop: &ActiveEventLoop, cwd: Option<&str>) {
+    fn open_tab_with_saved(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        saved: Option<&session::SavedWindow>,
+    ) -> Option<(WindowId, bool)> {
         let wgpu = match &self.wgpu {
             Some(w) => w,
-            None => return,
+            None => return None,
         };
 
         // Find an existing window to group with
@@ -1382,10 +1444,7 @@ impl App {
             }
         };
 
-        let mut attrs = WindowAttributes::default()
-            .with_title("term")
-            .with_transparent(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        let mut attrs = terminal_window_attributes(saved);
 
         #[cfg(target_os = "macos")]
         {
@@ -1451,10 +1510,10 @@ impl App {
         };
 
         let proxy = self.proxy.clone();
-        let first_pane = match self.create_pane_in(window_id, &proxy, cols, rows, cwd) {
-            Some(p) => p,
-            None => return,
-        };
+        let cwd = saved
+            .and_then(|window| window.panes.first())
+            .map(|pane| pane.cwd.as_str());
+        let first_pane = self.create_pane_in(window_id, &proxy, cols, rows, cwd)?;
 
         let tw = TerminalWindow {
             window,
@@ -1475,6 +1534,9 @@ impl App {
         };
         tw.sync_title();
         self.windows.insert(window_id, tw);
+        let layout_complete = saved
+            .map(|saved| self.restore_window_layout(window_id, saved))
+            .unwrap_or(true);
 
         // Wire the "+" button after the window is fully set up.
         #[cfg(target_os = "macos")]
@@ -1488,18 +1550,22 @@ impl App {
 
         // Re-number all tab labels now that a new tab has been added.
         self.sync_all_titles();
+        Some((window_id, layout_complete))
     }
 
     fn add_split(&mut self, window_id: WindowId, dir: SplitDir) {
+        let _ = self.add_split_in(window_id, dir, None);
+    }
+
+    fn add_split_in(&mut self, window_id: WindowId, dir: SplitDir, cwd: Option<&str>) -> bool {
         let tw = match self.windows.get_mut(&window_id) {
             Some(w) => w,
-            None => return,
+            None => return false,
         };
         if tw.panes.len() >= 2 {
-            return; // already split
+            return false; // already split
         }
         let idx = tw.panes.len(); // will be 1
-        tw.split = Some(dir);
 
         // Temporarily compute size; we need renderer + window size
         let sz = tw.window.inner_size();
@@ -1521,11 +1587,12 @@ impl App {
         };
 
         let proxy = self.proxy.clone();
-        let new_pane = match self.create_pane(window_id, &proxy, cols, rows) {
+        let new_pane = match self.create_pane_in(window_id, &proxy, cols, rows, cwd) {
             Some(p) => p,
-            None => return,
+            None => return false,
         };
         let tw = self.windows.get_mut(&window_id).unwrap();
+        tw.split = Some(dir);
         tw.panes.push(new_pane);
         tw.active_pane = idx;
 
@@ -1544,6 +1611,37 @@ impl App {
                 });
             }
         }
+        true
+    }
+
+    /// Apply the portion of a saved window that depends on live panes. The
+    /// native window's size and position are applied before creation.
+    fn restore_window_layout(&mut self, window_id: WindowId, saved: &session::SavedWindow) -> bool {
+        let mut complete = true;
+        match (saved.split, saved.panes.get(1)) {
+            (Some(saved_split), Some(second)) => {
+                let split = match saved_split {
+                    session::SavedSplit::Vertical => SplitDir::Vertical,
+                    session::SavedSplit::Horizontal => SplitDir::Horizontal,
+                };
+                complete = self.add_split_in(window_id, split, Some(second.cwd.as_str()));
+            }
+            (None, None) => {}
+            _ => complete = false,
+        }
+
+        if let Some(tw) = self.windows.get_mut(&window_id) {
+            for (pane, saved_pane) in tw.panes.iter_mut().zip(&saved.panes) {
+                pane.terminal.state.title = saved_pane.title.clone();
+            }
+            tw.active_pane = saved.active_pane.min(tw.panes.len().saturating_sub(1));
+            tw.sync_title();
+            tw.window.request_redraw();
+            complete &= tw.panes.len() == saved.panes.len().max(1);
+        } else {
+            complete = false;
+        }
+        complete
     }
 
     fn close_pane_or_window(&mut self, window_id: WindowId, event_loop: &ActiveEventLoop) {
@@ -1579,6 +1677,9 @@ impl App {
                     pixel_height: sz.height as u16,
                 });
             }
+            tw.update_ghost();
+            tw.sync_title();
+            tw.window.request_redraw();
         }
     }
 
@@ -1587,6 +1688,9 @@ impl App {
             for pane in &tw.panes {
                 self.pane_to_window.remove(&pane.id);
             }
+        }
+        if self.focused_window == Some(window_id) {
+            self.focused_window = None;
         }
         if self.windows.is_empty() {
             event_loop.exit();
@@ -1613,11 +1717,13 @@ impl ApplicationHandler<AppEvent> for App {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
+        let first_saved = self
+            .pending_restore
+            .as_ref()
+            .and_then(|saved| saved.windows.first())
+            .cloned();
 
-        let mut attrs = WindowAttributes::default()
-            .with_title("term")
-            .with_transparent(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        let mut attrs = terminal_window_attributes(first_saved.as_ref());
 
         #[cfg(target_os = "macos")]
         {
@@ -1736,17 +1842,10 @@ impl ApplicationHandler<AppEvent> for App {
             )
         };
 
-        // CWD for the first (default) window when restoring a session. The
-        // remaining tabs are restored after `resumed()` returns, by calling
-        // `open_tab_with_cwd` for each — kept owned so the &str lives long
-        // enough.
-        let restore_first_cwd: Option<String> = self
-            .pending_restore
+        let cwd = first_saved
             .as_ref()
-            .and_then(|s| s.windows.first())
-            .and_then(|w| w.panes.first())
-            .map(|p| p.cwd.clone());
-        let cwd: Option<&str> = restore_first_cwd.as_deref();
+            .and_then(|saved| saved.panes.first())
+            .map(|pane| pane.cwd.as_str());
 
         let proxy = self.proxy.clone();
         let first_pane = match self.create_pane_in(window_id, &proxy, cols, rows, cwd) {
@@ -1773,6 +1872,9 @@ impl ApplicationHandler<AppEvent> for App {
         };
         tw.sync_title();
         self.windows.insert(window_id, tw);
+        let first_layout_complete = first_saved
+            .as_ref()
+            .is_none_or(|saved| self.restore_window_layout(window_id, saved));
 
         // Wire the "+" button after the window is fully set up.
         #[cfg(target_os = "macos")]
@@ -1787,22 +1889,38 @@ impl ApplicationHandler<AppEvent> for App {
         // Re-number all tab labels now that a new tab has been added.
         self.sync_all_titles();
 
-        // Restore additional tabs from a `--restore-session` payload. The
-        // first saved window already drove the default-window CWD above;
-        // here we replay every subsequent saved window as a fresh tab.
+        // Restore additional tabs from a `--restore-session` payload. Keep
+        // window ids aligned with the saved array so the focused tab can be
+        // reactivated after every pane has been created.
         if let Some(saved) = self.pending_restore.take() {
-            let extra_cwds: Vec<String> = saved
-                .windows
-                .iter()
-                .skip(1)
-                .filter_map(|w| w.panes.first().map(|p| p.cwd.clone()))
-                .collect();
-            for c in &extra_cwds {
-                self.open_tab_with_cwd(event_loop, Some(c.as_str()));
+            let mut restored_ids = Vec::with_capacity(saved.windows.len());
+            if !saved.windows.is_empty() {
+                restored_ids.push(Some(window_id));
             }
-            // Best-effort: drop the file after we successfully restored from
-            // it so a normal next launch starts fresh.
-            session::clear();
+            let mut restore_complete = first_layout_complete;
+            for saved_window in saved.windows.iter().skip(1) {
+                let restored = self.open_tab_with_saved(event_loop, Some(saved_window));
+                restore_complete &= restored
+                    .as_ref()
+                    .is_some_and(|(_, layout_complete)| *layout_complete);
+                restored_ids.push(restored.map(|(id, _)| id));
+            }
+            if let Some(focused) = saved
+                .focused_window
+                .and_then(|index| restored_ids.get(index))
+                .copied()
+                .flatten()
+            {
+                if let Some(tw) = self.windows.get(&focused) {
+                    tw.window.focus_window();
+                }
+                self.focused_window = Some(focused);
+            }
+            // Drop the file only after all recorded panes were recreated. A
+            // partial failure leaves it available for a later retry.
+            if restore_complete {
+                session::clear();
+            }
         }
     }
 
@@ -1821,6 +1939,7 @@ impl ApplicationHandler<AppEvent> for App {
             // after a drag-reorder because macOS activates the moved tab.
             WindowEvent::Focused(focused) => {
                 if focused {
+                    self.focused_window = Some(window_id);
                     self.sync_all_titles();
                 }
                 // Send focus-in / focus-out to the active pane if ?1004h is on.
@@ -2051,7 +2170,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if !opened {
                         // Activate pane under cursor
                         if let Some(pi) = tw.pane_at_pixel(mx, my) {
-                            tw.active_pane = pi;
+                            tw.set_active_pane(pi);
                         }
                         // Start selection
                         tw.panes[tw.active_pane].selection = None;
@@ -2193,6 +2312,8 @@ impl ApplicationHandler<AppEvent> for App {
                     Some(w) => w,
                     None => return,
                 };
+                let mut input_changed = false;
+                let mut title_changed = false;
                 if let Some(pane) = tw.panes.iter_mut().find(|p| p.id == pane_id) {
                     if !pane.terminal.state.is_scrolled_back() {
                         pane.terminal.state.snap_to_bottom();
@@ -2213,15 +2334,23 @@ impl ApplicationHandler<AppEvent> for App {
                         &mut pane.terminal.state,
                         clipboard_payload.as_deref().unwrap_or(""),
                     );
+                    (input_changed, title_changed) = pane.terminal.state.take_ui_changes();
+                    let has_responses = !responses.is_empty();
                     for r in responses {
                         let _ = pane.pty_writer.write_all(&r);
+                    }
+                    if has_responses {
                         let _ = pane.pty_writer.flush();
                     }
                 }
-                // Update ghost text for active pane
+                // Shell metadata changes are sparse compared with PTY output.
                 if tw.panes.get(tw.active_pane).map(|p| p.id) == Some(pane_id) {
-                    tw.update_ghost();
-                    tw.sync_title();
+                    if input_changed {
+                        tw.update_ghost();
+                    }
+                    if title_changed {
+                        tw.sync_title();
+                    }
                 }
                 tw.reset_blink();
                 // Only redraw immediately if synchronized-output mode is off.
@@ -2255,6 +2384,8 @@ impl ApplicationHandler<AppEvent> for App {
                             tw.panes.remove(pos);
                             tw.active_pane = tw.active_pane.min(tw.panes.len() - 1);
                             tw.split = None;
+                            tw.update_ghost();
+                            tw.sync_title();
                             tw.window.request_redraw();
                             false
                         }
@@ -2443,7 +2574,7 @@ fn build_shell_bootstrap_files(home: &str, tools: &ShellTools) -> ShellBootstrap
 
     let cat_fn = match tools.tcat.as_ref() {
         Some(path) => format!(
-            "_TCAT='{}'\nfunction cat() {{\n  if [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
+            "_TCAT='{}'\nfunction cat() {{\n  if [[ -t 1 ]] && [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
             sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
@@ -2923,6 +3054,53 @@ mod tests {
         assert_eq!(sh_sq_escape("'"), "'\\''");
     }
 
+    #[test]
+    fn saved_window_geometry_uses_physical_size_and_position() {
+        let saved = session::SavedWindow {
+            outer_x: Some(120),
+            outer_y: Some(240),
+            inner_w: 960,
+            inner_h: 640,
+            split: None,
+            panes: Vec::new(),
+            active_pane: 0,
+        };
+        let attrs = terminal_window_attributes(Some(&saved));
+        assert_eq!(
+            attrs.inner_size,
+            Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
+                960, 640
+            )))
+        );
+        assert_eq!(
+            attrs.position,
+            Some(winit::dpi::Position::Physical(
+                winit::dpi::PhysicalPosition::new(120, 240)
+            ))
+        );
+    }
+
+    #[test]
+    fn saved_window_geometry_ignores_partial_position_and_clamps_zero_size() {
+        let saved = session::SavedWindow {
+            outer_x: Some(120),
+            outer_y: None,
+            inner_w: 0,
+            inner_h: 0,
+            split: None,
+            panes: Vec::new(),
+            active_pane: 0,
+        };
+        let attrs = terminal_window_attributes(Some(&saved));
+        assert_eq!(
+            attrs.inner_size,
+            Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
+                1, 1
+            )))
+        );
+        assert_eq!(attrs.position, None);
+    }
+
     // ── URL cache (urls_with_cache) ───────────────────────────────────────────
 
     fn make_state_with_url(url: &str) -> TerminalState {
@@ -2940,11 +3118,21 @@ mod tests {
         state.generation = 1;
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX; // sentinel — forces initial miss
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0usize, 0usize);
-        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        let result = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].3, "https://example.com");
         assert_eq!(cache_gen, 1);
+        assert_eq!(cache_viewport_offset, 0);
         assert_eq!(cache_dims, (1, 30));
     }
 
@@ -2954,15 +3142,32 @@ mod tests {
         state.generation = 5;
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0, 0);
         // First call — populates cache.
-        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         // Corrupt the state grid so a fresh scan would return nothing.
         for cell in &mut state.grid[0] {
             cell.c = ' ';
         }
         // Second call with same generation + dims — must return cached value.
-        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        let result = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         assert_eq!(
             result.len(),
             1,
@@ -2976,15 +3181,32 @@ mod tests {
         state.generation = 1;
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0, 0);
-        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         assert_eq!(cache.len(), 1);
         // Bump generation and clear the grid — rescan should return empty.
         state.generation = 2;
         for cell in &mut state.grid[0] {
             cell.c = ' ';
         }
-        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        let result = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         assert_eq!(result.len(), 0, "stale generation must trigger rescan");
         assert_eq!(cache_gen, 2);
     }
@@ -2995,10 +3217,27 @@ mod tests {
         state.generation = 1;
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0, 0);
-        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         // Same generation, different vis_rows — must rescan.
-        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 2, 30);
+        let result = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            2,
+            30,
+        );
         assert_eq!(cache_dims, (2, 30), "dims must update after miss");
         let _ = result; // result correctness verified elsewhere
     }
@@ -3009,10 +3248,66 @@ mod tests {
         state.generation = 1;
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0, 0);
-        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
-        urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 40);
+        urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
+        urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            40,
+        );
         assert_eq!(cache_dims, (1, 40));
+    }
+
+    #[test]
+    fn url_cache_miss_on_viewport_offset_change() {
+        let mut state = make_state_with_url("https://live.example");
+        let mut scrollback_row = vec![terminal::Cell::default(); state.cols];
+        for (i, c) in "https://history.test".chars().enumerate() {
+            scrollback_row[i].c = c;
+        }
+        state.scrollback.push_back(scrollback_row);
+        state.generation = 7;
+
+        let mut cache = Vec::new();
+        let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
+        let mut cache_dims = (0, 0);
+        let live = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            state.cols,
+        );
+        assert_eq!(live[0].3, "https://live.example");
+
+        state.viewport_offset = 1;
+        let history = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            state.cols,
+        );
+        assert_eq!(history[0].3, "https://history.test");
+        assert_eq!(cache_viewport_offset, 1);
     }
 
     #[test]
@@ -3022,8 +3317,17 @@ mod tests {
         // state.generation == 0 (default)
         let mut cache = Vec::new();
         let mut cache_gen = u64::MAX;
+        let mut cache_viewport_offset = usize::MAX;
         let mut cache_dims = (0, 0);
-        let result = urls_with_cache(&mut cache, &mut cache_gen, &mut cache_dims, &state, 1, 30);
+        let result = urls_with_cache(
+            &mut cache,
+            &mut cache_gen,
+            &mut cache_viewport_offset,
+            &mut cache_dims,
+            &state,
+            1,
+            30,
+        );
         assert_eq!(cache_gen, 0, "sentinel must be replaced after first call");
         let _ = result;
     }
@@ -3251,6 +3555,11 @@ mod tests {
         );
         assert!(files.zshrc.contains("_TJSON='/tmp/O'\\''Brien/bin/tjson'"));
         assert!(files.zshrc.contains("function cat()"));
+        assert!(
+            files
+                .zshrc
+                .contains("if [[ -t 1 ]] && [ $# -ge 1 ] && [ -f \"$1\" ]")
+        );
         assert!(files.zshrc.contains("function json()"));
         assert!(files.zshrc.contains("function git()"));
         assert!(files.zshrc.contains("command git log --reverse"));
