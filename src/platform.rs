@@ -511,14 +511,13 @@ pub fn confirm_update_install(current_version: &str, latest_version: &str) -> bo
 #[cfg(target_os = "macos")]
 pub fn clipboard_png() -> Option<Vec<u8>> {
     use objc2::{class, msg_send, runtime::AnyObject};
-    use std::os::raw::c_char;
     unsafe {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
 
         // Try PNG directly.
         let png_type: *mut AnyObject = msg_send![
             class!(NSString),
-            stringWithUTF8String: b"public.png\0".as_ptr() as *const c_char
+            stringWithUTF8String: c"public.png".as_ptr()
         ];
         let data: *mut AnyObject = msg_send![pb, dataForType: png_type];
         if !data.is_null() {
@@ -532,7 +531,7 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
         // Try TIFF (screenshots, most copy-as-image operations on macOS).
         let tiff_type: *mut AnyObject = msg_send![
             class!(NSString),
-            stringWithUTF8String: b"public.tiff\0".as_ptr() as *const c_char
+            stringWithUTF8String: c"public.tiff".as_ptr()
         ];
         let tiff_data: *mut AnyObject = msg_send![pb, dataForType: tiff_type];
         if tiff_data.is_null() {
@@ -584,7 +583,7 @@ pub fn clipboard_text() -> Option<String> {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         let str_type: *mut AnyObject = msg_send![
             class!(NSString),
-            stringWithUTF8String: b"public.utf8-plain-text\0".as_ptr() as *const c_char
+            stringWithUTF8String: c"public.utf8-plain-text".as_ptr()
         ];
         let ns_str: *mut AnyObject = msg_send![pb, stringForType: str_type];
         if ns_str.is_null() {

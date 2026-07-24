@@ -345,9 +345,7 @@ fn shape_run_impl(face: &rustybuzz::Face<'_>, chars: &[char]) -> Vec<ShapedGlyph
     // Build a byte-offset → char-index mapping for the UTF-8 string.
     let mut byte_to_char = vec![0usize; text.len() + 1];
     for (char_idx, (byte_off, c)) in text.char_indices().enumerate() {
-        for b in byte_off..byte_off + c.len_utf8() {
-            byte_to_char[b] = char_idx;
-        }
+        byte_to_char[byte_off..byte_off + c.len_utf8()].fill(char_idx);
     }
     byte_to_char[text.len()] = chars.len();
 
@@ -357,11 +355,11 @@ fn shape_run_impl(face: &rustybuzz::Face<'_>, chars: &[char]) -> Vec<ShapedGlyph
     let infos = output.glyph_infos();
 
     let mut result = Vec::with_capacity(infos.len());
-    for i in 0..infos.len() {
-        let cluster_byte = infos[i].cluster as usize;
+    for info in infos {
+        let cluster_byte = info.cluster as usize;
         let char_idx = byte_to_char[cluster_byte.min(text.len())];
         result.push(ShapedGlyph {
-            glyph_id: infos[i].glyph_id as u16,
+            glyph_id: info.glyph_id as u16,
             char_idx,
         });
     }
@@ -474,10 +472,10 @@ fn lookup_cached_row_ops<F>(
 where
     F: FnOnce() -> Vec<GlyphOp>,
 {
-    if let Some(entry) = cache.get(&slot) {
-        if entry.key == key {
-            return entry.ops.clone();
-        }
+    if let Some(entry) = cache.get(&slot)
+        && entry.key == key
+    {
+        return entry.ops.clone();
     }
 
     let ops = compute();
@@ -1211,7 +1209,7 @@ impl Renderer {
                 // cached shaping results when the visible row signature matches.
                 let glyph_ops = self.compute_row_glyph_ops(pane.state, row, vis_cols);
 
-                for col in 0..vis_cols {
+                for (col, glyph_op) in glyph_ops.iter().enumerate().take(vis_cols) {
                     let cell = pane.state.visual_cell(row, col);
                     let mut fg_color = cell.attrs.fg;
                     let mut bg_color = cell.attrs.bg;
@@ -1243,7 +1241,7 @@ impl Renderer {
 
                     let fg = c2f(fg_color);
                     let c = cell.c;
-                    match glyph_ops[col] {
+                    match *glyph_op {
                         GlyphOp::Skip => {}
                         GlyphOp::Block => {
                             // Block chars can't participate in ligatures; skip
@@ -1290,16 +1288,16 @@ impl Renderer {
             }
 
             // ── Ghost text ────────────────────────────────────────────────────────
-            if !pane.state.is_scrolled_back() {
-                if let Some(g) = pane.ghost {
-                    let py = oy + pane.state.cursor_row as f32 * ch;
-                    for (i, c) in g.chars().enumerate() {
-                        let col = pane.state.cursor_col + i;
-                        if col >= vis_cols {
-                            break;
-                        }
-                        self.emit_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
+            if !pane.state.is_scrolled_back()
+                && let Some(g) = pane.ghost
+            {
+                let py = oy + pane.state.cursor_row as f32 * ch;
+                for (i, c) in g.chars().enumerate() {
+                    let col = pane.state.cursor_col + i;
+                    if col >= vis_cols {
+                        break;
                     }
+                    self.emit_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
                 }
             }
 
@@ -1790,8 +1788,8 @@ mod tests {
             "col 0 with 'A' must produce Glyph, got Skip/Block"
         );
         // Remaining cols were not written → Skip.
-        for i in 1..10 {
-            assert!(matches!(ops[i], GlyphOp::Skip), "col {i} must be Skip");
+        for (i, op) in ops.iter().enumerate().take(10).skip(1) {
+            assert!(matches!(*op, GlyphOp::Skip), "col {i} must be Skip");
         }
     }
 

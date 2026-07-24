@@ -351,7 +351,7 @@ fn mouse_wheel_action(
             let cy = (32 + row1).min(255) as u8;
             vec![0x1b, b'[', b'M', cb, cx, cy]
         };
-        return MouseWheelAction::PtyWrites(std::iter::repeat(seq).take(count).collect());
+        return MouseWheelAction::PtyWrites(std::iter::repeat_n(seq, count).collect());
     }
 
     if state.is_alt_screen() {
@@ -361,9 +361,7 @@ fn mouse_wheel_action(
             b"\x1bOB".to_vec()
         };
         return MouseWheelAction::PtyWrites(
-            std::iter::repeat(seq)
-                .take(lines.unsigned_abs() as usize)
-                .collect(),
+            std::iter::repeat_n(seq, lines.unsigned_abs() as usize).collect(),
         );
     }
 
@@ -406,7 +404,7 @@ fn drain_terminal_host_responses(
 fn ns_view_ptr(window: &winit::window::Window) -> Option<*mut std::ffi::c_void> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match window.window_handle().ok()?.as_raw() {
-        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr() as *mut std::ffi::c_void),
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
         _ => None,
     }
 }
@@ -639,8 +637,7 @@ impl TerminalWindow {
                     // OSC 8 hyperlink first — apps (e.g. copilot-cli, gh)
                     // opt into these explicitly, so treat the whole cell run
                     // as clickable regardless of visible text.
-                    let osc8 =
-                        self.panes[pi].terminal.state.visual_cell(row, col).link_id != 0;
+                    let osc8 = self.panes[pi].terminal.state.visual_cell(row, col).link_id != 0;
                     if osc8 {
                         return true;
                     }
@@ -685,13 +682,12 @@ impl TerminalWindow {
                 }
                 return;
             }
-            if let Some(text) = platform::clipboard_text() {
-                if !text.is_empty() {
-                    let bracketed = self.active().terminal.state.bracketed_paste;
-                    let payload = wrap_bracketed_paste(text.as_bytes(), bracketed);
-                    self.pty_write(&payload);
-                }
-                return;
+            if let Some(text) = platform::clipboard_text()
+                && !text.is_empty()
+            {
+                let bracketed = self.active().terminal.state.bracketed_paste;
+                let payload = wrap_bracketed_paste(text.as_bytes(), bracketed);
+                self.pty_write(&payload);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -866,11 +862,9 @@ impl TerminalWindow {
                     | NamedKey::CapsLock
             )
         );
-        if !is_cmd_c && !is_modifier_only {
-            if self.panes[self.active_pane].selection.is_some() {
-                self.panes[self.active_pane].selection = None;
-                self.window.request_redraw();
-            }
+        if !is_cmd_c && !is_modifier_only && self.panes[self.active_pane].selection.is_some() {
+            self.panes[self.active_pane].selection = None;
+            self.window.request_redraw();
         }
 
         // ── Cmd chords ────────────────────────────────────────────────────────
@@ -1086,10 +1080,10 @@ impl TerminalWindow {
                 }
             }
             Key::Character(_) if alt => {
-                if let PhysicalKey::Code(kc) = event.physical_key {
-                    if let Some(ascii) = physical_key_to_ascii(kc) {
-                        self.pty_write(&[0x1b, ascii]);
-                    }
+                if let PhysicalKey::Code(kc) = event.physical_key
+                    && let Some(ascii) = physical_key_to_ascii(kc)
+                {
+                    self.pty_write(&[0x1b, ascii]);
                 }
             }
             _ => {}
@@ -1143,7 +1137,10 @@ struct App {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<AppEvent>, pending_restore: Option<session::SavedSession>) -> Self {
+    fn new(
+        proxy: EventLoopProxy<AppEvent>,
+        pending_restore: Option<session::SavedSession>,
+    ) -> Self {
         Self {
             wgpu: None,
             windows: HashMap::new(),
@@ -2002,31 +1999,28 @@ impl ApplicationHandler<AppEvent> for App {
                             tw.window.request_redraw();
                         }
                     }
-                    KeyAction::PrevTab =>
-                    {
+                    KeyAction::PrevTab => {
                         #[cfg(target_os = "macos")]
-                        if let Some(tw) = self.windows.get(&window_id) {
-                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
-                                platform::select_prev_tab(ns_view);
-                            }
+                        if let Some(tw) = self.windows.get(&window_id)
+                            && let Some(ns_view) = ns_view_ptr(&tw.window)
+                        {
+                            platform::select_prev_tab(ns_view);
                         }
                     }
-                    KeyAction::NextTab =>
-                    {
+                    KeyAction::NextTab => {
                         #[cfg(target_os = "macos")]
-                        if let Some(tw) = self.windows.get(&window_id) {
-                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
-                                platform::select_next_tab(ns_view);
-                            }
+                        if let Some(tw) = self.windows.get(&window_id)
+                            && let Some(ns_view) = ns_view_ptr(&tw.window)
+                        {
+                            platform::select_next_tab(ns_view);
                         }
                     }
-                    KeyAction::SelectTab(n) =>
-                    {
+                    KeyAction::SelectTab(n) => {
                         #[cfg(target_os = "macos")]
-                        if let Some(tw) = self.windows.get(&window_id) {
-                            if let Some(ns_view) = ns_view_ptr(&tw.window) {
-                                platform::select_tab_at_index(ns_view, n);
-                            }
+                        if let Some(tw) = self.windows.get(&window_id)
+                            && let Some(ns_view) = ns_view_ptr(&tw.window)
+                        {
+                            platform::select_tab_at_index(ns_view, n);
                         }
                     }
                     KeyAction::SplitVertical => {
@@ -2066,8 +2060,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     let vis_cols = (pw as usize / tw.renderer.cell_width).max(1);
                                     let vis_rows = (ph as usize / tw.renderer.cell_height).max(1);
                                     let vo = tw.panes[ai].terminal.state.viewport_offset as i64;
-                                    let col =
-                                        ((position.x - ox as f64).max(0.) / cw as f64) as usize;
+                                    let col = ((position.x - ox as f64).max(0.) / cw) as usize;
                                     let col = col.min(vis_cols.saturating_sub(1));
                                     if position.y < oy as f64 {
                                         Some((ai, -vo, col))
@@ -2243,7 +2236,9 @@ impl ApplicationHandler<AppEvent> for App {
         // Cheap periodic snapshot of the layout so a sudden SIGTERM from the
         // updater never loses more than ~30 s of state changes. Heavy lifting
         // is in save_session_now(); here we just gate on the interval.
-        if !self.windows.is_empty() && now.duration_since(self.last_session_save) >= SESSION_SAVE_PERIOD {
+        if !self.windows.is_empty()
+            && now.duration_since(self.last_session_save) >= SESSION_SAVE_PERIOD
+        {
             self.save_session_now();
         }
 
@@ -2434,12 +2429,12 @@ fn osc52_clipboard_payload() -> String {
         if let Some(png) = platform::clipboard_png() {
             return base64_encode(&png);
         }
-        if let Some(text) = platform::clipboard_text() {
-            if !text.is_empty() {
-                return base64_encode(text.as_bytes());
-            }
+        if let Some(text) = platform::clipboard_text()
+            && !text.is_empty()
+        {
+            return base64_encode(text.as_bytes());
         }
-        return String::new();
+        String::new()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2453,7 +2448,7 @@ fn osc52_clipboard_payload() -> String {
 
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
         let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };

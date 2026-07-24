@@ -479,13 +479,13 @@ mod tests {
 
     #[test]
     fn test_reset_sequence() {
-        let out = capture(|b| reset(b));
+        let out = capture(reset);
         assert_eq!(out, "\x1b[0m");
     }
 
     #[test]
     fn test_bold_sequence() {
-        let out = capture(|b| bold(b));
+        let out = capture(bold);
         assert_eq!(out, "\x1b[1m");
     }
 
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_print_footer_contains_corner() {
-        let out = capture(|b| print_footer(b));
+        let out = capture(print_footer);
         assert!(out.contains("╰─"), "footer corner missing: {out:?}");
     }
 

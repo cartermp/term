@@ -82,16 +82,15 @@ fn process_line(
 ) {
     let trimmed = line.trim();
 
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                match print_highlighted(out, &pretty, ps, syntax, theme) {
-                    Ok(()) => return,
-                    Err(_) => {
-                        *drain = true;
-                        return;
-                    }
-                }
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Ok(pretty) = serde_json::to_string_pretty(&val)
+    {
+        match print_highlighted(out, &pretty, ps, syntax, theme) {
+            Ok(()) => return,
+            Err(_) => {
+                *drain = true;
+                return;
             }
         }
     }

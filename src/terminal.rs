@@ -539,10 +539,8 @@ impl TerminalState {
                 continue;
             }
 
-            if row[col].is_wide_continuation() {
-                if col == 0 || !row[col - 1].wide {
-                    row[col] = Cell::default();
-                }
+            if row[col].is_wide_continuation() && (col == 0 || !row[col - 1].wide) {
+                row[col] = Cell::default();
             }
 
             col += 1;
@@ -1185,6 +1183,31 @@ impl TerminalState {
         self.mouse_sgr = false;
         self.insert_mode = false;
         self.wrap_next = false;
+    }
+}
+
+pub struct Terminal {
+    parser: vte::Parser,
+    pub state: TerminalState,
+}
+
+impl Terminal {
+    pub fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            parser: vte::Parser::new(),
+            state: TerminalState::new(cols, rows),
+        }
+    }
+
+    pub fn process(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.parser.advance(&mut self.state, b);
+        }
+        self.state.generation = self.state.generation.wrapping_add(1);
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.state.resize(cols, rows);
     }
 }
 
@@ -4654,30 +4677,5 @@ mod tests {
         let mut t = Terminal::new(80, 24);
         t.process(b"\x1b[?1000l");
         assert!(!t.state.mouse_tracking);
-    }
-}
-
-pub struct Terminal {
-    parser: vte::Parser,
-    pub state: TerminalState,
-}
-
-impl Terminal {
-    pub fn new(cols: usize, rows: usize) -> Self {
-        Self {
-            parser: vte::Parser::new(),
-            state: TerminalState::new(cols, rows),
-        }
-    }
-
-    pub fn process(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.parser.advance(&mut self.state, b);
-        }
-        self.state.generation = self.state.generation.wrapping_add(1);
-    }
-
-    pub fn resize(&mut self, cols: usize, rows: usize) {
-        self.state.resize(cols, rows);
     }
 }

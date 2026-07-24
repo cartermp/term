@@ -118,7 +118,7 @@ fn syntax_hint(path: &str) -> &str {
 // ── Per-line highlighter ──────────────────────────────────────────────────────
 
 /// Highlights a code line using a running HighlightLines (state advances per call).
-fn hl_line<'s>(line: &'s str, h: &mut HighlightLines, ps: &SyntaxSet) -> Vec<(Style, String)> {
+fn hl_line(line: &str, h: &mut HighlightLines, ps: &SyntaxSet) -> Vec<(Style, String)> {
     let with_nl = if line.ends_with('\n') {
         std::borrow::Cow::Borrowed(line)
     } else {
@@ -643,7 +643,9 @@ mod tests {
         let mut out = Vec::<u8>::new();
         let lines = vec![
             Ok(String::from("error: invalid option: --stats")),
-            Ok(String::from("usage: git diff [<options>] [<commit>] [--] [<path>...]")),
+            Ok(String::from(
+                "usage: git diff [<options>] [<commit>] [--] [<path>...]",
+            )),
             Ok(String::from("  --stat show diffstat instead of patch.")),
         ];
         render_lines(lines, &mut out).unwrap();
@@ -672,15 +674,16 @@ mod tests {
         assert!(s.contains("commit "), "label preserved: {s:?}");
         assert!(s.contains("1234567890abcdef1234567890abcdef12345678"));
         // PEACH = (0xfa, 0xb3, 0x87) -> 250;179;135
-        assert!(s.contains("\x1b[38;2;250;179;135m"), "peach fg applied: {s:?}");
+        assert!(
+            s.contains("\x1b[38;2;250;179;135m"),
+            "peach fg applied: {s:?}"
+        );
     }
 
     #[test]
     fn test_log_commit_line_with_ref_decoration_styles_refs() {
         let mut out = Vec::<u8>::new();
-        assert!(
-            try_render_log_line("commit abcdef0123456 (HEAD -> main)", &mut out).unwrap()
-        );
+        assert!(try_render_log_line("commit abcdef0123456 (HEAD -> main)", &mut out).unwrap());
         let s = String::from_utf8_lossy(&out);
         // YELLOW = (0xf9, 0xe2, 0xaf) -> 249;226;175
         assert!(
@@ -694,8 +697,7 @@ mod tests {
     fn test_log_author_line_splits_name_and_email() {
         let mut out = Vec::<u8>::new();
         assert!(
-            try_render_log_line("Author: Phillip Carter <phil@example.com>", &mut out)
-                .unwrap()
+            try_render_log_line("Author: Phillip Carter <phil@example.com>", &mut out).unwrap()
         );
         let s = String::from_utf8_lossy(&out);
         // SKY = (0x89, 0xdc, 0xeb) -> 137;220;235
@@ -707,9 +709,7 @@ mod tests {
     #[test]
     fn test_log_date_line_dimmed() {
         let mut out = Vec::<u8>::new();
-        assert!(
-            try_render_log_line("Date:   Wed Jun 24 12:00:00 2026 -0700", &mut out).unwrap()
-        );
+        assert!(try_render_log_line("Date:   Wed Jun 24 12:00:00 2026 -0700", &mut out).unwrap());
         let s = String::from_utf8_lossy(&out);
         // OVERLAY0 = (0x6c, 0x70, 0x86) -> 108;112;134
         assert!(s.contains("\x1b[38;2;108;112;134m"), "date dimmed: {s:?}");
@@ -749,7 +749,9 @@ mod tests {
         // their respective styling and the transition doesn't confuse state.
         let mut out = Vec::<u8>::new();
         let lines = vec![
-            Ok(String::from("commit 0123456789abcdef0123456789abcdef01234567")),
+            Ok(String::from(
+                "commit 0123456789abcdef0123456789abcdef01234567",
+            )),
             Ok(String::from("Author: Alice <alice@example.com>")),
             Ok(String::from("Date:   Wed Jun 24 12:00:00 2026 -0700")),
             Ok(String::from("")),
