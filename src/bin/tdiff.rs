@@ -380,10 +380,6 @@ where
         } else if in_hunk && let Some(content) = line.strip_prefix('+') {
             let hl = new_hl.get_or_insert_with(|| make_highlighter(&hint, &ps, &ts));
             let spans = hl_line(content, hl, &ps);
-            // Also advance old_hl with a context-like phantom to keep state roughly in sync
-            if let Some(old) = old_hl.as_mut() {
-                let _ = hl_line(content, old, &ps);
-            }
             write_code_line(out, "+", GREEN, &spans, BG_ADDED)?;
         } else if in_hunk && let Some(content) = line.strip_prefix('-') {
             let hl = old_hl.get_or_insert_with(|| make_highlighter(&hint, &ps, &ts));

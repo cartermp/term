@@ -12,6 +12,7 @@ pub struct ReleaseInfo {
     pub tag_name: String,
     pub version: String,
     pub zip_url: String,
+    pub zip_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +69,7 @@ pub fn spawn_background_update(release: &ReleaseInfo) -> Result<(), String> {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&work_dir)
+    std::fs::create_dir(&work_dir)
         .map_err(|e| format!("failed to create updater workspace: {e}"))?;
 
     let script_path = work_dir.join("install-update.sh");
@@ -91,8 +92,9 @@ pub fn spawn_background_update(release: &ReleaseInfo) -> Result<(), String> {
         .arg(&script_path)
         .arg(std::process::id().to_string())
         .arg(&app_bundle)
-        .arg(&release.tag_name)
+        .arg(&release.version)
         .arg(&release.zip_url)
+        .arg(&release.zip_sha256)
         .arg(&log_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -115,6 +117,12 @@ fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     let output = Command::new("/usr/bin/curl")
         .args([
             "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "--retry",
+            "2",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
@@ -143,27 +151,37 @@ fn parse_latest_release_json(json: &str) -> Result<ReleaseInfo, String> {
         .get("tag_name")
         .and_then(Value::as_str)
         .ok_or_else(|| "latest release payload is missing tag_name".to_string())?;
-    let zip_url = value
+    let (zip_url, zip_sha256) = value
         .get("assets")
         .and_then(Value::as_array)
         .and_then(|assets| {
             assets.iter().find_map(|asset| {
                 (asset.get("name").and_then(Value::as_str) == Some(RELEASE_ASSET_NAME))
-                    .then(|| {
-                        asset
+                    .then(|| -> Option<(String, String)> {
+                        let url = asset
                             .get("browser_download_url")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
+                            .and_then(Value::as_str)?
+                            .to_string();
+                        let digest = asset
+                            .get("digest")
+                            .and_then(Value::as_str)?
+                            .strip_prefix("sha256:")?
+                            .to_ascii_lowercase();
+                        (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .then_some((url, digest))
                     })
                     .flatten()
             })
         })
-        .ok_or_else(|| format!("latest release does not include {RELEASE_ASSET_NAME}"))?;
+        .ok_or_else(|| {
+            format!("latest release does not include {RELEASE_ASSET_NAME} with a SHA-256 digest")
+        })?;
 
     Ok(ReleaseInfo {
         tag_name: tag_name.to_string(),
         version: normalize_version(tag_name),
         zip_url,
+        zip_sha256,
     })
 }
 
@@ -265,14 +283,22 @@ PID="$1"
 APP_DST="$2"
 VERSION="$3"
 ZIP_URL="$4"
-LOG_PATH="$5"
+EXPECTED_SHA256="$5"
+LOG_PATH="$6"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
+APP_PARENT="$(dirname "$APP_DST")"
+APP_NAME="$(basename "$APP_DST")"
+STAGED_APP="${APP_PARENT}/.${APP_NAME}.update-${PID}"
+BACKUP_APP="${APP_PARENT}/.${APP_NAME}.previous-${PID}"
+SUCCEEDED=0
 
 cleanup() {
-  rm -rf "$TMP" "$SCRIPT_DIR"
+  rm -rf "$TMP" "$STAGED_APP"
+  if [ "$SUCCEEDED" -eq 1 ]; then
+    rm -rf "$BACKUP_APP" "$SCRIPT_DIR"
+  fi
 }
-trap cleanup EXIT
 
 report_failure() {
   /usr/bin/osascript - "$LOG_PATH" <<'APPLESCRIPT' >/dev/null 2>&1 || true
@@ -282,31 +308,86 @@ end run
 APPLESCRIPT
 }
 
-{
+finish() {
+  STATUS=$?
+  trap - EXIT
+  cleanup
+  if [ "$STATUS" -ne 0 ]; then
+    report_failure
+  fi
+  exit "$STATUS"
+}
+trap finish EXIT
+exec >>"$LOG_PATH" 2>&1
+
   echo "Downloading Term ${VERSION}..."
-  /usr/bin/curl -fL --silent --show-error "$ZIP_URL" -o "$TMP/Term.app.zip"
+  /usr/bin/curl -fL --silent --show-error \
+    --connect-timeout 10 --max-time 300 --retry 2 \
+    "$ZIP_URL" -o "$TMP/Term.app.zip"
+  ACTUAL_SHA256="$(/usr/bin/shasum -a 256 "$TMP/Term.app.zip" | /usr/bin/awk '{print $1}')"
+  if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+    echo "error: update archive SHA-256 mismatch"
+    exit 1
+  fi
+
   /usr/bin/ditto -x -k "$TMP/Term.app.zip" "$TMP"
   if [ ! -d "$TMP/Term.app" ]; then
     echo "error: downloaded archive did not contain Term.app"
     exit 1
   fi
+  if [ ! -x "$TMP/Term.app/Contents/MacOS/term" ]; then
+    echo "error: downloaded app does not contain an executable"
+    exit 1
+  fi
+  BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "$TMP/Term.app/Contents/Info.plist")"
+  BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+    "$TMP/Term.app/Contents/Info.plist")"
+  if [ "$BUNDLE_ID" != "com.local.term" ]; then
+    echo "error: downloaded app has unexpected bundle identifier: $BUNDLE_ID"
+    exit 1
+  fi
+  if [ "$BUNDLE_VERSION" != "$VERSION" ]; then
+    echo "error: downloaded app version $BUNDLE_VERSION does not match $VERSION"
+    exit 1
+  fi
+  /usr/bin/codesign --verify --deep --strict "$TMP/Term.app"
   /usr/bin/xattr -cr "$TMP/Term.app" || true
+
+  # Copy beside the installed app before stopping Term. This proves the
+  # destination is writable and keeps the final renames on one filesystem.
+  rm -rf "$STAGED_APP" "$BACKUP_APP"
+  /usr/bin/ditto "$TMP/Term.app" "$STAGED_APP"
+  /usr/bin/codesign --verify --deep --strict "$STAGED_APP"
 
   if /bin/kill -0 "$PID" 2>/dev/null; then
     /bin/kill "$PID" 2>/dev/null || true
   fi
-  while /bin/kill -0 "$PID" 2>/dev/null; do
+  WAIT_COUNT=0
+  while /bin/kill -0 "$PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 50 ]; do
     /bin/sleep 0.2
+    WAIT_COUNT=$((WAIT_COUNT + 1))
   done
+  if /bin/kill -0 "$PID" 2>/dev/null; then
+    /bin/kill -9 "$PID" 2>/dev/null || true
+  fi
 
-  /bin/rm -rf "$APP_DST"
-  /usr/bin/ditto "$TMP/Term.app" "$APP_DST"
+  /bin/mv "$APP_DST" "$BACKUP_APP"
+  if ! /bin/mv "$STAGED_APP" "$APP_DST"; then
+    /bin/mv "$BACKUP_APP" "$APP_DST" || true
+    exit 1
+  fi
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
     -f "$APP_DST" 2>/dev/null || true
   # Pass --restore-session so the freshly-launched binary reads the saved
   # session file and re-creates the user's tabs + CWDs.
-  /usr/bin/open -a "$APP_DST" --args --restore-session
-} >>"$LOG_PATH" 2>&1 || report_failure
+  if ! /usr/bin/open -a "$APP_DST" --args --restore-session; then
+    /bin/rm -rf "$APP_DST"
+    /bin/mv "$BACKUP_APP" "$APP_DST"
+    /usr/bin/open -a "$APP_DST" --args --restore-session || true
+    exit 1
+  fi
+  SUCCEEDED=1
 "#
 }
 
@@ -321,7 +402,11 @@ mod tests {
                 "tag_name": "v1.3.1",
                 "assets": [
                     {"name": "install.sh", "browser_download_url": "https://example/install.sh"},
-                    {"name": "Term.app.zip", "browser_download_url": "https://example/Term.app.zip"}
+                    {
+                      "name": "Term.app.zip",
+                      "browser_download_url": "https://example/Term.app.zip",
+                      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
                 ]
             }"#,
         )
@@ -330,6 +415,51 @@ mod tests {
         assert_eq!(release.tag_name, "v1.3.1");
         assert_eq!(release.version, "1.3.1");
         assert_eq!(release.zip_url, "https://example/Term.app.zip");
+        assert_eq!(release.zip_sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn rejects_release_asset_without_sha256_digest() {
+        let err = parse_latest_release_json(
+            r#"{
+                "tag_name": "v1.3.1",
+                "assets": [
+                    {"name": "Term.app.zip", "browser_download_url": "https://example/Term.app.zip"}
+                ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("SHA-256"));
+    }
+
+    #[test]
+    fn update_script_verifies_before_replacing_and_keeps_failure_logs() {
+        let script = build_update_script();
+        let verify_pos = script.find("shasum -a 256").unwrap();
+        let replace_pos = script.find("/bin/mv \"$APP_DST\"").unwrap();
+        assert!(verify_pos < replace_pos);
+        assert!(script.contains("codesign --verify --deep --strict"));
+        assert!(script.contains("if [ \"$SUCCEEDED\" -eq 1 ]"));
+        assert!(script.contains("/bin/mv \"$BACKUP_APP\" \"$APP_DST\""));
+    }
+
+    #[test]
+    fn update_script_is_valid_bash() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/bash")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(build_update_script().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

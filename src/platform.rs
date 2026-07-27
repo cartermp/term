@@ -114,7 +114,6 @@ fn make_action_target() -> Option<*mut objc2::runtime::AnyObject> {
         if obj.is_null() {
             return None;
         }
-        let _: *mut AnyObject = msg_send![obj, retain];
         Some(obj)
     }
 }
@@ -259,8 +258,23 @@ fn panel_background(sender: *mut objc2::runtime::AnyObject) -> Option<Background
 /// the native tab bar "+" button's `newWindowForTab:` action reaches our callback.
 /// Called once per window after the window is fully set up.
 #[cfg(target_os = "macos")]
+static WINDOW_ACTION_TARGET_KEY: u8 = 0;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn objc_setAssociatedObject(
+        object: *mut std::ffi::c_void,
+        key: *const std::ffi::c_void,
+        value: *mut std::ffi::c_void,
+        policy: usize,
+    );
+}
+
+#[cfg(target_os = "macos")]
 pub fn setup_add_tab_button(ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
+    // Retain the responder for exactly the NSWindow lifetime.
+    const OBJC_ASSOCIATION_RETAIN_NONATOMIC: usize = 1;
     let Some(obj) = make_action_target() else {
         return;
     };
@@ -268,11 +282,19 @@ pub fn setup_add_tab_button(ns_view: *mut std::ffi::c_void) {
         let view = ns_view as *mut AnyObject;
         let win: *mut AnyObject = msg_send![view, window];
         if win.is_null() {
+            let _: () = msg_send![obj, release];
             return;
         }
         let old_next: *mut AnyObject = msg_send![win, nextResponder];
         let _: () = msg_send![obj, setNextResponder: old_next];
         let _: () = msg_send![win, setNextResponder: obj];
+        objc_setAssociatedObject(
+            win.cast(),
+            std::ptr::addr_of!(WINDOW_ACTION_TARGET_KEY).cast(),
+            obj.cast(),
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+        );
+        let _: () = msg_send![obj, release];
     }
 }
 
@@ -326,12 +348,14 @@ pub fn install_update_menu_item() {
             return;
         }
         let Some(target) = shared_action_target() else {
+            let _: () = msg_send![item, release];
             return;
         };
         let _: () = msg_send![item, setTarget: target];
         let count: usize = msg_send![submenu, numberOfItems];
         let insert_at = count.min(1usize);
         let _: () = msg_send![submenu, insertItem: item atIndex: insert_at];
+        let _: () = msg_send![item, release];
     }
 }
 
@@ -372,10 +396,13 @@ pub fn install_background_menu_item() {
             let submenu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
             let submenu: *mut AnyObject = msg_send![submenu, initWithTitle: appearance_title];
             if submenu.is_null() {
+                let _: () = msg_send![item, release];
                 return;
             }
             let _: () = msg_send![item, setSubmenu: submenu];
             let _: () = msg_send![main_menu, addItem: item];
+            let _: () = msg_send![submenu, release];
+            let _: () = msg_send![item, release];
             item
         };
 
@@ -395,10 +422,12 @@ pub fn install_background_menu_item() {
             return;
         }
         let Some(target) = shared_action_target() else {
+            let _: () = msg_send![item, release];
             return;
         };
         let _: () = msg_send![item, setTarget: target];
         let _: () = msg_send![submenu, addItem: item];
+        let _: () = msg_send![item, release];
     }
 }
 
@@ -469,19 +498,23 @@ fn run_alert(title: &str, message: &str, second_button: Option<&str>) -> Option<
             return None;
         }
 
-        let title = ns_string(title)?;
-        let message = ns_string(message)?;
-        let ok = ns_string("OK")?;
-        let _: () = msg_send![alert, setMessageText: title];
-        let _: () = msg_send![alert, setInformativeText: message];
-        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ok];
+        let result = (|| {
+            let title = ns_string(title)?;
+            let message = ns_string(message)?;
+            let ok = ns_string("OK")?;
+            let _: () = msg_send![alert, setMessageText: title];
+            let _: () = msg_send![alert, setInformativeText: message];
+            let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ok];
 
-        if let Some(second_button) = second_button {
-            let second = ns_string(second_button)?;
-            let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: second];
-        }
+            if let Some(second_button) = second_button {
+                let second = ns_string(second_button)?;
+                let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: second];
+            }
 
-        Some(msg_send![alert, runModal])
+            Some(msg_send![alert, runModal])
+        })();
+        let _: () = msg_send![alert, release];
+        result
     }
 }
 

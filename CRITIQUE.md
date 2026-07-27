@@ -21,7 +21,7 @@ The terminal currently assumes that every character occupies exactly one column.
 ## 3. Rendering Pipeline Efficiency
 Each frame, the renderer performs text shaping for every visible row via `rustybuzz`.
 
-**Status:** Addressed. The renderer now caches per-row glyph-op results keyed by the visible row signature, so unchanged rows reuse prior shaping work instead of re-running HarfBuzz every frame.
+**Status:** Addressed. The renderer caches per-row glyph operations and also caches the complete static frame. Cursor blink and ghost-text changes are emitted separately, so an idle redraw neither scans the grid nor re-runs HarfBuzz.
 
 *   **Critique:** Shaping is relatively expensive. In a 100-row terminal, we are shaping ~20,000 cells every frame (~60-120 times per second), even if the content is static.
 *   **Recommendation:** Implement a dirty-row mechanism or a shaping cache. Only re-shape rows that have changed since the last frame.
@@ -29,7 +29,7 @@ Each frame, the renderer performs text shaping for every visible row via `rustyb
 ## 4. PTY Processing & Main Thread Blocking
 PTY data processing happens on the main thread inside the `winit` event loop.
 
-**Status:** Deferred. This pass did not move VT processing off the main thread because doing that safely would require a larger ownership/snapshot redesign across `Terminal`, `Renderer`, and the event loop.
+**Status:** Partially addressed. VT mutation remains on the main thread to keep the grid single-owned, but PTY reads now feed a bounded 256 KiB staging buffer with backpressure and one coalesced wake event. This removes the unbounded event/allocation failure mode and bounds each main-thread drain. A background parser would still require an immutable snapshot or damage-list handoff.
 
 *   **Critique:** If a command produces a massive burst of output (e.g., `cat`ing a large file), the main thread will spend significant time in `Terminal::process`, causing the UI to stutter or drop frames.
 *   **Recommendation:** Move the VT state machine (`vte` processing) to a background thread. The main thread should only consume "snapshots" of the grid or a list of dirty regions for rendering.
@@ -37,7 +37,7 @@ PTY data processing happens on the main thread inside the `winit` event loop.
 ## 5. Atlas Management
 The glyph atlas is fully cleared when it overflows.
 
-**Status:** Deferred. The atlas behavior is unchanged in this pass; the new row-shape cache reduces CPU-side repeat work, but atlas eviction is still all-or-nothing.
+**Status:** Addressed for the current font model. The atlas is now a four-layer texture array. It advances to a fresh stable layer instead of clearing entries whose UVs may still be referenced by cached frames. At the fixed bundled font size this provides 4 MiB of glyph coverage without eviction stalls; once exhausted, previously cached glyphs remain valid.
 
 *   **Critique:** While rare for standard English text, a terminal displaying many unique Unicode characters (or different font sizes if that were added) would frequently trigger a full clear, leading to visible stutters as every glyph is re-uploaded.
 *   **Recommendation:** Implement an LRU (Least Recently Used) eviction policy for the atlas, or at least a multi-stage atlas that grows/compacts more gracefully.
@@ -45,7 +45,7 @@ The glyph atlas is fully cleared when it overflows.
 ## 6. PTY Data Passing
 Data from the PTY reader thread is sent to the main thread via `Vec<u8>` for every `read()` call.
 
-**Status:** Deferred. The current PTY event payload path is unchanged; reducing allocation pressure there is coupled to the broader threading redesign in item 4.
+**Status:** Addressed. Reader threads append into a reusable, bounded per-pane buffer. Multiple reads coalesce behind a single `PtyReady` notification, and the main thread swaps the bytes into a reusable scratch vector. Child exit is reported only after PTY EOF, preserving final output ordering.
 
 *   **Critique:** This creates high allocation pressure (thousands of small `Vec`s per second during high output).
 *   **Recommendation:** Use a lock-free ring buffer or a pool of pre-allocated buffers to pass data between the PTY thread and the processing thread.
@@ -60,9 +60,9 @@ Data from the PTY reader thread is sent to the main thread via `Vec<u8>` for eve
 2.  **Robust Unicode Support:**
     *   Add `unicode-width` and `unicode-segmentation`.
     *   Handle double-width characters in `put_char` and `visual_cell`.
-3.  **Optimize Renderer:**
-    *   Add a `generation` or `dirty` flag per row.
-    *   Cache shaped results (`GlyphOp` vectors) to avoid redundant HarfBuzz calls.
-4.  **PTY Throughput Improvements:**
-    *   Profile the impact of moving `vte` processing to a background thread.
-    *   Reduce allocations in the PTY data path.
+3.  **Profile Before Further Renderer Work:**
+    *   Measure sustained-output frame time and GPU upload volume.
+    *   Add row-level GPU buffer patching only if static-frame invalidation remains material.
+4.  **Consider Background VT Parsing:**
+    *   Prototype immutable grid snapshots or compact damage lists.
+    *   Keep terminal state single-owned; do not add shared mutable grid state.

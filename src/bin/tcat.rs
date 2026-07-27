@@ -6,6 +6,11 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthChar;
 
+/// Above this size, the interactive `cat` replacement preserves ordinary
+/// `cat` streaming behavior instead of loading and highlighting the whole
+/// file. Explicit `path:start-end` requests remain highlightable.
+const MAX_HIGHLIGHT_BYTES: u64 = 16 * 1024 * 1024;
+
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
 /// Write a true-colour foreground sequence.
@@ -316,8 +321,22 @@ fn highlight_file(
     ps: &SyntaxSet,
     ts: &ThemeSet,
 ) -> io::Result<()> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    if range.is_none() && metadata.len() > MAX_HIGHLIGHT_BYTES {
+        return passthrough_file(path);
+    }
+
+    let bytes =
+        std::fs::read(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(invalid) => {
+            // `cat` is routinely used for non-text files. Never turn that into
+            // an encoding error or partially decorated output.
+            return io::stdout().lock().write_all(&invalid.into_bytes());
+        }
+    };
 
     let syntax = ps
         .find_syntax_for_file(path)
@@ -369,6 +388,14 @@ fn highlight_file(
 
     print_footer(&mut out)?;
     out.flush()
+}
+
+fn passthrough_file(path: &str) -> io::Result<()> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut file, &mut stdout)?;
+    stdout.flush()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

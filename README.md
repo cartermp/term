@@ -49,14 +49,15 @@ Automated coverage includes inline unit tests, subprocess integration tests for 
 
 ## Features
 
-- **GPU-accelerated rendering** — wgpu/Metal pipeline with batched instancing and a 1024×1024 glyph atlas
+- **GPU-accelerated rendering** — wgpu/Metal pipeline with batched instancing, static-frame reuse, and a multi-layer glyph atlas
 - **JetBrains Mono** — bundled font, no system font dependency
 - **Catppuccin Mocha** color theme throughout
 - **True-color support** — ANSI 8/16, 256-color, and 24-bit RGB
 - **Multiple tabs** — Cmd+T/W to open/close, Cmd+[/] or Cmd+1–9 to navigate, drag to reorder
-- **Native self-updates** — `Term -> Check for Updates...` compares the running build against the latest GitHub release and installs it in place when a newer app bundle is available
+- **Native self-updates** — `Term -> Check for Updates...` verifies the release SHA-256, bundle identity/version, and code-signature structure before a staged install with rollback
 - **Native background controls** — `Appearance -> Background...` opens the macOS color panel with an alpha slider for live background color/opacity changes
 - **Scrollback** — 10,000-line buffer; scroll with mouse wheel, Cmd+Up/Down, Cmd+Home/End
+- **Resize reflow** — soft-wrapped logical lines reflow when the terminal width changes; copied text preserves hard line breaks
 - **Clipboard** — Cmd+C copies selection (text), Cmd+V pastes (text or image path); OSC 52 supported
 - **URL detection** — hold Cmd to underline URLs; Cmd+click opens in browser
 - **Inline history** — ghost-text completion from `~/.zsh_history`; accept with Cmd+Right or →
@@ -121,10 +122,9 @@ Lines that parse as JSON objects or arrays are pretty-printed with syntax color.
 
 ## Known gaps
 
-- No mouse reporting protocols (programs can't receive click/drag events)
 - No sixel or kitty image protocols
 - No search in scrollback
-- No split panes
 - No custom keybinding config
-- No ligatures or double-width characters
+- No publisher-identity guarantee for self-updates until release builds use a private Apple signing identity (release digests and signature structure are still verified)
+- Grapheme handling covers combining marks, emoji modifiers, flags, and double-width cells, but is not yet a full Unicode grapheme-break implementation
 - Bold uses the same font face (no separate bold variant loaded)

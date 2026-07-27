@@ -166,6 +166,18 @@ fn tcat_with_flags_falls_back_to_system_cat() {
 }
 
 #[test]
+fn tcat_binary_file_passes_through_without_decoration() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("raw.bin");
+    let bytes = b"\0\x80\xffbinary\n";
+    std::fs::write(&path, bytes).unwrap();
+
+    let output = run_bin("tcat", &[path.to_str().unwrap()], None, None);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, bytes);
+}
+
+#[test]
 fn tcat_renders_existing_files_and_reports_missing_ones() {
     let dir = TempDir::new().unwrap();
     let existing = write_file(&dir, "ok.rs", "fn ok() {}\n");
@@ -279,6 +291,13 @@ fn tjson_filter_mode_handles_final_line_without_newline() {
 }
 
 #[test]
+fn tjson_filter_mode_preserves_plain_final_line_without_newline() {
+    let output = run_bin("tjson", &[], Some("plain"), None);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"plain");
+}
+
+#[test]
 fn tjson_pty_mode_uses_real_tty_and_current_dir() {
     let dir = TempDir::new().unwrap();
     let script =
@@ -346,17 +365,17 @@ fn tjson_pty_mode_passes_through_invalid_utf8_bytes() {
     assert!(
         output
             .stdout
-            .windows(2)
-            .any(|window| window == [0x80, b'\n']),
-        "stdout bytes did not contain raw 0x80 newline sequence: {:?}",
+            .windows(3)
+            .any(|window| window == [0x80, b'\r', b'\n']),
+        "stdout bytes did not preserve the PTY's raw 0x80 CRLF sequence: {:?}",
         output.stdout
     );
 }
 
 #[test]
-fn tjson_pty_mode_returns_failure_for_nonzero_child() {
+fn tjson_pty_mode_preserves_nonzero_child_exit_code() {
     let output = run_bin("tjson", &["/bin/sh", "-lc", "exit 7"], None, None);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
 }
 
 #[test]

@@ -61,7 +61,7 @@ struct Out {
 const GLYPH_SHADER: &str = r#"
 struct Uni { res: vec4<f32> }
 @group(0) @binding(0) var<uniform> uni: Uni;
-@group(1) @binding(0) var atlas_t: texture_2d<f32>;
+@group(1) @binding(0) var atlas_t: texture_2d_array<f32>;
 @group(1) @binding(1) var atlas_s: sampler;
 
 struct Inst {
@@ -69,22 +69,24 @@ struct Inst {
     @location(1) sz:      vec2<f32>,
     @location(2) uv_pos:  vec2<f32>,
     @location(3) uv_sz:   vec2<f32>,
-    @location(4) fg:      vec4<f32>,
+    @location(4) layer:    f32,
+    @location(5) fg:       vec4<f32>,
 }
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) fg: vec4<f32>,
+    @location(1) @interpolate(flat) layer: f32,
+    @location(2) fg: vec4<f32>,
 }
 
 @vertex fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> Out {
     let uv = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
     let px = i.pos + uv * i.sz;
     let ndc = px / uni.res.xy * vec2(2., -2.) + vec2(-1., 1.);
-    return Out(vec4(ndc, 0., 1.), i.uv_pos + uv * i.uv_sz, i.fg);
+    return Out(vec4(ndc, 0., 1.), i.uv_pos + uv * i.uv_sz, i.layer, i.fg);
 }
 @fragment fn fs(o: Out) -> @location(0) vec4<f32> {
-    let a = textureSample(atlas_t, atlas_s, o.uv).r;
+    let a = textureSample(atlas_t, atlas_s, o.uv, i32(o.layer)).r;
     return vec4(o.fg.rgb, o.fg.a * a);
 }
 "#;
@@ -132,6 +134,7 @@ struct GlyphInst {
     sz: [f32; 2],
     uv_pos: [f32; 2],
     uv_sz: [f32; 2],
+    layer: f32,
     fg: [f32; 4],
 }
 
@@ -164,6 +167,11 @@ impl GlyphInst {
                 wgpu::VertexAttribute {
                     offset: 32,
                     shader_location: 4,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 36,
+                    shader_location: 5,
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],
@@ -173,10 +181,11 @@ impl GlyphInst {
 
 // ── Atlas ─────────────────────────────────────────────────────────────────────
 
-// 512×512 R8 = 256 KB of GPU memory. Fits ~500 rasterised glyphs at typical
-// JetBrains-Mono-at-14pt-2×-scale sizes (ASCII + common box/Unicode glyphs
-// comfortably), and resets itself on overflow.
-const ATLAS_SIZE: u32 = 512;
+// Four 1024×1024 R8 pages = 4 MB per DPI scale and enough room for thousands
+// of distinct glyphs. Pages never overwrite live entries: once full, new
+// uncached glyphs are omitted rather than corrupting glyphs already emitted.
+const ATLAS_SIZE: u32 = 1024;
+const ATLAS_LAYERS: u32 = 4;
 
 #[derive(Clone)]
 struct AtlasEntry {
@@ -184,6 +193,7 @@ struct AtlasEntry {
     uv_y: f32,
     uv_w: f32,
     uv_h: f32,
+    layer: f32,
     // fontdue placement offsets (pixels from cell origin)
     glyph_x: i32,
     glyph_y: i32,
@@ -463,6 +473,24 @@ fn build_row_glyph_key(state: &TerminalState, row: usize, vis_cols: usize) -> Ro
     RowGlyphKey { cells }
 }
 
+fn row_glyph_key_matches(
+    key: &RowGlyphKey,
+    state: &TerminalState,
+    row: usize,
+    vis_cols: usize,
+) -> bool {
+    key.cells.len() == vis_cols
+        && key.cells.iter().enumerate().all(|(col, expected)| {
+            let cell = state.visual_cell(row, col);
+            *expected
+                == RowGlyphKeyCell {
+                    c: cell.c,
+                    fg: effective_fg(cell),
+                }
+        })
+}
+
+#[cfg(test)]
 fn lookup_cached_row_ops<F>(
     cache: &mut HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
     slot: RowGlyphCacheSlot,
@@ -511,18 +539,110 @@ pub struct PaneView<'a> {
     pub url_underlines: &'a [(usize, usize, usize)],
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct StaticPaneKey {
+    state_ptr: usize,
+    generation: u64,
+    viewport_offset: usize,
+    rows: usize,
+    cols: usize,
+    bounds: [u32; 4],
+    selection: Option<(usize, usize, usize, usize)>,
+    url_underlines: Vec<(usize, usize, usize)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct StaticFrameKey {
+    surface: [u32; 2],
+    panes: Vec<StaticPaneKey>,
+    dividers: Vec<[u32; 4]>,
+}
+
+impl StaticFrameKey {
+    fn matches(
+        &self,
+        surface_w: u32,
+        surface_h: u32,
+        panes: &[PaneView<'_>],
+        dividers: &[(f32, f32, f32, f32)],
+    ) -> bool {
+        self.surface == [surface_w, surface_h]
+            && self.panes.len() == panes.len()
+            && self.panes.iter().zip(panes).all(|(cached, pane)| {
+                cached.state_ptr == pane.state as *const TerminalState as usize
+                    && cached.generation == pane.state.generation
+                    && cached.viewport_offset == pane.state.viewport_offset
+                    && cached.rows == pane.state.rows
+                    && cached.cols == pane.state.cols
+                    && cached.bounds
+                        == [
+                            pane.x.to_bits(),
+                            pane.y.to_bits(),
+                            pane.width.to_bits(),
+                            pane.height.to_bits(),
+                        ]
+                    && cached.selection == pane.selection
+                    && cached.url_underlines.as_slice() == pane.url_underlines
+            })
+            && self.dividers.len() == dividers.len()
+            && self
+                .dividers
+                .iter()
+                .zip(dividers)
+                .all(|(cached, &(x, y, width, height))| {
+                    *cached == [x.to_bits(), y.to_bits(), width.to_bits(), height.to_bits()]
+                })
+    }
+
+    fn new(
+        surface_w: u32,
+        surface_h: u32,
+        panes: &[PaneView<'_>],
+        dividers: &[(f32, f32, f32, f32)],
+    ) -> Self {
+        Self {
+            surface: [surface_w, surface_h],
+            panes: panes
+                .iter()
+                .map(|pane| StaticPaneKey {
+                    state_ptr: pane.state as *const TerminalState as usize,
+                    generation: pane.state.generation,
+                    viewport_offset: pane.state.viewport_offset,
+                    rows: pane.state.rows,
+                    cols: pane.state.cols,
+                    bounds: [
+                        pane.x.to_bits(),
+                        pane.y.to_bits(),
+                        pane.width.to_bits(),
+                        pane.height.to_bits(),
+                    ],
+                    selection: pane.selection,
+                    url_underlines: pane.url_underlines.to_vec(),
+                })
+                .collect(),
+            dividers: dividers
+                .iter()
+                .map(|&(x, y, width, height)| {
+                    [x.to_bits(), y.to_bits(), width.to_bits(), height.to_bits()]
+                })
+                .collect(),
+        }
+    }
+}
+
 // ── RendererShared ────────────────────────────────────────────────────────────
 
 /// Mutable atlas packing state — the rasterised-glyph LUT and the
 /// row-packing cursor. Lives behind a `Mutex` inside `RendererShared` so
 /// every window at the same DPI scale shares the same GPU atlas texture
-/// instead of paying 256 KB (or 1 MB pre-shrink) per window for an
-/// almost-identical ASCII set.
+/// instead of paying for a separate four-page atlas per window.
 struct AtlasPack {
     cache: HashMap<u16, Option<AtlasEntry>>,
     x: u32,
     y: u32,
     row_h: u32,
+    layer: u32,
+    full: bool,
 }
 
 /// GPU + font resources that depend only on the device, surface format, and
@@ -621,7 +741,7 @@ impl RendererShared {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -646,7 +766,7 @@ impl RendererShared {
             size: wgpu::Extent3d {
                 width: ATLAS_SIZE,
                 height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: ATLAS_LAYERS,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -655,7 +775,10 @@ impl RendererShared {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas_bg"),
             layout: &atlas_bgl,
@@ -685,6 +808,8 @@ impl RendererShared {
                 x: 0,
                 y: 0,
                 row_h: 0,
+                layer: 0,
+                full: false,
             }),
             font,
             rb_face,
@@ -706,6 +831,10 @@ impl RendererShared {
         if let Some(entry) = pack.cache.get(&id) {
             return entry.clone();
         }
+        if pack.full {
+            pack.cache.insert(id, None);
+            return None;
+        }
         let (m, bitmap) = self.font.rasterize_indexed(id, self.font_size);
         if m.width == 0 || m.height == 0 {
             pack.cache.insert(id, None);
@@ -721,21 +850,33 @@ impl RendererShared {
             pack.row_h = 0;
         }
         if pack.y + gh > ATLAS_SIZE {
-            // Atlas full — evict and restart (rare; terminals have small glyph sets).
-            pack.cache.clear();
+            pack.layer += 1;
             pack.x = 0;
             pack.y = 0;
             pack.row_h = 0;
+            if pack.layer >= ATLAS_LAYERS {
+                // Never invalidate UVs that may already be referenced by a
+                // cached frame. The atlas is deliberately sized so reaching
+                // this path requires an unusually diverse visible glyph set.
+                pack.full = true;
+                pack.cache.insert(id, None);
+                return None;
+            }
         }
 
         let ax = pack.x;
         let ay = pack.y;
+        let layer = pack.layer;
 
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.atlas_tex,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: ax,
+                    y: ay,
+                    z: layer,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             &bitmap,
@@ -765,6 +906,7 @@ impl RendererShared {
             uv_y: ay as f32 / ATLAS_SIZE as f32,
             uv_w: gw as f32 / ATLAS_SIZE as f32,
             uv_h: gh as f32 / ATLAS_SIZE as f32,
+            layer: layer as f32,
             glyph_x,
             glyph_y,
             w: gw,
@@ -794,6 +936,9 @@ pub struct Renderer {
 
     /// Per-window shaping cache (independent of the shared GPU atlas).
     row_glyph_cache: HashMap<RowGlyphCacheSlot, RowGlyphCacheEntry>,
+    /// Reused result view for one row. Cache hits copy into this allocation
+    /// rather than allocating a fresh Vec for every visible row and frame.
+    row_ops_scratch: Vec<GlyphOp>,
 
     // Reusable GPU instance buffers (grown on demand)
     rect_buf: wgpu::Buffer,
@@ -807,6 +952,12 @@ pub struct Renderer {
     block_rects: Vec<RectInst>,
     glyphs: Vec<GlyphInst>,
     fg_rects: Vec<RectInst>,
+    /// Cursor and ghost text are the only instances expected to change during
+    /// an idle blink frame. Keeping them separate lets the static terminal
+    /// frame stay cached and resident in the GPU buffers.
+    dynamic_glyphs: Vec<GlyphInst>,
+    dynamic_fg_rects: Vec<RectInst>,
+    static_frame_key: Option<StaticFrameKey>,
 
     background: BackgroundAppearance,
 }
@@ -864,6 +1015,7 @@ impl Renderer {
             uni_buf,
             uni_bg,
             row_glyph_cache: HashMap::new(),
+            row_ops_scratch: Vec::new(),
             rect_buf,
             rect_buf_cap: init_rect,
             glyph_buf,
@@ -875,6 +1027,9 @@ impl Renderer {
             block_rects: Vec::new(),
             glyphs: Vec::new(),
             fg_rects: Vec::new(),
+            dynamic_glyphs: Vec::new(),
+            dynamic_fg_rects: Vec::new(),
+            static_frame_key: None,
             background,
         }
     }
@@ -974,21 +1129,28 @@ impl Renderer {
 
     // ── Glyph emit helpers ────────────────────────────────────────────────────
 
+    fn glyph_instance(&self, id: u16, px: f32, py: f32, fg: [f32; 4]) -> Option<GlyphInst> {
+        self.shared.ensure_glyph_id(id).map(|e| GlyphInst {
+            pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
+            sz: [e.w as f32, e.h as f32],
+            uv_pos: [e.uv_x, e.uv_y],
+            uv_sz: [e.uv_w, e.uv_h],
+            layer: e.layer,
+            fg,
+        })
+    }
+
     fn emit_glyph_id(&mut self, id: u16, px: f32, py: f32, fg: [f32; 4]) {
-        if let Some(e) = self.shared.ensure_glyph_id(id) {
-            self.glyphs.push(GlyphInst {
-                pos: [px + e.glyph_x as f32, py + e.glyph_y as f32],
-                sz: [e.w as f32, e.h as f32],
-                uv_pos: [e.uv_x, e.uv_y],
-                uv_sz: [e.uv_w, e.uv_h],
-                fg,
-            });
+        if let Some(instance) = self.glyph_instance(id, px, py, fg) {
+            self.glyphs.push(instance);
         }
     }
 
-    fn emit_char(&mut self, c: char, px: f32, py: f32, fg: [f32; 4]) {
+    fn emit_dynamic_char(&mut self, c: char, px: f32, py: f32, fg: [f32; 4]) {
         let id = self.shared.font.lookup_glyph_index(c);
-        self.emit_glyph_id(id, px, py, fg);
+        if let Some(instance) = self.glyph_instance(id, px, py, fg) {
+            self.dynamic_glyphs.push(instance);
+        }
     }
 
     // ── Ligature shaping ──────────────────────────────────────────────────────
@@ -999,21 +1161,28 @@ impl Renderer {
     /// the OpenType engine; ligature glyphs that span multiple cells produce
     /// `GlyphOp::Glyph` at the first cell and `GlyphOp::Skip` at subsequent
     /// covered cells.
-    fn compute_row_glyph_ops(
-        &mut self,
-        state: &TerminalState,
-        row: usize,
-        vis_cols: usize,
-    ) -> Vec<GlyphOp> {
+    fn prepare_row_glyph_ops(&mut self, state: &TerminalState, row: usize, vis_cols: usize) {
         let slot = RowGlyphCacheSlot {
             state_ptr: state as *const TerminalState as usize,
             row,
             vis_cols,
         };
+        self.row_ops_scratch.clear();
+        if let Some(entry) = self.row_glyph_cache.get(&slot)
+            && row_glyph_key_matches(&entry.key, state, row, vis_cols)
+        {
+            self.row_ops_scratch.extend_from_slice(&entry.ops);
+            return;
+        }
+
         let key = build_row_glyph_key(state, row, vis_cols);
-        lookup_cached_row_ops(&mut self.row_glyph_cache, slot, key, || {
-            compute_row_glyph_ops_impl(&self.shared.rb_face, state, row, vis_cols)
-        })
+        let ops = compute_row_glyph_ops_impl(&self.shared.rb_face, state, row, vis_cols);
+        self.row_ops_scratch.extend_from_slice(&ops);
+        if self.row_glyph_cache.len() >= ROW_GLYPH_CACHE_MAX_ENTRIES {
+            self.row_glyph_cache.clear();
+        }
+        self.row_glyph_cache
+            .insert(slot, RowGlyphCacheEntry { key, ops });
     }
 
     // ── Block character rects ─────────────────────────────────────────────────
@@ -1184,110 +1353,162 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uni_buf, 0, bytemuck::cast_slice(&res));
 
-        self.bg_rects.clear();
-        self.block_rects.clear();
-        self.glyphs.clear();
-        self.fg_rects.clear();
+        let static_dirty = !self
+            .static_frame_key
+            .as_ref()
+            .is_some_and(|key| key.matches(surface_w, surface_h, panes, dividers));
+        if static_dirty {
+            self.bg_rects.clear();
+            self.block_rects.clear();
+            self.glyphs.clear();
+            self.fg_rects.clear();
 
-        let sel_bg = c2fa(Color::new(0x26, 0x4a, 0x7a), 1.0);
+            let sel_bg = c2fa(Color::new(0x26, 0x4a, 0x7a), 1.0);
 
+            for pane in panes {
+                let ox = pane.x;
+                let oy = pane.y;
+                let vis_rows = ((pane.height / ch) as usize).min(pane.state.rows);
+                let vis_cols = ((pane.width / cw) as usize).min(pane.state.cols);
+
+                // ── Cell grid ─────────────────────────────────────────────────────────
+                for row in 0..vis_rows {
+                    let gutter = if pane.selection.is_some() {
+                        tcat_gutter_end(pane.state, row, vis_cols)
+                    } else {
+                        0
+                    };
+
+                    // Pre-compute ligature-aware glyph ops for the row, reusing
+                    // cached shaping results when the visible row signature matches.
+                    self.prepare_row_glyph_ops(pane.state, row, vis_cols);
+
+                    for col in 0..vis_cols {
+                        let glyph_op = self.row_ops_scratch[col];
+                        let cell = pane.state.visual_cell(row, col);
+                        let mut fg_color = cell.attrs.fg;
+                        let mut bg_color = cell.attrs.bg;
+                        if cell.attrs.inverse {
+                            std::mem::swap(&mut fg_color, &mut bg_color);
+                        }
+
+                        let selected = if let Some((r0, c0, r1, c1)) = pane.selection {
+                            row >= r0
+                                && row <= r1
+                                && !(row == r0 && col < c0)
+                                && !(row == r1 && col > c1)
+                                && col >= gutter
+                        } else {
+                            false
+                        };
+
+                        let px = ox + col as f32 * cw;
+                        let py = oy + row as f32 * ch;
+
+                        if selected {
+                            push_rect(&mut self.bg_rects, px, py, cw, ch, sel_bg);
+                        } else if let Some(bg) = explicit_background_fill(bg_color) {
+                            // The render pass already clears the surface to the
+                            // configured default background. Only explicit cell
+                            // backgrounds need per-cell GPU instances.
+                            push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
+                        }
+
+                        let fg = c2f(fg_color);
+                        let c = cell.c;
+                        match glyph_op {
+                            GlyphOp::Skip => {}
+                            GlyphOp::Block => {
+                                // Block chars can't participate in ligatures; skip
+                                // the GlyphOp::Skip guard above — we always render.
+                                if c != ' ' && c != '\0' {
+                                    self.push_block_char(px, py, cw, ch, c, fg);
+                                }
+                            }
+                            GlyphOp::Glyph(glyph_id) => {
+                                self.emit_glyph_id(glyph_id, px, py, fg);
+                                // Combining chars overlay at the same cell origin.
+                                for &combining in cell.combining_chars() {
+                                    let comb_id = self.shared.font.lookup_glyph_index(combining);
+                                    self.emit_glyph_id(comb_id, px, py, fg);
+                                }
+                            }
+                        }
+
+                        // ── Per-cell underlines (SGR style + OSC 8 links) ─────────
+                        let ul_style = cell.attrs.underline_style;
+                        if ul_style != crate::terminal::UnderlineStyle::None {
+                            let ul_color =
+                                cell.attrs.underline_color.map(c2f).unwrap_or(c2f(fg_color));
+                            self.emit_underline(px, py, cw, ch, ul_style, ul_color);
+                        } else if cell.link_id != 0 {
+                            // OSC 8 hyperlink — use same blue as URL underlines.
+                            let lc = rgb_f(0x58, 0x9a, 0xdd);
+                            push_rect(&mut self.fg_rects, px, py + ch - 2., cw, 1., lc);
+                        }
+                    }
+                }
+
+                // ── URL underlines ────────────────────────────────────────────────────
+                if !pane.url_underlines.is_empty() {
+                    let u_col = rgb_f(0x58, 0x9a, 0xdd);
+                    for &(row, c0, c1) in pane.url_underlines {
+                        if row >= vis_rows {
+                            continue;
+                        }
+                        let uy = oy + row as f32 * ch + ch - 2.;
+                        let x0 = ox + c0 as f32 * cw;
+                        let x1 = ox + c1.min(vis_cols) as f32 * cw;
+                        push_rect(&mut self.fg_rects, x0, uy, x1 - x0, 2., u_col);
+                    }
+                }
+
+                // ── Scrollbar ─────────────────────────────────────────────────────────
+                let sb_total = pane.state.scrollback.len();
+                if sb_total > 0 {
+                    let total = sb_total + pane.state.rows;
+                    let ph_u = pane.height as usize;
+                    let thumb_h = ((ph_u * vis_rows) / total).max(8).min(ph_u);
+                    let view_top = sb_total.saturating_sub(pane.state.viewport_offset);
+                    let thumb_y = oy + (view_top * (ph_u - thumb_h)) as f32 / total.max(1) as f32;
+                    let bar_x = ox + pane.width - 3.;
+                    let track = rgb_f(0x2a, 0x2a, 0x2a);
+                    let thumb = if pane.state.is_scrolled_back() {
+                        rgb_f(0x66, 0x66, 0x66)
+                    } else {
+                        rgb_f(0x44, 0x44, 0x44)
+                    };
+                    push_rect(&mut self.fg_rects, bar_x, oy, 2., pane.height, track);
+                    push_rect(
+                        &mut self.fg_rects,
+                        bar_x,
+                        thumb_y,
+                        2.,
+                        thumb_h as f32,
+                        thumb,
+                    );
+                }
+            }
+
+            // ── Split dividers ────────────────────────────────────────────────────
+            let div_col = rgb_f(0x3a, 0x3a, 0x3a);
+            for &(x, y, w, h) in dividers {
+                push_rect(&mut self.fg_rects, x, y, w, h, div_col);
+            }
+            self.static_frame_key =
+                Some(StaticFrameKey::new(surface_w, surface_h, panes, dividers));
+        }
+
+        // Ghost text and the cursor are deliberately rebuilt independently:
+        // idle cursor-blink frames no longer scan, shape, or upload the grid.
+        self.dynamic_glyphs.clear();
+        self.dynamic_fg_rects.clear();
         for pane in panes {
             let ox = pane.x;
             let oy = pane.y;
             let vis_rows = ((pane.height / ch) as usize).min(pane.state.rows);
             let vis_cols = ((pane.width / cw) as usize).min(pane.state.cols);
 
-            // ── Cell grid ─────────────────────────────────────────────────────────
-            for row in 0..vis_rows {
-                let gutter = if pane.selection.is_some() {
-                    tcat_gutter_end(pane.state, row, vis_cols)
-                } else {
-                    0
-                };
-
-                // Pre-compute ligature-aware glyph ops for the row, reusing
-                // cached shaping results when the visible row signature matches.
-                let glyph_ops = self.compute_row_glyph_ops(pane.state, row, vis_cols);
-
-                for (col, glyph_op) in glyph_ops.iter().enumerate().take(vis_cols) {
-                    let cell = pane.state.visual_cell(row, col);
-                    let mut fg_color = cell.attrs.fg;
-                    let mut bg_color = cell.attrs.bg;
-                    if cell.attrs.inverse {
-                        std::mem::swap(&mut fg_color, &mut bg_color);
-                    }
-
-                    let selected = if let Some((r0, c0, r1, c1)) = pane.selection {
-                        row >= r0
-                            && row <= r1
-                            && !(row == r0 && col < c0)
-                            && !(row == r1 && col > c1)
-                            && col >= gutter
-                    } else {
-                        false
-                    };
-
-                    let px = ox + col as f32 * cw;
-                    let py = oy + row as f32 * ch;
-
-                    if selected {
-                        push_rect(&mut self.bg_rects, px, py, cw, ch, sel_bg);
-                    } else if let Some(bg) = explicit_background_fill(bg_color) {
-                        // The render pass already clears the surface to the
-                        // configured default background. Only explicit cell
-                        // backgrounds need per-cell GPU instances.
-                        push_rect(&mut self.bg_rects, px, py, cw, ch, bg);
-                    }
-
-                    let fg = c2f(fg_color);
-                    let c = cell.c;
-                    match *glyph_op {
-                        GlyphOp::Skip => {}
-                        GlyphOp::Block => {
-                            // Block chars can't participate in ligatures; skip
-                            // the GlyphOp::Skip guard above — we always render.
-                            if c != ' ' && c != '\0' {
-                                self.push_block_char(px, py, cw, ch, c, fg);
-                            }
-                        }
-                        GlyphOp::Glyph(glyph_id) => {
-                            self.emit_glyph_id(glyph_id, px, py, fg);
-                            // Combining chars overlay at the same cell origin.
-                            for &combining in cell.combining_chars() {
-                                let comb_id = self.shared.font.lookup_glyph_index(combining);
-                                self.emit_glyph_id(comb_id, px, py, fg);
-                            }
-                        }
-                    }
-
-                    // ── Per-cell underlines (SGR style + OSC 8 links) ─────────
-                    let ul_style = cell.attrs.underline_style;
-                    if ul_style != crate::terminal::UnderlineStyle::None {
-                        let ul_color = cell.attrs.underline_color.map(c2f).unwrap_or(c2f(fg_color));
-                        self.emit_underline(px, py, cw, ch, ul_style, ul_color);
-                    } else if cell.link_id != 0 {
-                        // OSC 8 hyperlink — use same blue as URL underlines.
-                        let lc = rgb_f(0x58, 0x9a, 0xdd);
-                        push_rect(&mut self.fg_rects, px, py + ch - 2., cw, 1., lc);
-                    }
-                }
-            }
-
-            // ── URL underlines ────────────────────────────────────────────────────
-            if !pane.url_underlines.is_empty() {
-                let u_col = rgb_f(0x58, 0x9a, 0xdd);
-                for &(row, c0, c1) in pane.url_underlines {
-                    if row >= vis_rows {
-                        continue;
-                    }
-                    let uy = oy + row as f32 * ch + ch - 2.;
-                    let x0 = ox + c0 as f32 * cw;
-                    let x1 = ox + c1.min(vis_cols) as f32 * cw;
-                    push_rect(&mut self.fg_rects, x0, uy, x1 - x0, 2., u_col);
-                }
-            }
-
-            // ── Ghost text ────────────────────────────────────────────────────────
             if !pane.state.is_scrolled_back()
                 && let Some(g) = pane.ghost
             {
@@ -1297,11 +1518,10 @@ impl Renderer {
                     if col >= vis_cols {
                         break;
                     }
-                    self.emit_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
+                    self.emit_dynamic_char(c, ox + col as f32 * cw, py, c2f(GHOST_COLOR));
                 }
             }
 
-            // ── Cursor ────────────────────────────────────────────────────────────
             if !pane.state.is_scrolled_back()
                 && pane.show_cursor
                 && pane.state.cursor_row < vis_rows
@@ -1311,13 +1531,18 @@ impl Renderer {
                 let py = oy + pane.state.cursor_row as f32 * ch;
                 match pane.state.cursor_shape {
                     1 | 2 => {
-                        // Block cursor: fill entire cell
-                        push_rect(&mut self.fg_rects, px, py, cw, ch, c2f(CURSOR_COLOR));
+                        push_rect(
+                            &mut self.dynamic_fg_rects,
+                            px,
+                            py,
+                            cw,
+                            ch,
+                            c2f(CURSOR_COLOR),
+                        );
                     }
                     3 | 4 => {
-                        // Underline cursor: thin bar at cell bottom
                         push_rect(
-                            &mut self.fg_rects,
+                            &mut self.dynamic_fg_rects,
                             px,
                             py + ch - 2.,
                             cw,
@@ -1326,79 +1551,73 @@ impl Renderer {
                         );
                     }
                     _ => {
-                        // Bar cursor (default, 0, 5, 6): thin vertical bar at left
-                        push_rect(&mut self.fg_rects, px, py, 2., ch, c2f(CURSOR_COLOR));
+                        push_rect(
+                            &mut self.dynamic_fg_rects,
+                            px,
+                            py,
+                            2.,
+                            ch,
+                            c2f(CURSOR_COLOR),
+                        );
                     }
                 }
             }
-
-            // ── Scrollbar ─────────────────────────────────────────────────────────
-            let sb_total = pane.state.scrollback.len();
-            if sb_total > 0 {
-                let total = sb_total + pane.state.rows;
-                let ph_u = pane.height as usize;
-                let thumb_h = ((ph_u * vis_rows) / total).max(8).min(ph_u);
-                let view_top = sb_total.saturating_sub(pane.state.viewport_offset);
-                let thumb_y = oy + (view_top * (ph_u - thumb_h)) as f32 / total.max(1) as f32;
-                let bar_x = ox + pane.width - 3.;
-                let track = rgb_f(0x2a, 0x2a, 0x2a);
-                let thumb = if pane.state.is_scrolled_back() {
-                    rgb_f(0x66, 0x66, 0x66)
-                } else {
-                    rgb_f(0x44, 0x44, 0x44)
-                };
-                push_rect(&mut self.fg_rects, bar_x, oy, 2., pane.height, track);
-                push_rect(
-                    &mut self.fg_rects,
-                    bar_x,
-                    thumb_y,
-                    2.,
-                    thumb_h as f32,
-                    thumb,
-                );
-            }
-        }
-
-        // ── Split dividers ────────────────────────────────────────────────────────
-        let div_col = rgb_f(0x3a, 0x3a, 0x3a);
-        for &(x, y, w, h) in dividers {
-            push_rect(&mut self.fg_rects, x, y, w, h, div_col);
         }
 
         // ── Upload ────────────────────────────────────────────────────────────────
         let bg_count = self.bg_rects.len();
         let block_count = self.block_rects.len();
-        let fg_count = self.fg_rects.len();
+        let static_fg_count = self.fg_rects.len();
+        let fg_count = static_fg_count + self.dynamic_fg_rects.len();
         let total_rects = bg_count + block_count + fg_count;
 
+        let old_rect_cap = self.rect_buf_cap;
         self.ensure_rect_buf(total_rects.max(1));
-        let glyph_count = self.glyphs.len();
+        let old_glyph_cap = self.glyph_buf_cap;
+        let static_glyph_count = self.glyphs.len();
+        let glyph_count = static_glyph_count + self.dynamic_glyphs.len();
         self.ensure_glyph_buf(glyph_count.max(1));
+        let upload_static_rects = static_dirty || old_rect_cap != self.rect_buf_cap;
+        let upload_static_glyphs = static_dirty || old_glyph_cap != self.glyph_buf_cap;
 
         let ri_size = std::mem::size_of::<RectInst>();
         let gi_size = std::mem::size_of::<GlyphInst>();
 
-        if !self.bg_rects.is_empty() {
+        if upload_static_rects && !self.bg_rects.is_empty() {
             self.queue
                 .write_buffer(&self.rect_buf, 0, bytemuck::cast_slice(&self.bg_rects));
         }
-        if !self.block_rects.is_empty() {
+        if upload_static_rects && !self.block_rects.is_empty() {
             self.queue.write_buffer(
                 &self.rect_buf,
                 (bg_count * ri_size) as u64,
                 bytemuck::cast_slice(&self.block_rects),
             );
         }
-        if !self.fg_rects.is_empty() {
+        if upload_static_rects && !self.fg_rects.is_empty() {
             self.queue.write_buffer(
                 &self.rect_buf,
                 ((bg_count + block_count) * ri_size) as u64,
                 bytemuck::cast_slice(&self.fg_rects),
             );
         }
-        if !self.glyphs.is_empty() {
+        if !self.dynamic_fg_rects.is_empty() {
+            self.queue.write_buffer(
+                &self.rect_buf,
+                ((bg_count + block_count + static_fg_count) * ri_size) as u64,
+                bytemuck::cast_slice(&self.dynamic_fg_rects),
+            );
+        }
+        if upload_static_glyphs && !self.glyphs.is_empty() {
             self.queue
                 .write_buffer(&self.glyph_buf, 0, bytemuck::cast_slice(&self.glyphs));
+        }
+        if !self.dynamic_glyphs.is_empty() {
+            self.queue.write_buffer(
+                &self.glyph_buf,
+                (static_glyph_count * gi_size) as u64,
+                bytemuck::cast_slice(&self.dynamic_glyphs),
+            );
         }
 
         // ── Render pass ───────────────────────────────────────────────────────────
@@ -1467,6 +1686,67 @@ mod tests {
 
     fn make_term(cols: usize, rows: usize) -> Terminal {
         Terminal::new(cols, rows)
+    }
+
+    #[test]
+    fn static_frame_key_ignores_cursor_blink_and_ghost_text() {
+        let term = make_term(10, 2);
+        let first = PaneView {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+            state: &term.state,
+            show_cursor: true,
+            ghost: Some("first"),
+            selection: None,
+            url_underlines: &[],
+        };
+        let first_key = StaticFrameKey::new(100, 40, &[first], &[]);
+        let second = PaneView {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+            state: &term.state,
+            show_cursor: false,
+            ghost: Some("second"),
+            selection: None,
+            url_underlines: &[],
+        };
+        assert!(first_key.matches(100, 40, &[second], &[]));
+    }
+
+    #[test]
+    fn static_frame_key_invalidates_for_terminal_content() {
+        let mut term = make_term(10, 2);
+        let before = {
+            let pane = PaneView {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 40.0,
+                state: &term.state,
+                show_cursor: true,
+                ghost: None,
+                selection: None,
+                url_underlines: &[],
+            };
+            StaticFrameKey::new(100, 40, &[pane], &[])
+        };
+        term.process(b"x");
+        let pane = PaneView {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+            state: &term.state,
+            show_cursor: true,
+            ghost: None,
+            selection: None,
+            url_underlines: &[],
+        };
+        assert!(before != StaticFrameKey::new(100, 40, &[pane], &[]));
     }
 
     // ── Color helpers ─────────────────────────────────────────────────────────

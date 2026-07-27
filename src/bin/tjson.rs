@@ -72,6 +72,26 @@ fn print_highlighted(
 
 // ── Core line processor (shared by both modes) ────────────────────────────────
 
+fn try_print_json(
+    line: &str,
+    out: &mut impl Write,
+    ps: &SyntaxSet,
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+) -> io::Result<bool> {
+    let trimmed = line.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Ok(false);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Ok(false);
+    };
+    let pretty = serde_json::to_string_pretty(&value)?;
+    print_highlighted(out, &pretty, ps, syntax, theme)?;
+    Ok(true)
+}
+
+#[cfg(test)]
 fn process_line(
     line: &str,
     out: &mut impl Write,
@@ -80,24 +100,58 @@ fn process_line(
     theme: &syntect::highlighting::Theme,
     drain: &mut bool,
 ) {
-    let trimmed = line.trim();
-
-    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && let Ok(pretty) = serde_json::to_string_pretty(&val)
-    {
-        match print_highlighted(out, &pretty, ps, syntax, theme) {
-            Ok(()) => return,
-            Err(_) => {
-                *drain = true;
-                return;
-            }
+    match try_print_json(line, out, ps, syntax, theme) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(_) => {
+            *drain = true;
+            return;
         }
     }
 
     // Non-JSON or failed parse: pass through unchanged.
     if writeln!(out, "{line}").is_err() {
         *drain = true;
+    }
+}
+
+fn process_record(
+    record: &[u8],
+    out: &mut impl Write,
+    ps: &SyntaxSet,
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+    drain: &mut bool,
+) {
+    if *drain {
+        return;
+    }
+
+    let mut content_end = record.len();
+    if content_end > 0 && record[content_end - 1] == b'\n' {
+        content_end -= 1;
+    }
+    if content_end > 0 && record[content_end - 1] == b'\r' {
+        content_end -= 1;
+    }
+
+    match std::str::from_utf8(&record[..content_end]) {
+        Ok(line) => match try_print_json(line, out, ps, syntax, theme) {
+            Ok(true) => {}
+            Ok(false) => {
+                if out.write_all(record).is_err() {
+                    *drain = true;
+                }
+            }
+            Err(_) => *drain = true,
+        },
+        Err(_) => {
+            // Invalid UTF-8 is not JSON, but it is still valid command output.
+            // Preserve the original bytes and line ending exactly.
+            if out.write_all(record).is_err() {
+                *drain = true;
+            }
+        }
     }
 }
 
@@ -112,15 +166,14 @@ fn run_filter(
     let mut out = io::BufWriter::new(stdout.lock());
     let mut drain = false;
 
-    for line in io::stdin().lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if drain {
-            continue;
+    let mut input = io::stdin().lock();
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        match input.read_until(b'\n', &mut record) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => process_record(&record, &mut out, ps, syntax, theme, &mut drain),
         }
-        process_line(&line, &mut out, ps, syntax, theme, &mut drain);
     }
     let _ = out.flush();
 }
@@ -185,51 +238,27 @@ fn run_pty(
         };
         buf.extend_from_slice(&chunk[..n]);
 
-        // Process all complete lines (ending with \n) in the buffer.
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let mut line_bytes = buf.drain(..=pos).collect::<Vec<u8>>();
-            // Strip trailing \n and \r\n.
-            if line_bytes.last() == Some(&b'\n') {
-                line_bytes.pop();
-            }
-            if line_bytes.last() == Some(&b'\r') {
-                line_bytes.pop();
-            }
-
-            if drain {
-                continue;
-            }
-
-            // Try to interpret as UTF-8 for JSON detection; fall back to raw write.
-            match std::str::from_utf8(&line_bytes) {
-                Ok(line) => process_line(line, &mut out, ps, syntax, theme, &mut drain),
-                Err(_) => {
-                    // Not valid UTF-8 — write raw bytes unchanged.
-                    let _ = out.write_all(&line_bytes);
-                    let _ = out.write_all(b"\n");
-                }
-            }
+        // Process complete lines without allocating and shifting the remainder
+        // once per line. Any partial trailing record stays in `buf`.
+        let mut consumed = 0usize;
+        while let Some(relative_end) = buf[consumed..].iter().position(|&b| b == b'\n') {
+            let end = consumed + relative_end + 1;
+            process_record(&buf[consumed..end], &mut out, ps, syntax, theme, &mut drain);
+            consumed = end;
+        }
+        if consumed > 0 {
+            buf.copy_within(consumed.., 0);
+            buf.truncate(buf.len() - consumed);
         }
     }
 
     // Flush any remaining bytes that had no trailing newline.
     if !buf.is_empty() && !drain {
-        match std::str::from_utf8(&buf) {
-            Ok(line) => process_line(line, &mut out, ps, syntax, theme, &mut drain),
-            Err(_) => {
-                let _ = out.write_all(&buf);
-            }
-        }
+        process_record(&buf, &mut out, ps, syntax, theme, &mut drain);
     }
 
     let exit_code = match child.wait() {
-        Ok(status) => {
-            if status.success() {
-                0
-            } else {
-                1
-            }
-        }
+        Ok(status) => status.exit_code().min(255) as i32,
         Err(_) => 1,
     };
     std::process::exit(exit_code);
@@ -345,6 +374,22 @@ mod tests {
         let mut drain = false;
         process_line(line, &mut buf, &ps, syntax, theme, &mut drain);
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn test_invalid_utf8_record_passes_through_byte_for_byte() {
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let syntax = ps
+            .find_syntax_by_extension("json")
+            .unwrap_or_else(|| ps.find_syntax_plain_text());
+        let theme = ts.themes.values().next().expect("no theme");
+        let record = b"raw \x80 bytes\r\n";
+        let mut out = Vec::new();
+        let mut drain = false;
+        process_record(record, &mut out, &ps, syntax, theme, &mut drain);
+        assert_eq!(out, record);
+        assert!(!drain);
     }
 
     #[test]

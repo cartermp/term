@@ -7,6 +7,8 @@ const SCROLLBACK_MAX: usize = 10_000;
 /// Cap on OSC-supplied strings (title, cwd, hyperlink URI) to bound how much
 /// memory a hostile or buggy program can chew up via a single escape sequence.
 const OSC_STRING_MAX: usize = 4096;
+const OSC_LINKS_MAX: usize = 4096;
+const OSC_LINK_BYTES_MAX: usize = 4 * 1024 * 1024;
 
 /// SGR underline style (4:N sub-parameter family).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -105,7 +107,11 @@ impl Cell {
 
 pub struct TerminalState {
     pub grid: Vec<Vec<Cell>>,
+    /// Whether each live row continues into the following physical row due
+    /// to automatic wrapping rather than an explicit line break.
+    pub grid_wrapped: Vec<bool>,
     pub scrollback: VecDeque<Vec<Cell>>,
+    pub scrollback_wrapped: VecDeque<bool>,
     pub viewport_offset: usize, // 0 = live view; N = scrolled N rows above live bottom
     /// Incremented on every `Terminal::process()` call so callers can detect
     /// when content has changed and invalidate derived caches (e.g. URL spans).
@@ -171,6 +177,7 @@ pub struct TerminalState {
     // Alternate screen buffer (?1049h / ?47h)
     alt_screen: bool,
     alt_grid: Vec<Vec<Cell>>,
+    alt_grid_wrapped: Vec<bool>,
     /// Cursor position saved on ?1049h entry, restored on ?1049l exit.
     alt_saved_cursor: (usize, usize),
 }
@@ -193,7 +200,9 @@ impl TerminalState {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
             grid: vec![vec![Cell::default(); cols]; rows],
+            grid_wrapped: vec![false; rows],
             scrollback: VecDeque::new(),
+            scrollback_wrapped: VecDeque::new(),
             viewport_offset: 0,
             generation: 0,
             cols,
@@ -220,6 +229,7 @@ impl TerminalState {
             // Allocated lazily on first ?1049h / ?47h. Terminals that never
             // enter alternate screen save rows × cols × sizeof(Cell) bytes.
             alt_grid: Vec::new(),
+            alt_grid_wrapped: Vec::new(),
             alt_saved_cursor: (0, 0),
             osc_52_query: false,
             bracketed_paste: false,
@@ -248,8 +258,10 @@ impl TerminalState {
         // existing allocation on subsequent enter/leave cycles.
         if self.alt_grid.is_empty() {
             self.alt_grid = vec![vec![Cell::default(); self.cols]; self.rows];
+            self.alt_grid_wrapped = vec![false; self.rows];
         }
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        std::mem::swap(&mut self.grid_wrapped, &mut self.alt_grid_wrapped);
         self.alt_screen = true;
         self.viewport_offset = 0;
         // Clear the now-active alt grid
@@ -257,6 +269,7 @@ impl TerminalState {
         for row in &mut self.grid {
             row.fill(blank);
         }
+        self.grid_wrapped.fill(false);
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.scroll_top = 0;
@@ -271,6 +284,7 @@ impl TerminalState {
             return;
         }
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        std::mem::swap(&mut self.grid_wrapped, &mut self.alt_grid_wrapped);
         self.alt_screen = false;
         if restore_cursor {
             (self.cursor_row, self.cursor_col) = self.alt_saved_cursor;
@@ -320,28 +334,245 @@ impl TerminalState {
         }
     }
 
+    /// Whether visual row `row` is soft-wrapped into the following row.
+    pub fn visual_row_wrapped(&self, row: usize) -> bool {
+        let vo = self.viewport_offset.min(self.scrollback.len());
+        if row < vo {
+            let sb_idx = self.scrollback.len() - vo + row;
+            self.scrollback_wrapped
+                .get(sb_idx)
+                .copied()
+                .unwrap_or(false)
+        } else {
+            self.grid_wrapped.get(row - vo).copied().unwrap_or(false)
+        }
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        for row in &mut self.grid {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+
+        if self.alt_screen {
+            // Reflow the saved normal screen with its saved cursor, then resize
+            // the active alternate screen without reflow (TUIs repaint it).
+            let active_cursor = (self.cursor_row, self.cursor_col);
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            std::mem::swap(&mut self.grid_wrapped, &mut self.alt_grid_wrapped);
+            (self.cursor_row, self.cursor_col) = self.alt_saved_cursor;
+            self.reflow_normal_screen(cols, rows);
+            self.alt_saved_cursor = (self.cursor_row, self.cursor_col);
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            std::mem::swap(&mut self.grid_wrapped, &mut self.alt_grid_wrapped);
+            (self.cursor_row, self.cursor_col) = active_cursor;
+            Self::resize_grid_simple(&mut self.grid, &mut self.grid_wrapped, cols, rows);
+            self.wrap_next = false;
+        } else {
+            self.reflow_normal_screen(cols, rows);
+            // Leave the alternate grid empty until first use. Once allocated,
+            // keep it dimensionally ready for the next ?1049h.
+            if !self.alt_grid.is_empty() {
+                Self::resize_grid_simple(
+                    &mut self.alt_grid,
+                    &mut self.alt_grid_wrapped,
+                    cols,
+                    rows,
+                );
+            }
+        }
+
+        self.cols = cols;
+        self.rows = rows;
+        self.cursor_row = self.cursor_row.min(rows - 1);
+        self.cursor_col = self.cursor_col.min(cols - 1);
+        self.saved_cursor.0 = self.saved_cursor.0.min(rows - 1);
+        self.saved_cursor.1 = self.saved_cursor.1.min(cols - 1);
+        self.last_placed.0 = self.last_placed.0.min(rows - 1);
+        self.last_placed.1 = self.last_placed.1.min(cols - 1);
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+    }
+
+    fn resize_grid_simple(
+        grid: &mut Vec<Vec<Cell>>,
+        wrapped: &mut Vec<bool>,
+        cols: usize,
+        rows: usize,
+    ) {
+        for row in grid.iter_mut() {
             row.resize(cols, Cell::default());
             Self::normalize_row_cells(row);
         }
-        self.grid.resize(rows, vec![Cell::default(); cols]);
-        // Leave alt_grid alone when it's empty (the common case: alt screen
-        // never used). It'll be allocated at the right size on next enter.
-        if !self.alt_grid.is_empty() {
-            for row in &mut self.alt_grid {
-                row.resize(cols, Cell::default());
-                Self::normalize_row_cells(row);
+        grid.resize(rows, vec![Cell::default(); cols]);
+        wrapped.resize(rows, false);
+    }
+
+    fn row_content_len(row: &[Cell]) -> usize {
+        let default = Cell::default();
+        row.iter()
+            .rposition(|cell| *cell != default)
+            .map_or(0, |idx| idx + 1)
+    }
+
+    fn emit_reflowed_line(
+        logical: &[Cell],
+        cursor_offset: Option<usize>,
+        cols: usize,
+        rows_out: &mut Vec<Vec<Cell>>,
+        wrapped_out: &mut Vec<bool>,
+        cursor_out: &mut Option<(usize, usize, bool)>,
+    ) {
+        if logical.is_empty() {
+            let row_idx = rows_out.len();
+            rows_out.push(vec![Cell::default(); cols]);
+            wrapped_out.push(false);
+            if cursor_offset.is_some() {
+                *cursor_out = Some((row_idx, 0, false));
             }
-            self.alt_grid.resize(rows, vec![Cell::default(); cols]);
+            return;
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
-        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
-        self.scroll_top = 0;
-        self.scroll_bottom = rows.saturating_sub(1);
-        self.wrap_next = false;
+
+        let mut start = 0usize;
+        while start < logical.len() {
+            let mut end = (start + cols).min(logical.len());
+            if cols > 1
+                && end < logical.len()
+                && logical[end - 1].wide
+                && logical[end].is_wide_continuation()
+            {
+                end -= 1;
+            }
+            if end == start {
+                end = (start + 1).min(logical.len());
+            }
+
+            let row_idx = rows_out.len();
+            let more = end < logical.len();
+            let mut row = logical[start..end].to_vec();
+            row.resize(cols, Cell::default());
+            Self::normalize_row_cells(&mut row);
+            rows_out.push(row);
+            wrapped_out.push(more);
+
+            if cursor_out.is_none()
+                && let Some(offset) = cursor_offset
+                && (offset < end || (!more && offset <= end))
+            {
+                let pending_wrap = offset == end && end - start == cols;
+                *cursor_out = Some((
+                    row_idx,
+                    offset.saturating_sub(start).min(cols - 1),
+                    pending_wrap,
+                ));
+            }
+            start = end;
+        }
+    }
+
+    fn reflow_normal_screen(&mut self, cols: usize, rows: usize) {
+        let old_cols = self.cols.max(1);
+        let scrollback_len = self.scrollback.len();
+        let cursor_source_row = scrollback_len + self.cursor_row;
+
+        let old_scrollback = std::mem::take(&mut self.scrollback);
+        let old_scrollback_wrapped = std::mem::take(&mut self.scrollback_wrapped);
+        let old_grid = std::mem::take(&mut self.grid);
+        let old_grid_wrapped = std::mem::take(&mut self.grid_wrapped);
+
+        let mut source = Vec::with_capacity(old_scrollback.len() + old_grid.len());
+        for (idx, row) in old_scrollback.into_iter().enumerate() {
+            source.push((
+                row,
+                old_scrollback_wrapped.get(idx).copied().unwrap_or(false),
+            ));
+        }
+        for (idx, row) in old_grid.into_iter().enumerate() {
+            source.push((row, old_grid_wrapped.get(idx).copied().unwrap_or(false)));
+        }
+
+        let mut physical_rows = Vec::new();
+        let mut physical_wrapped = Vec::new();
+        let mut cursor_reflowed = None;
+        let mut logical = Vec::new();
+        let mut logical_cursor = None;
+
+        for (source_idx, (row, wrapped)) in source.into_iter().enumerate() {
+            let mut used = if wrapped {
+                old_cols
+            } else {
+                Self::row_content_len(&row)
+            };
+            if source_idx == cursor_source_row {
+                let offset = logical.len() + self.cursor_col;
+                logical_cursor = Some(offset);
+                used = used.max(self.cursor_col);
+            }
+            for col in 0..used {
+                logical.push(row.get(col).copied().unwrap_or_default());
+            }
+            if !wrapped {
+                Self::emit_reflowed_line(
+                    &logical,
+                    logical_cursor,
+                    cols,
+                    &mut physical_rows,
+                    &mut physical_wrapped,
+                    &mut cursor_reflowed,
+                );
+                logical.clear();
+                logical_cursor = None;
+            }
+        }
+        if !logical.is_empty() {
+            Self::emit_reflowed_line(
+                &logical,
+                logical_cursor,
+                cols,
+                &mut physical_rows,
+                &mut physical_wrapped,
+                &mut cursor_reflowed,
+            );
+        }
+        if physical_rows.is_empty() {
+            physical_rows.push(vec![Cell::default(); cols]);
+            physical_wrapped.push(false);
+        }
+
+        let (cursor_abs_row, cursor_col, cursor_wrap_next) =
+            cursor_reflowed.unwrap_or((0, 0, false));
+        // Keep the cursor at its existing visual row whenever the new height
+        // permits it. This preserves the prompt and recent command above it
+        // instead of blindly bottom-anchoring and pushing them into scrollback.
+        let desired_cursor_row = self.cursor_row.min(rows - 1);
+        let grid_start = cursor_abs_row
+            .saturating_sub(desired_cursor_row)
+            .min(physical_rows.len().saturating_sub(1));
+        let grid_end = (grid_start + rows).min(physical_rows.len());
+
+        for (row, wrapped) in physical_rows[..grid_start]
+            .iter()
+            .cloned()
+            .zip(physical_wrapped[..grid_start].iter().copied())
+        {
+            let trim_to = Self::row_content_len(&row);
+            self.scrollback.push_back(row[..trim_to].to_vec());
+            self.scrollback_wrapped.push_back(wrapped);
+        }
+        while self.scrollback.len() > SCROLLBACK_MAX {
+            self.scrollback.pop_front();
+            self.scrollback_wrapped.pop_front();
+        }
+
+        self.grid = physical_rows[grid_start..grid_end].to_vec();
+        self.grid_wrapped = physical_wrapped[grid_start..grid_end].to_vec();
+        self.grid.resize(rows, vec![Cell::default(); cols]);
+        self.grid_wrapped.resize(rows, false);
+        self.cursor_row = cursor_abs_row.saturating_sub(grid_start).min(rows - 1);
+        self.cursor_col = cursor_col.min(cols - 1);
+        self.wrap_next = cursor_wrap_next;
+        self.viewport_offset = self.viewport_offset.min(self.scrollback.len());
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -359,16 +590,19 @@ impl TerminalState {
         // screen. Clone just the rows that are actually leaving the viewport,
         // then rotate the region once even for large CSI S counts.
         if top == 0 && bottom + 1 == self.grid.len() && !self.alt_screen {
-            for row in &self.grid[top..top + count] {
+            for (idx, row) in self.grid[top..top + count].iter().enumerate() {
                 // Trim trailing default cells before storing to slash memory use on
                 // wide terminals with short lines. `visual_cell` already returns
                 // Cell::default() for out-of-bounds reads, so this is invisible.
                 let default = Cell::default();
                 let trim_to = row.iter().rposition(|c| *c != default).map_or(0, |i| i + 1);
                 self.scrollback.push_back(row[..trim_to].to_vec());
+                self.scrollback_wrapped
+                    .push_back(self.grid_wrapped.get(top + idx).copied().unwrap_or(false));
             }
             while self.scrollback.len() > SCROLLBACK_MAX {
                 self.scrollback.pop_front();
+                self.scrollback_wrapped.pop_front();
             }
             // Keep the viewport pinned to the same content when user is
             // scrolled back.
@@ -378,9 +612,11 @@ impl TerminalState {
         }
 
         self.grid[top..=bottom].rotate_left(count);
+        self.grid_wrapped[top..=bottom].rotate_left(count);
         for row in &mut self.grid[bottom + 1 - count..=bottom] {
             row.fill(Cell::default());
         }
+        self.grid_wrapped[bottom + 1 - count..=bottom].fill(false);
     }
 
     fn scroll_down(&mut self, n: usize) {
@@ -395,14 +631,19 @@ impl TerminalState {
         }
 
         self.grid[top..=bottom].rotate_right(count);
+        self.grid_wrapped[top..=bottom].rotate_right(count);
         for row in &mut self.grid[top..top + count] {
             row.fill(Cell::default());
         }
+        self.grid_wrapped[top..top + count].fill(false);
     }
 
     fn put_char(&mut self, c: char) {
         if self.wrap_next {
             self.wrap_next = false;
+            if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                *wrapped = true;
+            }
             self.cursor_col = 0;
             self.do_newline();
         }
@@ -556,6 +797,9 @@ impl TerminalState {
                 for c in col..self.cols {
                     self.clear_cell_span(row, c, blank);
                 }
+                if let Some(wrapped) = self.grid_wrapped.get_mut(row) {
+                    *wrapped = false;
+                }
             }
             1 => {
                 for c in 0..=col.min(self.cols.saturating_sub(1)) {
@@ -565,6 +809,9 @@ impl TerminalState {
             2 => {
                 for c in 0..self.cols {
                     self.clear_cell_span(row, c, blank);
+                }
+                if let Some(wrapped) = self.grid_wrapped.get_mut(row) {
+                    *wrapped = false;
                 }
             }
             _ => {}
@@ -586,7 +833,9 @@ impl TerminalState {
                     for c in 0..self.cols {
                         self.clear_cell_span(r, c, blank);
                     }
+                    self.grid_wrapped[r] = false;
                 }
+                self.grid_wrapped[row] = false;
             }
             1 => {
                 let (row, col) = (self.cursor_row, self.cursor_col);
@@ -594,6 +843,7 @@ impl TerminalState {
                     for c in 0..self.cols {
                         self.clear_cell_span(r, c, blank);
                     }
+                    self.grid_wrapped[r] = false;
                 }
                 for c in 0..=col.min(self.cols.saturating_sub(1)) {
                     self.clear_cell_span(row, c, blank);
@@ -605,6 +855,7 @@ impl TerminalState {
                         self.clear_cell_span(r, c, blank);
                     }
                 }
+                self.grid_wrapped.fill(false);
             }
             3 => {
                 // ED 3: erase display and clear scrollback (xterm extension).
@@ -614,6 +865,8 @@ impl TerminalState {
                     }
                 }
                 self.scrollback.clear();
+                self.scrollback_wrapped.clear();
+                self.grid_wrapped.fill(false);
                 self.viewport_offset = 0;
             }
             _ => {}
@@ -812,7 +1065,12 @@ impl Perform for TerminalState {
                 let next = (self.cursor_col / 8 + 1) * 8;
                 self.cursor_col = next.min(self.cols.saturating_sub(1));
             }
-            0x0a..=0x0c => self.do_newline(),
+            0x0a..=0x0c => {
+                if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                    *wrapped = false;
+                }
+                self.do_newline();
+            }
             0x0d => self.cursor_col = 0,
             _ => {}
         }
@@ -874,9 +1132,11 @@ impl Perform for TerminalState {
                     let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
                     let count = n.min(bottom - self.cursor_row + 1);
                     self.grid[self.cursor_row..=bottom].rotate_right(count);
+                    self.grid_wrapped[self.cursor_row..=bottom].rotate_right(count);
                     for row in &mut self.grid[self.cursor_row..self.cursor_row + count] {
                         row.fill(Cell::default());
                     }
+                    self.grid_wrapped[self.cursor_row..self.cursor_row + count].fill(false);
                 }
             }
             (0, 'M') => {
@@ -888,9 +1148,11 @@ impl Perform for TerminalState {
                     let bottom = self.scroll_bottom.min(self.grid.len().saturating_sub(1));
                     let count = n.min(bottom - self.cursor_row + 1);
                     self.grid[self.cursor_row..=bottom].rotate_left(count);
+                    self.grid_wrapped[self.cursor_row..=bottom].rotate_left(count);
                     for row in &mut self.grid[bottom + 1 - count..=bottom] {
                         row.fill(Cell::default());
                     }
+                    self.grid_wrapped[bottom + 1 - count..=bottom].fill(false);
                 }
             }
             (0, 'P') => {
@@ -1044,8 +1306,16 @@ impl Perform for TerminalState {
                 self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
                 self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
             }
-            b'D' => self.do_newline(),
+            b'D' => {
+                if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                    *wrapped = false;
+                }
+                self.do_newline();
+            }
             b'E' => {
+                if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                    *wrapped = false;
+                }
                 self.cursor_col = 0;
                 self.do_newline();
             }
@@ -1152,12 +1422,25 @@ impl Perform for TerminalState {
                         }
                         if uri.is_empty() {
                             self.current_link_id = 0;
-                        } else if uri.len() <= OSC_STRING_MAX
-                            && self.links.len() < u16::MAX as usize
-                        {
-                            self.links.push(uri.to_owned());
-                            self.current_link_id = self.links.len() as u16;
+                        } else if uri.len() <= OSC_STRING_MAX {
+                            if let Some(existing) = self.links.iter().position(|link| link == uri) {
+                                self.current_link_id = existing as u16 + 1;
+                            } else {
+                                let used_bytes = self.links.iter().map(String::len).sum::<usize>();
+                                if self.links.len() < OSC_LINKS_MAX
+                                    && used_bytes + uri.len() <= OSC_LINK_BYTES_MAX
+                                {
+                                    self.links.push(uri.to_owned());
+                                    self.current_link_id = self.links.len() as u16;
+                                } else {
+                                    self.current_link_id = 0;
+                                }
+                            }
+                        } else {
+                            self.current_link_id = 0;
                         }
+                    } else {
+                        self.current_link_id = 0;
                     }
                 } else {
                     self.current_link_id = 0;
@@ -1238,8 +1521,11 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct TerminalSnapshot {
         grid: Vec<Vec<CellSnapshot>>,
+        grid_wrapped: Vec<bool>,
         scrollback: Vec<Vec<CellSnapshot>>,
+        scrollback_wrapped: Vec<bool>,
         alt_grid: Vec<Vec<CellSnapshot>>,
+        alt_grid_wrapped: Vec<bool>,
         viewport_offset: usize,
         cols: usize,
         rows: usize,
@@ -1294,12 +1580,15 @@ mod tests {
         let state = &term.state;
         TerminalSnapshot {
             grid: snapshot_rows(&state.grid),
+            grid_wrapped: state.grid_wrapped.clone(),
             scrollback: state
                 .scrollback
                 .iter()
                 .map(|row| row.iter().copied().map(snapshot_cell).collect())
                 .collect(),
+            scrollback_wrapped: state.scrollback_wrapped.iter().copied().collect(),
             alt_grid: snapshot_rows(&state.alt_grid),
+            alt_grid_wrapped: state.alt_grid_wrapped.clone(),
             viewport_offset: state.viewport_offset,
             cols: state.cols,
             rows: state.rows,
@@ -1433,9 +1722,12 @@ mod tests {
 
         let state = &term.state;
         assert_eq!(state.grid.len(), state.rows);
+        assert_eq!(state.grid_wrapped.len(), state.rows);
         // alt_grid is allocated lazily on first ?1049h / ?47h, so it's
         // either empty (alt screen never used) or full-sized.
         assert!(state.alt_grid.is_empty() || state.alt_grid.len() == state.rows);
+        assert_eq!(state.alt_grid_wrapped.len(), state.alt_grid.len());
+        assert_eq!(state.scrollback_wrapped.len(), state.scrollback.len());
         assert!(state.rows > 0);
         assert!(state.cols > 0);
         assert!(
@@ -3065,6 +3357,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resize_reflows_soft_wrapped_logical_line() {
+        let mut t = t(6, 3);
+        t.process(b"abcdefgh");
+        t.resize(4, 3);
+
+        let row = |row: usize| {
+            t.state.grid[row]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+        };
+        assert_eq!(row(0), "abcd");
+        assert_eq!(row(1), "efgh");
+        assert!(t.state.grid_wrapped[0]);
+        assert!(!t.state.grid_wrapped[1]);
+
+        t.resize(8, 3);
+        assert_eq!(
+            t.state.grid[0]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>(),
+            "abcdefgh"
+        );
+        assert!(!t.state.grid_wrapped[0]);
+    }
+
     // ── Alternate screen ──────────────────────────────────────────────────────
 
     /// Feed the ?1049h / ?1049l sequences as the real shell would.
@@ -4264,6 +4584,24 @@ mod tests {
         assert_ne!(id1, id2, "two different links must get distinct ids");
         assert_eq!(s.links[0], "https://a.com");
         assert_eq!(s.links[1], "https://b.com");
+    }
+
+    #[test]
+    fn osc8_reuses_id_for_duplicate_uri() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        let first_id = s.current_link_id;
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        assert_eq!(s.current_link_id, first_id);
+        assert_eq!(s.links.len(), 1);
+    }
+
+    #[test]
+    fn osc8_invalid_utf8_clears_previously_active_link() {
+        let mut s = TerminalState::new(80, 5);
+        s.osc_dispatch(&[b"8", b"", b"https://example.com"], false);
+        s.osc_dispatch(&[b"8", b"", b"https://\xff"], false);
+        assert_eq!(s.current_link_id, 0);
     }
 
     // ── DECSCUSR comprehensive ────────────────────────────────────────────────

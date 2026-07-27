@@ -10,10 +10,10 @@ mod updater;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -28,13 +28,67 @@ use updater::UpdateCheck;
 
 #[derive(Debug)]
 enum AppEvent {
-    PtyData { pane_id: u64, data: Vec<u8> },
+    PtyReady { pane_id: u64 },
     PtyExit { pane_id: u64 },
     NewTab,
     CheckForUpdates,
     UpdateCheckFinished(Result<UpdateCheck, String>),
     ShowBackgroundAppearancePanel,
     BackgroundAppearanceChanged(BackgroundAppearance),
+}
+
+const PTY_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct PtyOutputState {
+    bytes: Vec<u8>,
+    wake_pending: bool,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct PtyOutput {
+    state: Mutex<PtyOutputState>,
+    space_available: Condvar,
+}
+
+impl PtyOutput {
+    /// Append bytes from the blocking PTY reader. The bounded buffer applies
+    /// backpressure instead of allowing user events to grow without limit.
+    /// Returns true when the reader must wake the event loop.
+    fn push(&self, data: &[u8]) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while !state.closed && state.bytes.len() + data.len() > PTY_OUTPUT_MAX_BYTES {
+            state = self.space_available.wait(state).unwrap();
+        }
+        if state.closed {
+            return false;
+        }
+        state.bytes.extend_from_slice(data);
+        if state.wake_pending {
+            false
+        } else {
+            state.wake_pending = true;
+            true
+        }
+    }
+
+    /// Swap all pending bytes into a reusable main-thread scratch buffer.
+    fn drain_into(&self, scratch: &mut Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        scratch.clear();
+        std::mem::swap(scratch, &mut state.bytes);
+        state.wake_pending = false;
+        self.space_available.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.bytes.clear();
+        state.wake_pending = false;
+        self.space_available.notify_all();
+    }
 }
 
 // ── Split direction ───────────────────────────────────────────────────────────
@@ -105,6 +159,9 @@ struct Pane {
     terminal: Terminal,
     pty_master: Box<dyn MasterPty>,
     pty_writer: Box<dyn Write + Send>,
+    child_killer: Box<dyn ChildKiller + Send + Sync>,
+    pty_output: Arc<PtyOutput>,
+    pty_scratch: Vec<u8>,
     ghost_text: Option<String>,
     engine: Arc<Engine>,
     selection: Option<Selection>,
@@ -155,6 +212,21 @@ impl Pane {
         } else {
             t
         }
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        self.pty_output.close();
+        #[cfg(unix)]
+        if let Some(process_group) = self.pty_master.process_group_leader() {
+            // The foreground job may be in a different process group from the
+            // shell. Hang it up before terminating the shell itself.
+            unsafe {
+                libc::kill(-process_group, libc::SIGHUP);
+            }
+        }
+        let _ = self.child_killer.kill();
     }
 }
 
@@ -572,28 +644,7 @@ impl TerminalWindow {
         };
         let state = &pane.terminal.state;
         let (r0, c0, r1, c1) = sel.to_viewport(state.viewport_offset);
-        let mut result = String::new();
-        for row in r0..=r1 {
-            let col_start = if row == r0 { c0 } else { 0 };
-            let col_end = if row == r1 { c1 + 1 } else { state.cols };
-            let mut line = String::new();
-            for col in col_start..col_end.min(state.cols) {
-                let cell = state.visual_cell(row, col);
-                if cell.c == '\0' {
-                    line.push(' ');
-                } else {
-                    line.push(cell.c);
-                    for &combining in cell.combining_chars() {
-                        line.push(combining);
-                    }
-                }
-            }
-            if row > r0 {
-                result.push('\n');
-            }
-            result.push_str(line.trim_end());
-        }
-        result
+        selection_text_for_range(state, (r0, c0, r1, c1))
     }
 
     /// Convert pixel coordinate to (pane_idx, row, col). Returns None if out of bounds.
@@ -1093,6 +1144,36 @@ impl TerminalWindow {
     }
 }
 
+fn selection_text_for_range(
+    state: &terminal::TerminalState,
+    (r0, c0, r1, c1): (usize, usize, usize, usize),
+) -> String {
+    let mut result = String::new();
+    for row in r0..=r1 {
+        let col_start = if row == r0 { c0 } else { 0 };
+        let col_end = if row == r1 { c1 + 1 } else { state.cols };
+        let mut line = String::new();
+        for col in col_start..col_end.min(state.cols) {
+            let cell = state.visual_cell(row, col);
+            if cell.c != '\0' {
+                line.push(cell.c);
+                for &combining in cell.combining_chars() {
+                    line.push(combining);
+                }
+            }
+        }
+        if row > r0 && !state.visual_row_wrapped(row - 1) {
+            result.push('\n');
+        }
+        if row < r1 && state.visual_row_wrapped(row) {
+            result.push_str(&line);
+        } else {
+            result.push_str(line.trim_end());
+        }
+    }
+    result
+}
+
 // ── KeyAction ─────────────────────────────────────────────────────────────────
 
 enum KeyAction {
@@ -1342,26 +1423,6 @@ impl App {
             }
         };
 
-        let mut cmd = CommandBuilder::new("zsh");
-        cmd.arg("-l");
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        // Honour a saved CWD when present and the directory still exists.
-        // CommandBuilder defaults to the parent process's CWD otherwise.
-        if let Some(dir) = cwd
-            && !dir.is_empty()
-            && std::path::Path::new(dir).is_dir()
-        {
-            cmd.cwd(dir);
-        }
-        setup_shell_env(&mut cmd);
-
-        if let Err(e) = pair.slave.spawn_command(cmd) {
-            eprintln!("spawn zsh: {e}");
-            return None;
-        }
-        drop(pair.slave);
-
         let mut reader = match pair.master.try_clone_reader() {
             Ok(r) => r,
             Err(e) => {
@@ -1377,24 +1438,56 @@ impl App {
             }
         };
 
+        let mut cmd = CommandBuilder::new("zsh");
+        cmd.arg("-l");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // Honour a saved CWD when present and the directory still exists.
+        // CommandBuilder defaults to the parent process's CWD otherwise.
+        if let Some(dir) = cwd
+            && !dir.is_empty()
+            && std::path::Path::new(dir).is_dir()
+        {
+            cmd.cwd(dir);
+        }
+        setup_shell_env(&mut cmd);
+
+        let mut child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("spawn zsh: {e}");
+                return None;
+            }
+        };
+        let child_killer = child.clone_killer();
+        drop(pair.slave);
+
         self.pane_to_window.insert(pane_id, window_id);
-        let proxy_clone = proxy.clone();
+        let pty_output = Arc::new(PtyOutput::default());
+        let reader_output = Arc::clone(&pty_output);
+        let reader_proxy = proxy.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        let _ = proxy_clone.send_event(AppEvent::PtyExit { pane_id });
-                        break;
-                    }
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let _ = proxy_clone.send_event(AppEvent::PtyData {
-                            pane_id,
-                            data: buf[..n].to_vec(),
-                        });
+                        if reader_output.push(&buf[..n])
+                            && reader_proxy
+                                .send_event(AppEvent::PtyReady { pane_id })
+                                .is_err()
+                        {
+                            reader_output.close();
+                            break;
+                        }
                     }
                 }
             }
+            // Reap only after the PTY reaches EOF. This keeps all PtyReady
+            // notifications ordered before PtyExit so final shell output
+            // cannot be discarded during pane removal.
+            let _ = child.wait();
+            let _ = reader_proxy.send_event(AppEvent::PtyExit { pane_id });
         });
 
         Some(Pane {
@@ -1402,6 +1495,9 @@ impl App {
             terminal: Terminal::new(cols, rows),
             pty_master: pair.master,
             pty_writer: writer,
+            child_killer,
+            pty_output,
+            pty_scratch: Vec::new(),
             ghost_text: None,
             engine: Arc::clone(&self.engine),
             selection: None,
@@ -2298,7 +2394,7 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::PtyData { pane_id, data } => {
+            AppEvent::PtyReady { pane_id } => {
                 let window_id = match self.pane_to_window.get(&pane_id).copied() {
                     Some(w) => w,
                     None => return,
@@ -2310,11 +2406,15 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut input_changed = false;
                 let mut title_changed = false;
                 if let Some(pane) = tw.panes.iter_mut().find(|p| p.id == pane_id) {
+                    pane.pty_output.drain_into(&mut pane.pty_scratch);
+                    if pane.pty_scratch.is_empty() {
+                        return;
+                    }
                     if !pane.terminal.state.is_scrolled_back() {
                         pane.terminal.state.snap_to_bottom();
                     }
                     let sync_before = pane.terminal.state.sync_output;
-                    pane.terminal.process(&data);
+                    pane.terminal.process(&pane.pty_scratch);
                     let sync_after = pane.terminal.state.sync_output;
                     // If ?2026l just cleared sync mode, force a redraw now.
                     if sync_before && !sync_after {
@@ -2569,7 +2669,7 @@ fn build_shell_bootstrap_files(home: &str, tools: &ShellTools) -> ShellBootstrap
 
     let cat_fn = match tools.tcat.as_ref() {
         Some(path) => format!(
-            "_TCAT='{}'\nfunction cat() {{\n  if [[ -t 1 ]] && [ $# -ge 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$@\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
+            "_TCAT='{}'\nfunction cat() {{\n  if [[ -t 1 ]] && [ $# -eq 1 ] && [ -f \"$1\" ]; then\n    \"$_TCAT\" \"$1\"\n  else\n    command cat \"$@\"\n  fi\n}}\n",
             sh_sq_escape(&path.display().to_string())
         ),
         None => String::new(),
@@ -2817,7 +2917,73 @@ fn main() {
 mod tests {
     use super::*;
     use crate::terminal::{Terminal, TerminalState};
+    use std::sync::mpsc;
     use tempfile::TempDir;
+
+    #[test]
+    fn pty_output_coalesces_wakes_until_drained() {
+        let output = PtyOutput::default();
+        assert!(output.push(b"one"));
+        assert!(!output.push(b"two"));
+
+        let mut drained = Vec::new();
+        output.drain_into(&mut drained);
+        assert_eq!(drained, b"onetwo");
+        assert!(output.push(b"three"));
+    }
+
+    #[test]
+    fn pty_output_applies_backpressure_and_unblocks_after_drain() {
+        let output = Arc::new(PtyOutput::default());
+        assert!(output.push(&vec![b'x'; PTY_OUTPUT_MAX_BYTES]));
+
+        let (sent, received) = mpsc::channel();
+        let writer_output = output.clone();
+        let writer = std::thread::spawn(move || {
+            let wake = writer_output.push(b"y");
+            sent.send(wake).unwrap();
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(25)).is_err(),
+            "writer should wait while the bounded buffer is full"
+        );
+
+        let mut drained = Vec::new();
+        output.drain_into(&mut drained);
+        assert_eq!(drained.len(), PTY_OUTPUT_MAX_BYTES);
+        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn copied_soft_wrapped_rows_join_without_newline() {
+        let mut terminal = Terminal::new(4, 3);
+        terminal.process(b"abcdef");
+        assert_eq!(
+            selection_text_for_range(&terminal.state, (0, 0, 1, 1)),
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn copied_hard_line_break_is_preserved() {
+        let mut terminal = Terminal::new(4, 3);
+        terminal.process(b"ab\r\ncd");
+        assert_eq!(
+            selection_text_for_range(&terminal.state, (0, 0, 1, 1)),
+            "ab\ncd"
+        );
+    }
+
+    #[test]
+    fn copied_wide_character_has_no_continuation_space() {
+        let mut terminal = Terminal::new(6, 2);
+        terminal.process("a界b".as_bytes());
+        assert_eq!(
+            selection_text_for_range(&terminal.state, (0, 0, 0, 3)),
+            "a界b"
+        );
+    }
 
     /// Write `text` into row 0 of a freshly-created state.
     fn make_state(text: &str) -> TerminalState {
@@ -3553,7 +3719,7 @@ mod tests {
         assert!(
             files
                 .zshrc
-                .contains("if [[ -t 1 ]] && [ $# -ge 1 ] && [ -f \"$1\" ]")
+                .contains("if [[ -t 1 ]] && [ $# -eq 1 ] && [ -f \"$1\" ]")
         );
         assert!(files.zshrc.contains("function json()"));
         assert!(files.zshrc.contains("function git()"));
