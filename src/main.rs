@@ -321,42 +321,67 @@ fn find_urls(
     vis_cols: usize,
 ) -> Vec<(usize, usize, usize, String)> {
     let mut out = Vec::new();
+    let mut line = Vec::new();
+
     for row in 0..vis_rows {
-        let cells: Vec<char> = (0..vis_cols)
-            .map(|col| state.visual_cell(row, col).c)
-            .collect();
-        let mut col = 0;
-        while col < vis_cols {
-            let https = col + 8 <= vis_cols
-                && cells[col..col + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
-            let http = !https
-                && col + 7 <= vis_cols
-                && cells[col..col + 7] == ['h', 't', 't', 'p', ':', '/', '/'];
-            if https || http {
-                let start = col;
-                let mut end = col + if https { 8 } else { 7 };
-                while end < vis_cols {
-                    match cells[end] {
-                        ' ' | '\0' | '"' | '\'' | '`' | '<' | '>' | '\t' => break,
-                        _ => end += 1,
-                    }
-                }
-                // strip trailing punctuation unlikely to be part of the URL
-                while end > start {
-                    match cells[end - 1] {
-                        '.' | ',' | ')' | ';' | ':' => end -= 1,
-                        _ => break,
-                    }
-                }
-                let url: String = cells[start..end].iter().collect();
-                out.push((row, start, end, url));
-                col = end;
-            } else {
-                col += 1;
-            }
+        if row > 0 && !state.visual_row_wrapped(row - 1) {
+            find_urls_in_line(&line, &mut out);
+            line.clear();
+        }
+        for col in 0..vis_cols {
+            line.push((state.visual_cell(row, col).c, row, col));
         }
     }
+    find_urls_in_line(&line, &mut out);
     out
+}
+
+fn find_urls_in_line(
+    line: &[(char, usize, usize)],
+    out: &mut Vec<(usize, usize, usize, String)>,
+) {
+    let cells: Vec<char> = line.iter().map(|(c, _, _)| *c).collect();
+    let mut start = 0;
+    while start < cells.len() {
+        let https = start + 8 <= cells.len()
+            && cells[start..start + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
+        let http = !https
+            && start + 7 <= cells.len()
+            && cells[start..start + 7] == ['h', 't', 't', 'p', ':', '/'];
+        if https || http {
+            let url_start = start;
+            let mut end = start + if https { 8 } else { 7 };
+            while end < cells.len() {
+                match cells[end] {
+                    ' ' | '\0' | '"' | '\'' | '`' | '<' | '>' | '\t' => break,
+                    _ => end += 1,
+                }
+            }
+            while end > url_start {
+                match cells[end - 1] {
+                    '.' | ',' | ')' | ';' | ':' => end -= 1,
+                    _ => break,
+                }
+            }
+            let url: String = cells[url_start..end].iter().collect();
+
+            let mut segment_start = url_start;
+            while segment_start < end {
+                let row = line[segment_start].1;
+                let c0 = line[segment_start].2;
+                let mut segment_end = segment_start + 1;
+                while segment_end < end && line[segment_end].1 == row {
+                    segment_end += 1;
+                }
+                let c1 = line[segment_end - 1].2 + 1;
+                out.push((row, c0, c1, url.clone()));
+                segment_start = segment_end;
+            }
+            start = end;
+        } else {
+            start += 1;
+        }
+    }
 }
 
 fn should_open_url(url: &str) -> bool {
@@ -3104,6 +3129,24 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].0, 1); // row 1
         assert_eq!(spans[0].3, "https://row2.io");
+    }
+
+    #[test]
+    fn preserves_url_across_soft_wrapped_rows() {
+        let url = "https://overflow.test/path";
+        let mut terminal = Terminal::new(10, 3);
+        terminal.process(url.as_bytes());
+
+        let spans = find_urls(&terminal.state, 3, 10);
+        assert_eq!(spans.len(), 3);
+        assert!(spans.iter().all(|(_, _, _, found)| found == url));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(row, c0, c1, _)| (*row, *c0, *c1))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 10), (1, 0, 10), (2, 0, 6)]
+        );
     }
 
     // ── non-matches ───────────────────────────────────────────────────────────
