@@ -361,7 +361,13 @@ fn shape_run_impl(face: &rustybuzz::Face<'_>, chars: &[char]) -> Vec<ShapedGlyph
 
     let mut buf = rustybuzz::UnicodeBuffer::new();
     buf.push_str(&text);
-    let output = rustybuzz::shape(face, &[], buf);
+    let features = [
+        rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"calt"), 0, ..),
+        rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"clig"), 0, ..),
+        rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..),
+        rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..),
+    ];
+    let output = rustybuzz::shape(face, &features, buf);
     let infos = output.glyph_infos();
 
     let mut result = Vec::with_capacity(infos.len());
@@ -2109,11 +2115,9 @@ mod tests {
     }
 
     #[test]
-    fn glyph_ops_same_fg_color_allows_ligature_run() {
-        // '-' and '>' in the same fg color must be shaped as one run.
-        // If JetBrains Mono produces a true single-glyph ligature, col 1 will be
-        // Skip.  If it uses calt (2 contextual glyphs), both will be Glyph.
-        // Either way, neither should be Block, and col 0 must be Glyph.
+    fn glyph_ops_same_fg_color_produces_independent_glyphs() {
+        // '-' and '>' in the same fg color are shaped as one run, but terminal
+        // ligatures are disabled so each cell must still get its own glyph.
         let face = test_face();
         let mut term = make_term(10, 5);
         term.process(b"->");
@@ -2123,8 +2127,24 @@ mod tests {
             "first char must be Glyph"
         );
         assert!(
-            matches!(ops[1], GlyphOp::Glyph(_) | GlyphOp::Skip),
-            "second char must be Glyph or Skip (ligature)"
+            matches!(ops[1], GlyphOp::Glyph(_)),
+            "second char must be Glyph"
+        );
+    }
+
+    #[test]
+    fn glyph_ops_double_dash_produces_two_glyphs() {
+        let face = test_face();
+        let mut term = make_term(10, 5);
+        term.process(b"--");
+        let ops = compute_row_glyph_ops_impl(&face, &term.state, 0, 10);
+        assert!(
+            matches!(ops[0], GlyphOp::Glyph(_)),
+            "first '-' must be Glyph"
+        );
+        assert!(
+            matches!(ops[1], GlyphOp::Glyph(_)),
+            "second '-' must be Glyph, not hidden by a ligature"
         );
     }
 
