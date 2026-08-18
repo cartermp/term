@@ -321,110 +321,141 @@ fn find_urls(
     vis_cols: usize,
 ) -> Vec<(usize, usize, usize, String)> {
     let mut out = Vec::new();
-    let vo = state.viewport_offset.min(state.scrollback.len());
-    let viewport_top = state.scrollback.len().saturating_sub(vo);
-    let total_rows = state.scrollback.len() + state.grid.len();
-    let visible_start = viewport_top;
-    let visible_end = viewport_top.saturating_add(vis_rows).min(total_rows);
+    if vis_cols == 0 {
+        return out;
+    }
+
+    let (visible_start, visible_end, total_rows, scan_scrollback) = if state.is_alt_screen() {
+        let total_rows = state.grid.len();
+        (0, vis_rows.min(total_rows), total_rows, false)
+    } else {
+        let vo = state.viewport_offset.min(state.scrollback.len());
+        let viewport_top = state.scrollback.len().saturating_sub(vo);
+        let total_rows = state.scrollback.len() + state.grid.len();
+        (
+            viewport_top,
+            viewport_top.saturating_add(vis_rows).min(total_rows),
+            total_rows,
+            true,
+        )
+    };
     if visible_start >= visible_end {
         return out;
     }
 
     let mut line_start = visible_start;
-    while line_start > 0 && combined_row_wrapped(state, line_start - 1) {
+    while line_start > 0 && row_wrapped(state, line_start - 1, scan_scrollback) {
         line_start -= 1;
     }
 
     while line_start < visible_end {
         let mut line_end = line_start + 1;
-        while line_end < total_rows && combined_row_wrapped(state, line_end - 1) {
+        while line_end < total_rows && row_wrapped(state, line_end - 1, scan_scrollback) {
             line_end += 1;
         }
 
-        let mut line = Vec::new();
+        let mut line = Vec::with_capacity((line_end - line_start) * vis_cols);
         for row in line_start..line_end {
             for col in 0..vis_cols {
-                line.push((combined_cell(state, row, col).c, row, col));
+                line.push(cell_char(state, row, col, scan_scrollback));
             }
         }
-        find_urls_in_line(&line, &mut out, visible_start, visible_end);
+        find_urls_in_line(
+            &line,
+            &mut out,
+            visible_start,
+            visible_end,
+            line_start,
+            vis_cols,
+        );
 
         line_start = line_end;
     }
     out
 }
 
-fn combined_cell(state: &terminal::TerminalState, row: usize, col: usize) -> terminal::Cell {
-    if row < state.scrollback.len() {
+fn cell_char(
+    state: &terminal::TerminalState,
+    row: usize,
+    col: usize,
+    scan_scrollback: bool,
+) -> char {
+    if scan_scrollback && row < state.scrollback.len() {
         state
             .scrollback
             .get(row)
             .and_then(|r| r.get(col))
-            .copied()
-            .unwrap_or_default()
+            .map(|cell| cell.c)
+            .unwrap_or('\0')
     } else {
+        let grid_row = if scan_scrollback {
+            row.saturating_sub(state.scrollback.len())
+        } else {
+            row
+        };
         state
             .grid
-            .get(row - state.scrollback.len())
+            .get(grid_row)
             .and_then(|r| r.get(col))
-            .copied()
-            .unwrap_or_default()
+            .map(|cell| cell.c)
+            .unwrap_or('\0')
     }
 }
 
-fn combined_row_wrapped(state: &terminal::TerminalState, row: usize) -> bool {
-    if row < state.scrollback.len() {
+fn row_wrapped(state: &terminal::TerminalState, row: usize, scan_scrollback: bool) -> bool {
+    if scan_scrollback && row < state.scrollback.len() {
         state.scrollback_wrapped.get(row).copied().unwrap_or(false)
     } else {
-        state
-            .grid_wrapped
-            .get(row - state.scrollback.len())
-            .copied()
-            .unwrap_or(false)
+        let grid_row = if scan_scrollback {
+            row.saturating_sub(state.scrollback.len())
+        } else {
+            row
+        };
+        state.grid_wrapped.get(grid_row).copied().unwrap_or(false)
     }
 }
 
 fn find_urls_in_line(
-    line: &[(char, usize, usize)],
+    line: &[char],
     out: &mut Vec<(usize, usize, usize, String)>,
     visible_start: usize,
     visible_end: usize,
+    line_start: usize,
+    vis_cols: usize,
 ) {
-    let cells: Vec<char> = line.iter().map(|(c, _, _)| *c).collect();
     let mut start = 0;
-    while start < cells.len() {
-        let https = start + 8 <= cells.len()
-            && cells[start..start + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
+    while start < line.len() {
+        let https = start + 8 <= line.len()
+            && line[start..start + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
         let http = !https
-            && start + 7 <= cells.len()
-            && cells[start..start + 7] == ['h', 't', 't', 'p', ':', '/', '/'];
+            && start + 7 <= line.len()
+            && line[start..start + 7] == ['h', 't', 't', 'p', ':', '/', '/'];
         if https || http {
             let url_start = start;
             let mut end = start + if https { 8 } else { 7 };
-            while end < cells.len() {
-                match cells[end] {
+            while end < line.len() {
+                match line[end] {
                     ' ' | '\0' | '"' | '\'' | '`' | '<' | '>' | '\t' => break,
                     _ => end += 1,
                 }
             }
             while end > url_start {
-                match cells[end - 1] {
+                match line[end - 1] {
                     '.' | ',' | ')' | ';' | ':' => end -= 1,
                     _ => break,
                 }
             }
-            let url: String = cells[url_start..end].iter().collect();
+            let url: String = line[url_start..end].iter().collect();
 
             let mut segment_start = url_start;
             while segment_start < end {
-                let abs_row = line[segment_start].1;
-                let c0 = line[segment_start].2;
-                let mut segment_end = segment_start + 1;
-                while segment_end < end && line[segment_end].1 == abs_row {
-                    segment_end += 1;
-                }
+                let row_offset = segment_start / vis_cols;
+                let abs_row = line_start + row_offset;
+                let c0 = segment_start % vis_cols;
+                let row_end = (row_offset + 1) * vis_cols;
+                let segment_end = end.min(row_end);
                 if abs_row >= visible_start && abs_row < visible_end {
-                    let c1 = line[segment_end - 1].2 + 1;
+                    let c1 = c0 + (segment_end - segment_start);
                     out.push((abs_row - visible_start, c0, c1, url.clone()));
                 }
                 segment_start = segment_end;
@@ -3250,6 +3281,44 @@ mod tests {
                 .map(|(row, c0, c1, _)| (*row, *c0, *c1))
                 .collect::<Vec<_>>(),
             vec![(0, 0, 10), (1, 0, 10)]
+        );
+    }
+
+    #[test]
+    fn alt_screen_url_scan_ignores_normal_scrollback() {
+        let cols = 10;
+        let mut terminal = Terminal::new(cols, 3);
+        terminal.process(b"\x1b[?1049h");
+        assert!(terminal.state.is_alt_screen());
+
+        terminal
+            .state
+            .scrollback
+            .push_back(row_with_text(cols, "https://hid"));
+        terminal.state.scrollback_wrapped.push_back(true);
+        terminal
+            .state
+            .scrollback
+            .push_back(row_with_text(cols, "den.test/a"));
+        terminal.state.scrollback_wrapped.push_back(true);
+
+        terminal.state.grid[0] = row_with_text(cols, "https://al");
+        terminal.state.grid[1] = row_with_text(cols, "t.test");
+        terminal.state.grid_wrapped[0] = true;
+
+        let spans = find_urls(&terminal.state, 2, cols);
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans
+                .iter()
+                .all(|(_, _, _, found)| found == "https://alt.test")
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(row, c0, c1, _)| (*row, *c0, *c1))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 10), (1, 0, 6)]
         );
     }
 
