@@ -344,7 +344,7 @@ fn find_urls_in_line(line: &[(char, usize, usize)], out: &mut Vec<(usize, usize,
             && cells[start..start + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'];
         let http = !https
             && start + 7 <= cells.len()
-            && cells[start..start + 7] == ['h', 't', 't', 'p', ':', '/'];
+            && cells[start..start + 7] == ['h', 't', 't', 'p', ':', '/', '/'];
         if https || http {
             let url_start = start;
             let mut end = start + if https { 8 } else { 7 };
