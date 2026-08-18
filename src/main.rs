@@ -336,10 +336,7 @@ fn find_urls(
     out
 }
 
-fn find_urls_in_line(
-    line: &[(char, usize, usize)],
-    out: &mut Vec<(usize, usize, usize, String)>,
-) {
+fn find_urls_in_line(line: &[(char, usize, usize)], out: &mut Vec<(usize, usize, usize, String)>) {
     let cells: Vec<char> = line.iter().map(|(c, _, _)| *c).collect();
     let mut start = 0;
     while start < cells.len() {
