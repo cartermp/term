@@ -321,22 +321,75 @@ fn find_urls(
     vis_cols: usize,
 ) -> Vec<(usize, usize, usize, String)> {
     let mut out = Vec::new();
-    let mut line = Vec::new();
-
-    for row in 0..vis_rows {
-        if row > 0 && !state.visual_row_wrapped(row - 1) {
-            find_urls_in_line(&line, &mut out);
-            line.clear();
-        }
-        for col in 0..vis_cols {
-            line.push((state.visual_cell(row, col).c, row, col));
-        }
+    let vo = state.viewport_offset.min(state.scrollback.len());
+    let viewport_top = state.scrollback.len().saturating_sub(vo);
+    let total_rows = state.scrollback.len() + state.grid.len();
+    let visible_start = viewport_top;
+    let visible_end = viewport_top.saturating_add(vis_rows).min(total_rows);
+    if visible_start >= visible_end {
+        return out;
     }
-    find_urls_in_line(&line, &mut out);
+
+    let mut line_start = visible_start;
+    while line_start > 0 && combined_row_wrapped(state, line_start - 1) {
+        line_start -= 1;
+    }
+
+    while line_start < visible_end {
+        let mut line_end = line_start + 1;
+        while line_end < total_rows && combined_row_wrapped(state, line_end - 1) {
+            line_end += 1;
+        }
+
+        let mut line = Vec::new();
+        for row in line_start..line_end {
+            for col in 0..vis_cols {
+                line.push((combined_cell(state, row, col).c, row, col));
+            }
+        }
+        find_urls_in_line(&line, &mut out, visible_start, visible_end);
+
+        line_start = line_end;
+    }
     out
 }
 
-fn find_urls_in_line(line: &[(char, usize, usize)], out: &mut Vec<(usize, usize, usize, String)>) {
+fn combined_cell(state: &terminal::TerminalState, row: usize, col: usize) -> terminal::Cell {
+    if row < state.scrollback.len() {
+        state
+            .scrollback
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or_default()
+    } else {
+        state
+            .grid
+            .get(row - state.scrollback.len())
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+fn combined_row_wrapped(state: &terminal::TerminalState, row: usize) -> bool {
+    if row < state.scrollback.len() {
+        state.scrollback_wrapped.get(row).copied().unwrap_or(false)
+    } else {
+        state
+            .grid_wrapped
+            .get(row - state.scrollback.len())
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+fn find_urls_in_line(
+    line: &[(char, usize, usize)],
+    out: &mut Vec<(usize, usize, usize, String)>,
+    visible_start: usize,
+    visible_end: usize,
+) {
     let cells: Vec<char> = line.iter().map(|(c, _, _)| *c).collect();
     let mut start = 0;
     while start < cells.len() {
@@ -364,14 +417,16 @@ fn find_urls_in_line(line: &[(char, usize, usize)], out: &mut Vec<(usize, usize,
 
             let mut segment_start = url_start;
             while segment_start < end {
-                let row = line[segment_start].1;
+                let abs_row = line[segment_start].1;
                 let c0 = line[segment_start].2;
                 let mut segment_end = segment_start + 1;
-                while segment_end < end && line[segment_end].1 == row {
+                while segment_end < end && line[segment_end].1 == abs_row {
                     segment_end += 1;
                 }
-                let c1 = line[segment_end - 1].2 + 1;
-                out.push((row, c0, c1, url.clone()));
+                if abs_row >= visible_start && abs_row < visible_end {
+                    let c1 = line[segment_end - 1].2 + 1;
+                    out.push((abs_row - visible_start, c0, c1, url.clone()));
+                }
                 segment_start = segment_end;
             }
             start = end;
@@ -3017,6 +3072,14 @@ mod tests {
         s
     }
 
+    fn row_with_text(cols: usize, text: &str) -> Vec<terminal::Cell> {
+        let mut row = vec![terminal::Cell::default(); cols];
+        for (i, c) in text.chars().take(cols).enumerate() {
+            row[i].c = c;
+        }
+        row
+    }
+
     /// Convenience: collect just the URL strings from a single-row state.
     fn urls(text: &str) -> Vec<String> {
         let s = make_state(text);
@@ -3143,6 +3206,50 @@ mod tests {
                 .map(|(row, c0, c1, _)| (*row, *c0, *c1))
                 .collect::<Vec<_>>(),
             vec![(0, 0, 10), (1, 0, 10), (2, 0, 6)]
+        );
+    }
+
+    #[test]
+    fn detects_wrapped_url_when_viewport_starts_mid_url() {
+        let url = "https://overflow.test/path";
+        let cols = 10;
+        let mut state = TerminalState::new(cols, 3);
+        state.scrollback.push_back(row_with_text(cols, &url[..10]));
+        state.scrollback_wrapped.push_back(true);
+        state
+            .scrollback
+            .push_back(row_with_text(cols, &url[10..20]));
+        state.scrollback_wrapped.push_back(true);
+        state.grid[0] = row_with_text(cols, &url[20..]);
+        state.viewport_offset = 1;
+
+        let spans = find_urls(&state, 2, cols);
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|(_, _, _, found)| found == url));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(row, c0, c1, _)| (*row, *c0, *c1))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 10), (1, 0, 6)]
+        );
+    }
+
+    #[test]
+    fn detects_full_wrapped_url_when_viewport_ends_mid_url() {
+        let url = "https://overflow.test/path";
+        let mut terminal = Terminal::new(10, 3);
+        terminal.process(url.as_bytes());
+
+        let spans = find_urls(&terminal.state, 2, 10);
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|(_, _, _, found)| found == url));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(row, c0, c1, _)| (*row, *c0, *c1))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 10), (1, 0, 10)]
         );
     }
 
