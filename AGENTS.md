@@ -151,3 +151,22 @@ Edit `FONT_SIZE_PT` in `src/config.rs`. The renderer scales by the window's DPI 
 - **tjson cwd**: `CommandBuilder::new()` defaults to the process's home directory, not `current_dir()`. Always call `cmd.cwd(std::env::current_dir()?)` so the spawned command runs in the same directory as the shell invoking `tjson`.
 - **UTF-8 in tjson**: `BufReader::lines()` requires valid UTF-8. If the PTY output contains raw C1 bytes (0x80–0x9F) that aren't part of a multi-byte sequence, `lines()` will error and the loop will break. Be aware of this if expanding `run_pty`.
 - **GPU buffer growth**: `rect_buf` and `glyph_buf` are grown on demand by reallocating. The capacity is tracked in `rect_buf_cap` / `glyph_buf_cap`. Don't assume a fixed size.
+
+
+<!-- github-knowledge-base-start -->
+## Knowledge Base
+
+### Purpose
+
+This repository uses the Knowledge Base at [https://github.com/cartermp/term](https://github.com/cartermp/term) on branch `main`.
+
+### Required behavior
+
+1. Before changing code, read `docs/index.md` from that branch.
+2. Use the index to open only the knowledge files relevant to the task.
+3. If the index is unavailable, stop and report that the Knowledge Base could not be loaded.
+
+### Source of truth
+
+Generated knowledge tracks the code. When the knowledge and code disagree, trust the code.
+<!-- github-knowledge-base-end -->
