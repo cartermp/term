@@ -489,6 +489,31 @@ enum MouseWheelAction {
     PtyWrites(Vec<Vec<u8>>),
 }
 
+fn mouse_button_report(
+    state: &terminal::TerminalState,
+    button: u32,
+    pressed: bool,
+    cell: Option<(usize, usize)>,
+) -> Option<Vec<u8>> {
+    if !state.mouse_tracking {
+        return None;
+    }
+
+    let (row, col) = cell?;
+    let col1 = col + 1;
+    let row1 = row + 1;
+    if state.mouse_sgr {
+        let suffix = if pressed { 'M' } else { 'm' };
+        Some(format!("\x1b[<{button};{col1};{row1}{suffix}").into_bytes())
+    } else {
+        let legacy_button = if pressed { button } else { 3 };
+        let cb = (32 + legacy_button).min(255) as u8;
+        let cx = (32 + col1).min(255) as u8;
+        let cy = (32 + row1).min(255) as u8;
+        Some(vec![0x1b, b'[', b'M', cb, cx, cy])
+    }
+}
+
 fn mouse_wheel_lines(delta: &MouseScrollDelta, cell_height: usize, scroll_frac: &mut f64) -> i32 {
     match delta {
         MouseScrollDelta::LineDelta(_, y) => {
@@ -2365,18 +2390,37 @@ impl ApplicationHandler<AppEvent> for App {
                     };
 
                     if !opened {
-                        // Activate pane under cursor
-                        if let Some(pi) = tw.pane_at_pixel(mx, my) {
+                        let pane_cell = tw.pixel_to_pane_cell(mx, my);
+                        let mouse_report = pane_cell.and_then(|(pi, row, col)| {
+                            mouse_button_report(
+                                &tw.panes[pi].terminal.state,
+                                0,
+                                true,
+                                Some((row, col)),
+                            )
+                            .map(|report| (pi, report))
+                        });
+                        if let Some((pi, report)) = mouse_report {
                             tw.set_active_pane(pi);
-                        }
-                        // Start selection
-                        tw.panes[tw.active_pane].selection = None;
-                        if let Some((_pi, grid_row, col)) = tw.pixel_to_grid_cell(mx, my) {
-                            tw.sel_anchor = Some((grid_row, col));
-                        } else {
+                            tw.selecting = false;
                             tw.sel_anchor = None;
+                            tw.sel_scroll = 0;
+                            tw.panes[pi].selection = None;
+                            tw.panes[pi].write(&report);
+                        } else {
+                            // Activate pane under cursor
+                            if let Some(pi) = tw.pane_at_pixel(mx, my) {
+                                tw.set_active_pane(pi);
+                            }
+                            // Start selection
+                            tw.panes[tw.active_pane].selection = None;
+                            if let Some((_pi, grid_row, col)) = tw.pixel_to_grid_cell(mx, my) {
+                                tw.sel_anchor = Some((grid_row, col));
+                            } else {
+                                tw.sel_anchor = None;
+                            }
+                            tw.selecting = true;
                         }
-                        tw.selecting = true;
                     }
                     tw.window.request_redraw();
                 }
@@ -2388,10 +2432,26 @@ impl ApplicationHandler<AppEvent> for App {
                 ..
             } => {
                 if let Some(tw) = self.windows.get_mut(&window_id) {
-                    tw.selecting = false;
-                    tw.sel_scroll = 0;
-                    if tw.panes[tw.active_pane].selection.is_none() {
-                        tw.sel_anchor = None;
+                    let (mx, my) = tw.cursor_pos;
+                    let report = tw
+                        .pixel_to_pane_cell(mx, my)
+                        .filter(|(pi, _, _)| *pi == tw.active_pane)
+                        .and_then(|(pi, row, col)| {
+                            mouse_button_report(
+                                &tw.panes[pi].terminal.state,
+                                0,
+                                false,
+                                Some((row, col)),
+                            )
+                        });
+                    if let Some(report) = report {
+                        tw.panes[tw.active_pane].write(&report);
+                    } else {
+                        tw.selecting = false;
+                        tw.sel_scroll = 0;
+                        if tw.panes[tw.active_pane].selection.is_none() {
+                            tw.sel_anchor = None;
+                        }
                     }
                     tw.window.request_redraw();
                 }
@@ -3809,6 +3869,43 @@ mod tests {
         assert_eq!(first, 1);
         assert_eq!(second, 2);
         assert_eq!(frac, 0.0);
+    }
+
+    #[test]
+    fn mouse_button_report_is_disabled_without_tracking() {
+        let term = Terminal::new(80, 24);
+        assert_eq!(
+            mouse_button_report(&term.state, 0, true, Some((3, 4))),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_button_report_sgr_encodes_press_and_release() {
+        let mut term = Terminal::new(80, 24);
+        term.process(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            mouse_button_report(&term.state, 0, true, Some((3, 4))),
+            Some(b"\x1b[<0;5;4M".to_vec())
+        );
+        assert_eq!(
+            mouse_button_report(&term.state, 0, false, Some((3, 4))),
+            Some(b"\x1b[<0;5;4m".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_button_report_x10_encodes_press_and_release() {
+        let mut term = Terminal::new(80, 24);
+        term.process(b"\x1b[?1000h");
+        assert_eq!(
+            mouse_button_report(&term.state, 0, true, Some((3, 4))),
+            Some(vec![0x1b, b'[', b'M', 32, 37, 36])
+        );
+        assert_eq!(
+            mouse_button_report(&term.state, 0, false, Some((3, 4))),
+            Some(vec![0x1b, b'[', b'M', 35, 37, 36])
+        );
     }
 
     #[test]
