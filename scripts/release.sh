@@ -59,13 +59,13 @@ PY
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 
 # Check for uncommitted changes in the working copy
-if [ -n "$(jj diff -r @)" ]; then
+if [ -n "$(git status --porcelain)" ]; then
   echo "error: working copy has uncommitted changes" >&2
   exit 1
 fi
 
 # Fetch and check main is in sync with origin
-jj git fetch --quiet
+git fetch --quiet origin
 if [ "$(git rev-parse main)" != "$(git rev-parse origin/main)" ]; then
   echo "error: main is not in sync with origin/main — push or pull first" >&2
   exit 1
@@ -109,8 +109,7 @@ fi
 
 # ── Tag & push ────────────────────────────────────────────────────────────────
 
-# Tag the version-bump commit on main explicitly — in jj, HEAD points to @
-# (the working copy), not the commit we just created for the release.
+# Tag the version-bump commit from the temporary worktree.
 echo "→ Tagging $VERSION"
 git tag "$VERSION" "$(git -C "$TMP_WORKTREE" rev-parse HEAD)"
 
