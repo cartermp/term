@@ -312,6 +312,34 @@ pub fn configure_window_background(ns_view: *mut std::ffi::c_void) {
         if !clear.is_null() {
             let _: () = msg_send![win, setBackgroundColor: clear];
         }
+
+        // The terminal uses a transparent Metal surface, but its native title
+        // and tab bars must remain legible. Newer macOS releases otherwise
+        // apply light Liquid Glass chrome over the clear NSWindow backing.
+        if let Some(dark_aqua_name) = ns_string("NSAppearanceNameDarkAqua") {
+            let appearance: *mut AnyObject =
+                msg_send![class!(NSAppearance), appearanceNamed: dark_aqua_name];
+            if !appearance.is_null() {
+                let _: () = msg_send![win, setAppearance: appearance];
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn window_content_top_inset(ns_view: *mut std::ffi::c_void) -> f32 {
+    use objc2::{msg_send, runtime::AnyObject};
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() {
+            return 0.0;
+        }
+        let bounds: objc2_foundation::NSRect = msg_send![view, bounds];
+        let layout: objc2_foundation::NSRect = msg_send![win, contentLayoutRect];
+        let scale: f64 = msg_send![win, backingScaleFactor];
+        let top_points = bounds.size.height - (layout.origin.y + layout.size.height);
+        (top_points.max(0.0) * scale) as f32
     }
 }
 
@@ -387,7 +415,7 @@ pub fn install_background_menu_item() {
             let item: *mut AnyObject = msg_send![
                 item,
                 initWithTitle: appearance_title
-                action: std::ptr::null::<std::ffi::c_void>()
+                action: None::<objc2::runtime::Sel>
                 keyEquivalent: empty
             ];
             if item.is_null() {

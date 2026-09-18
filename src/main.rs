@@ -104,6 +104,13 @@ fn terminal_window_attributes(saved: Option<&session::SavedWindow>) -> WindowAtt
         .with_title("term")
         .with_transparent(true)
         .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        attrs = attrs
+            .with_fullsize_content_view(true)
+            .with_titlebar_transparent(true);
+    }
     if let Some(saved) = saved {
         attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(
             saved.inner_w.max(1),
@@ -614,6 +621,20 @@ fn ns_view_ptr(window: &winit::window::Window) -> Option<*mut std::ffi::c_void> 
     }
 }
 
+fn terminal_content_top_inset(window: &Window) -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        return ns_view_ptr(window)
+            .map(platform::window_content_top_inset)
+            .unwrap_or(0.0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        0.0
+    }
+}
+
 // ── WgpuShared ────────────────────────────────────────────────────────────────
 
 struct WgpuShared {
@@ -666,38 +687,44 @@ struct TerminalWindow {
     // Cursor blink
     cursor_visible: bool,
     last_blink: Instant,
+    content_top_inset: f32,
 }
 
 impl TerminalWindow {
     fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
         let sz = self.window.inner_size();
         let w = sz.width as f32;
-        let h = sz.height as f32;
+        let top = self.content_top_inset.min(sz.height as f32);
+        let h = sz.height as f32 - top;
         match (self.panes.len(), &self.split) {
             (2, Some(SplitDir::Vertical)) => {
                 let half = (w / 2.).floor();
-                vec![(0., 0., half - 1., h), (half + 1., 0., w - half - 1., h)]
+                vec![(0., top, half - 1., h), (half + 1., top, w - half - 1., h)]
             }
             (2, Some(SplitDir::Horizontal)) => {
                 let half = (h / 2.).floor();
-                vec![(0., 0., w, half - 1.), (0., half + 1., w, h - half - 1.)]
+                vec![
+                    (0., top, w, half - 1.),
+                    (0., top + half + 1., w, h - half - 1.),
+                ]
             }
-            _ => vec![(0., 0., w, h)],
+            _ => vec![(0., top, w, h)],
         }
     }
 
     fn divider_rects(&self) -> Vec<(f32, f32, f32, f32)> {
         let sz = self.window.inner_size();
         let w = sz.width as f32;
-        let h = sz.height as f32;
+        let top = self.content_top_inset.min(sz.height as f32);
+        let h = sz.height as f32 - top;
         match (self.panes.len(), &self.split) {
             (2, Some(SplitDir::Vertical)) => {
                 let half = (w / 2.).floor();
-                vec![(half - 1., 0., 2., h)]
+                vec![(half - 1., top, 2., h)]
             }
             (2, Some(SplitDir::Horizontal)) => {
                 let half = (h / 2.).floor();
-                vec![(0., half - 1., w, 2.)]
+                vec![(0., top + half - 1., w, 2.)]
             }
             _ => vec![],
         }
@@ -887,6 +914,12 @@ impl TerminalWindow {
 
     fn maybe_bootstrap_resize(&mut self) {
         let size = self.window.inner_size();
+        let content_top_inset = terminal_content_top_inset(&self.window);
+        if (content_top_inset - self.content_top_inset).abs() >= 0.5 {
+            self.content_top_inset = content_top_inset;
+            self.on_resize(size.width, size.height);
+            return;
+        }
         if size.width <= self.surface_config.width && size.height <= self.surface_config.height {
             return;
         }
@@ -1725,13 +1758,15 @@ impl App {
         let scale = window.scale_factor();
         let shared = self.shared_renderer_for(scale);
         let renderer = Renderer::new(shared, self.background);
+        let content_top_inset = terminal_content_top_inset(&window);
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
             let ch = renderer.cell_height;
+            let content_height = (size.height as f32 - content_top_inset).max(1.0) as usize;
             (
                 (size.width as usize / cw).max(1),
-                (size.height as usize / ch).max(1),
+                (content_height / ch).max(1),
             )
         };
 
@@ -1757,6 +1792,7 @@ impl App {
             scroll_frac: 0.0,
             cursor_visible: true,
             last_blink: Instant::now(),
+            content_top_inset,
         };
         tw.sync_title();
         self.windows.insert(window_id, tw);
@@ -1793,20 +1829,26 @@ impl App {
         }
         let idx = tw.panes.len(); // will be 1
 
-        // Temporarily compute size; we need renderer + window size
+        // Temporarily compute size; we need renderer + content layout size.
         let sz = tw.window.inner_size();
         let cw = tw.renderer.cell_width;
         let ch = tw.renderer.cell_height;
+        let (_, _, content_width, content_height) = tw.pane_rects().into_iter().next().unwrap_or((
+            0.0,
+            0.0,
+            sz.width as f32,
+            sz.height as f32,
+        ));
         let (cols, rows) = match dir {
             SplitDir::Vertical => {
-                let half = (sz.width as f32 / 2.).floor() as usize;
+                let half = (content_width / 2.).floor() as usize;
                 let cols = (half / cw).max(1);
-                let rows = (sz.height as usize / ch).max(1);
+                let rows = (content_height as usize / ch).max(1);
                 (cols, rows)
             }
             SplitDir::Horizontal => {
-                let half = (sz.height as f32 / 2.).floor() as usize;
-                let cols = (sz.width as usize / cw).max(1);
+                let half = (content_height / 2.).floor() as usize;
+                let cols = (content_width as usize / cw).max(1);
                 let rows = (half / ch).max(1);
                 (cols, rows)
             }
@@ -1892,8 +1934,14 @@ impl App {
             let sz = tw.window.inner_size();
             let cw = tw.renderer.cell_width;
             let ch = tw.renderer.cell_height;
-            let cols = (sz.width as usize / cw).max(1);
-            let rows = (sz.height as usize / ch).max(1);
+            let (_, _, pw, ph) = tw.pane_rects().into_iter().next().unwrap_or((
+                0.0,
+                0.0,
+                sz.width as f32,
+                sz.height as f32,
+            ));
+            let cols = (pw as usize / cw).max(1);
+            let rows = (ph as usize / ch).max(1);
             if let Some(pane) = tw.panes.get_mut(0) {
                 pane.terminal.resize(cols, rows);
                 let _ = pane.pty_master.resize(PtySize {
@@ -1930,6 +1978,7 @@ impl App {
     fn sync_all_titles(&self) {
         for tw in self.windows.values() {
             tw.sync_title();
+            tw.window.request_redraw();
         }
     }
 }
@@ -2058,13 +2107,15 @@ impl ApplicationHandler<AppEvent> for App {
         let scale = window.scale_factor();
         let shared = self.shared_renderer_for(scale);
         let renderer = Renderer::new(shared, self.background);
+        let content_top_inset = terminal_content_top_inset(&window);
 
         let (cols, rows) = {
             let cw = renderer.cell_width;
             let ch = renderer.cell_height;
+            let content_height = (size.height as f32 - content_top_inset).max(1.0) as usize;
             (
                 (size.width as usize / cw).max(1),
-                (size.height as usize / ch).max(1),
+                (content_height / ch).max(1),
             )
         };
 
@@ -2095,6 +2146,7 @@ impl ApplicationHandler<AppEvent> for App {
             scroll_frac: 0.0,
             cursor_visible: true,
             last_blink: Instant::now(),
+            content_top_inset,
         };
         tw.sync_title();
         self.windows.insert(window_id, tw);

@@ -1976,6 +1976,7 @@ dependencies = [
  "fontdue",
  "libc",
  "objc2",
+ "objc2-foundation",
  "pollster",
  "portable-pty",
  "proptest",
