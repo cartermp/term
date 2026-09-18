@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "term"
-version = "1.10.0"
+version = "2.0.0"
 dependencies = [
  "bytemuck",
  "fontdue",
